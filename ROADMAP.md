@@ -23,22 +23,23 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
       `ReadyForQuery{TxStatus:'T'}`), relay the simple query protocol upstream
 - [x] M1.2 One shared backend transaction across every client connection in a session;
       a client `Terminate` must **not** end the transaction
-- [x] M1.3 Serialize backend access across concurrent clients (documented trade-off)
+- [x] M1.3 Serialize individual backend exchanges across concurrent clients. An idle
+      client-visible transaction does not retain the backend lease: other clients can
+      run read-only queries, while concurrent writes and a second `BEGIN` fail with
+      SQLSTATE `55P03` rather than waiting indefinitely for an application-level
+      dependency cycle
 - [x] M1.4 Session decision: `COMMIT` / `ROLLBACK`, plus crash-safe default to rollback
-- [ ] M1.5 Extended query protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`) —
+- [x] M1.5 Extended query protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`) —
       required by every ORM; rewrite prepared-statement names to avoid collisions
       between clients sharing one backend (see pgbouncer's known pitfalls)
-- [ ] M1.6 Escape hatch for statements that cannot run in a transaction block
+- [x] M1.6 Escape hatch for statements that cannot run in a transaction block
       (`CREATE DATABASE`, `DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`,
-      `ALTER SYSTEM`) — classify as *needs approval*, run on a separate
+      `ALTER SYSTEM`, `CHECKPOINT`) — classify as *needs approval*, run on a separate
       non-transactional connection, mark the session as no longer fully reversible
 - [ ] M1.7 Change summary — what the transaction actually did, for the review screen
-- [ ] M1.8 Map client transaction control onto savepoints. Today `BEGIN`/`COMMIT`/
-      `ROLLBACK` from a client are rejected outright, which is safe but breaks the
-      many tools and ORMs that manage their own transactions. Nesting them as
-      savepoints inside our shared transaction keeps the single-decision guarantee
-      while letting real clients work. Belongs with M1.5 — both are prerequisites
-      for "a real ORM can run under unring unmodified"
+- [x] M1.8 Map client `BEGIN`/`COMMIT`/`ROLLBACK` and named savepoints onto private
+      savepoints inside the shared transaction. This preserves the single-decision
+      guarantee while letting transaction-managing clients and ORMs run
 
 ## M2 — Wrapper CLI
 

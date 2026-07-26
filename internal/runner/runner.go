@@ -13,13 +13,27 @@ import (
 
 // Options controls one child process.
 type Options struct {
-	Command []string
-	Env     []string
-	Stdin   io.Reader
-	Stdout  io.Writer
-	Stderr  io.Writer
-	Signals <-chan os.Signal
-	Abort   <-chan struct{}
+	Command   []string
+	Env       []string
+	Stdin     io.Reader
+	Stdout    io.Writer
+	Stderr    io.Writer
+	Signals   <-chan os.Signal
+	Abort     <-chan struct{}
+	Approvals <-chan ApprovalRequest
+}
+
+// ApprovalRequest lets the supervisor temporarily reclaim an interactive
+// terminal while a child is blocked waiting for an unring decision.
+type ApprovalRequest struct {
+	Decide func() (bool, error)
+	Reply  chan<- ApprovalResult
+}
+
+// ApprovalResult is returned after the child has regained its terminal.
+type ApprovalResult struct {
+	Approved bool
+	Err      error
 }
 
 // Result describes how the child ended.
@@ -63,14 +77,29 @@ func Run(options Options) Result {
 
 	signals := options.Signals
 	abort := options.Abort
+	approvals := options.Approvals
+	allApprovals := approvals
 	var forceKill <-chan time.Time
 	var interrupted bool
 	var sessionLost bool
 	var supervisionErr error
+	type completedApproval struct {
+		id     uint64
+		result ApprovalResult
+	}
+	approvalResults := make(chan completedApproval, 1)
+	var approvalID uint64
+	var activeApproval *ApprovalRequest
 
 	for {
 		select {
 		case err := <-waited:
+			if activeApproval != nil {
+				activeApproval.Reply <- ApprovalResult{
+					Err: errors.New("child exited while irreversible-statement approval was pending"),
+				}
+				activeApproval = nil
+			}
 			exitCode := processExitCode(command.ProcessState, err)
 			interrupted = interrupted || processWasSignaled(command.ProcessState)
 			if restoreErr := processGroup.restoreForeground(); restoreErr != nil {
@@ -134,11 +163,42 @@ func Run(options Options) Result {
 				abort = nil
 				_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)
 			}
+			if activeApproval != nil {
+				_ = processGroup.cancelApproval(command.Process.Pid)
+				activeApproval.Reply <- ApprovalResult{
+					Err: fmt.Errorf("approval interrupted by %s", signal),
+				}
+				activeApproval = nil
+				approvals = allApprovals
+				approvalID++
+			}
 		case <-abort:
 			sessionLost = true
 			abort = nil
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGTERM)
 			forceKill = time.After(2 * time.Second)
+		case request, ok := <-approvals:
+			if !ok {
+				approvals = nil
+				continue
+			}
+			activeApproval = &request
+			approvals = nil
+			approvalID++
+			currentID := approvalID
+			go func() {
+				approvalResults <- completedApproval{
+					id:     currentID,
+					result: processGroup.handleApproval(command.Process.Pid, request.Decide),
+				}
+			}()
+		case completed := <-approvalResults:
+			if activeApproval == nil || completed.id != approvalID {
+				continue
+			}
+			activeApproval.Reply <- completed.result
+			activeApproval = nil
+			approvals = allApprovals
 		case <-forceKill:
 			forceKill = nil
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)

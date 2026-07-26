@@ -95,6 +95,75 @@ func TestUnsafeClientSQL(t *testing.T) {
 	}
 }
 
+func TestAnalyzeClientSQLCatchesTransactionControlBypasses(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		sql  string
+		kind statementKind
+	}{
+		{sql: "SELECT 1; --\rCOMMIT;", kind: statementCommit},
+		{sql: "SELECT $\xc3\xa9$'$\xc3\xa9$; COMMIT;", kind: statementCommit},
+		{sql: `UPDATE config SET dir = 'C:\'; COMMIT;`, kind: statementCommit},
+		{sql: `DO $body$ BEGIN RAISE NOTICE 'COMMIT'; END $body$; ROLLBACK`, kind: statementRollback},
+	}
+	for _, test := range tests {
+		statements, err := analyzeClientSQL(test.sql)
+		if err != nil {
+			t.Fatalf("analyzeClientSQL(%q): %v", test.sql, err)
+		}
+		found := false
+		for _, statement := range statements {
+			found = found || statement.Kind == test.kind
+		}
+		if !found {
+			t.Fatalf("analyzeClientSQL(%q) = %#v, missing transaction kind %d",
+				test.sql, statements, test.kind)
+		}
+	}
+}
+
+func TestAnalyzeClientSQLClassifiesIrreversibleStatements(t *testing.T) {
+	t.Parallel()
+
+	for _, sql := range []string{
+		"CREATE DATABASE example",
+		"DROP DATABASE example",
+		"VACUUM",
+		"CREATE INDEX CONCURRENTLY example_idx ON example (id)",
+		"DROP INDEX CONCURRENTLY example_idx",
+		"ALTER SYSTEM SET work_mem = '4MB'",
+		"CHECKPOINT",
+		"REINDEX (CONCURRENTLY) INDEX example_idx",
+		"CREATE TABLESPACE example LOCATION '/tmp/example'",
+		"DROP TABLESPACE example",
+		"CLUSTER",
+		"REINDEX DATABASE example",
+		"ALTER DATABASE example SET TABLESPACE example_space",
+	} {
+		statements, err := analyzeClientSQL(sql)
+		if err != nil {
+			t.Fatalf("analyzeClientSQL(%q): %v", sql, err)
+		}
+		if len(statements) != 1 || statements[0].Irreversible == "" {
+			t.Fatalf("analyzeClientSQL(%q) = %#v, want irreversible", sql, statements)
+		}
+	}
+}
+
+func TestAnalyzeClientSQLRefusesDiscardAllWithoutMarkingItIrreversible(t *testing.T) {
+	t.Parallel()
+
+	statements, err := analyzeClientSQL("DISCARD ALL")
+	if err != nil {
+		t.Fatalf("analyzeClientSQL(DISCARD ALL): %v", err)
+	}
+	if len(statements) != 1 || statements[0].Refusal == "" ||
+		statements[0].Irreversible != "" {
+		t.Fatalf("DISCARD ALL classification = %#v, want a reversible local refusal", statements)
+	}
+}
+
 func TestUnsafeClientSQLFailsClosedOnParserError(t *testing.T) {
 	t.Parallel()
 

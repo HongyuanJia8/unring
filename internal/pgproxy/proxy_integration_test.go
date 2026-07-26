@@ -83,8 +83,8 @@ func TestSharedTransactionIntegration(t *testing.T) {
 	assertConcurrentClients(t, ctx, proxyConfig)
 
 	if _, err := second.Exec(ctx, "VACUUM").ReadAll(); err == nil ||
-		!strings.Contains(err.Error(), "transaction block") {
-		t.Fatalf("VACUUM error = %v, want faithful transaction-block error", err)
+		!strings.Contains(err.Error(), "declined") {
+		t.Fatalf("VACUUM error = %v, want safe approval decline", err)
 	}
 	if got := scalarTest(t, ctx, second, "SELECT 42"); got != "42" {
 		t.Fatalf("session did not recover after backend error: got %s", got)
@@ -93,29 +93,20 @@ func TestSharedTransactionIntegration(t *testing.T) {
 	if got := scalarTest(t, ctx, second, "SELECT 43"); got != "43" {
 		t.Fatalf("session did not tolerate notices around internal queries: got %s", got)
 	}
-	if _, err := second.Exec(ctx, "COMMIT").ReadAll(); err == nil ||
-		!strings.Contains(err.Error(), "unring owns") {
-		t.Fatalf("client COMMIT error = %v, want loud transaction-owner error", err)
-	}
+	execTest(t, ctx, second, "COMMIT")
 	smuggledCommit := fmt.Sprintf(
 		`UPDATE %s SET value = 'C:\'; COMMIT;`,
 		table,
 	)
-	if _, err := second.Exec(ctx, smuggledCommit).ReadAll(); err == nil ||
-		!strings.Contains(err.Error(), "unring owns") {
-		t.Fatalf("backslash-smuggled COMMIT error = %v, want loud transaction-owner error", err)
-	}
-	for name, sql := range map[string]string{
+	execTest(t, ctx, second, smuggledCommit)
+	for _, sql := range map[string]string{
 		"carriage-return comment": "SELECT 1; --\rCOMMIT;",
 		"guessed savepoint escalation": "SELECT 1; --\rCOMMIT; BEGIN; " +
 			"SAVEPOINT unring_internal_1;",
 		"UTF-8 dollar tag":        "SELECT $\xc3\xa9$'$\xc3\xa9$; COMMIT;",
 		"continued escape string": "SELECT E'a'\n'\\'e'; COMMIT; --'",
 	} {
-		if _, err := second.Exec(ctx, sql).ReadAll(); err == nil ||
-			!strings.Contains(err.Error(), "unring owns") {
-			t.Fatalf("%s guard error = %v, want loud transaction-owner error", name, err)
-		}
+		execTest(t, ctx, second, sql)
 	}
 	if got := scalarTest(t, ctx, second,
 		"SELECT $\xe4\xb8\xad$; COMMIT;$\xe4\xb8\xad$"); got != "; COMMIT;" {
@@ -127,8 +118,12 @@ func TestSharedTransactionIntegration(t *testing.T) {
 			got, "a'; COMMIT; --")
 	}
 	if got := scalarTest(t, ctx, second,
-		fmt.Sprintf("SELECT value FROM %s", table)); got != "inside" {
-		t.Fatalf("rejected smuggled COMMIT changed shared transaction: got %q", got)
+		fmt.Sprintf("SELECT value FROM %s", table)); got != `C:\` {
+		t.Fatalf("translated smuggled COMMIT lost preceding write: got %q", got)
+	}
+	if got := scalarTest(t, ctx, direct,
+		fmt.Sprintf("SELECT value FROM %s", table)); got != "before" {
+		t.Fatalf("client COMMIT exposed the shared transaction: direct value %q", got)
 	}
 
 	if err := second.Close(ctx); err != nil {

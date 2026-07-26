@@ -82,6 +82,93 @@ func TestRunTreatsSignaledChildAsInterrupted(t *testing.T) {
 	}
 }
 
+func TestRunServicesApprovalWhileChildIsActive(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan ApprovalRequest)
+	approvalDone := make(chan ApprovalResult, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		reply := make(chan ApprovalResult, 1)
+		requests <- ApprovalRequest{
+			Decide: func() (bool, error) { return true, nil },
+			Reply:  reply,
+		}
+		approvalDone <- <-reply
+	}()
+	result := Run(Options{
+		Command:   []string{"/bin/sh", "-c", "sleep 0.2"},
+		Env:       os.Environ(),
+		Stdout:    io.Discard,
+		Stderr:    io.Discard,
+		Approvals: requests,
+	})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run() = %#v", result)
+	}
+	approval := <-approvalDone
+	if !approval.Approved || approval.Err != nil {
+		t.Fatalf("approval result = %#v", approval)
+	}
+}
+
+func TestRunForwardsSignalWhileApprovalPromptIsBlocked(t *testing.T) {
+	t.Parallel()
+
+	signals := make(chan os.Signal, 1)
+	requests := make(chan ApprovalRequest)
+	decisionStarted := make(chan struct{})
+	approvalDone := make(chan ApprovalResult, 1)
+	runDone := make(chan Result, 1)
+	go func() {
+		runDone <- Run(Options{
+			Command: []string{"/bin/sh", "-c",
+				"trap 'exit 42' TERM; while :; do sleep 1; done"},
+			Env:       os.Environ(),
+			Stdout:    io.Discard,
+			Stderr:    io.Discard,
+			Signals:   signals,
+			Approvals: requests,
+		})
+	}()
+	go func() {
+		reply := make(chan ApprovalResult, 1)
+		requests <- ApprovalRequest{
+			Decide: func() (bool, error) {
+				close(decisionStarted)
+				select {}
+			},
+			Reply: reply,
+		}
+		approvalDone <- <-reply
+	}()
+
+	select {
+	case <-decisionStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("approval decision did not start")
+	}
+	signals <- syscall.SIGTERM
+
+	select {
+	case result := <-runDone:
+		if !result.Interrupted ||
+			(result.ExitCode != 42 && result.ExitCode != 128+int(syscall.SIGTERM)) {
+			t.Fatalf("Run() after signal during approval = %#v", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run() swallowed SIGTERM while approval was blocked")
+	}
+	select {
+	case approval := <-approvalDone:
+		if approval.Err == nil || approval.Approved {
+			t.Fatalf("interrupted approval = %#v, want declined error", approval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupted approval requester was not released")
+	}
+}
+
 func TestChildStoppedObservesStopWithoutReapingExit(t *testing.T) {
 	t.Parallel()
 

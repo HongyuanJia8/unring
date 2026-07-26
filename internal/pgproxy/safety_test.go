@@ -71,7 +71,7 @@ func TestRelayQueryDetectsLostTransaction(t *testing.T) {
 	}()
 
 	var clientOutput bytes.Buffer
-	client := pgproto3.NewBackend(strings.NewReader(""), &clientOutput)
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), &clientOutput))
 	proxy.relayQuery(client, "SELECT 1")
 
 	if err := <-serverErrors; err != nil {
@@ -151,6 +151,111 @@ func TestInternalQueryAllowsAsynchronousMessages(t *testing.T) {
 	}
 	if status != 'T' {
 		t.Fatalf("internalQueryLocked() status = %q, want T", status)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+}
+
+func TestInternalRowsPreservesEmptyValuesAndSQLNull(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	t.Cleanup(func() {
+		_ = proxySide.Close()
+		_ = postgresSide.Close()
+	})
+	proxy := &Proxy{
+		upstream: proxySide,
+		frontend: pgproto3.NewFrontend(proxySide, proxySide),
+		params:   make(map[string]string),
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		if _, err := backend.Receive(); err != nil {
+			serverErrors <- err
+			return
+		}
+		backend.Send(&pgproto3.RowDescription{})
+		backend.Send(&pgproto3.DataRow{Values: [][]byte{
+			[]byte("empty"), {}, nil, []byte("value"),
+		}})
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	rows, err := proxy.internalRowsLocked("SELECT test_values")
+	if err != nil {
+		t.Fatalf("internalRowsLocked(): %v", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != 4 {
+		t.Fatalf("internalRowsLocked() = %#v", rows)
+	}
+	if rows[0][1] == nil || len(rows[0][1]) != 0 {
+		t.Fatalf("empty value decoded as %#v, want non-nil empty slice", rows[0][1])
+	}
+	if rows[0][2] != nil {
+		t.Fatalf("SQL NULL decoded as %#v, want nil", rows[0][2])
+	}
+	if string(rows[0][3]) != "value" {
+		t.Fatalf("non-empty value decoded as %q", rows[0][3])
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+}
+
+func TestEscapeSessionStateAcceptsEmptyTransactionIDAndGUC(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	t.Cleanup(func() {
+		_ = proxySide.Close()
+		_ = postgresSide.Close()
+	})
+	proxy := &Proxy{
+		upstream: proxySide,
+		frontend: pgproto3.NewFrontend(proxySide, proxySide),
+		params:   make(map[string]string),
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		if _, err := backend.Receive(); err != nil {
+			serverErrors <- err
+			return
+		}
+		backend.Send(&pgproto3.RowDescription{})
+		for _, values := range [][][]byte{
+			{[]byte("__unring_session_authorization__"), []byte("postgres")},
+			{[]byte("__unring_role__"), []byte("postgres")},
+			{[]byte("__unring_transaction_id__"), {}},
+			{[]byte("search_path"), {}},
+		} {
+			backend.Send(&pgproto3.DataRow{Values: values})
+		}
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 4")})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	state, err := proxy.escapeSessionStateLocked()
+	if err != nil {
+		t.Fatalf("escapeSessionStateLocked() rejected ordinary empty values: %v", err)
+	}
+	if state.hasUncommittedChanges {
+		t.Fatal("empty transaction ID was treated as an assigned transaction ID")
+	}
+	if value, ok := state.settings["search_path"]; !ok || value != "" {
+		t.Fatalf("empty search_path = %q, present=%v", value, ok)
 	}
 	if err := <-serverErrors; err != nil {
 		t.Fatalf("fake postgres server: %v", err)
@@ -242,4 +347,181 @@ func TestSealStopsNewClientsBeforeReview(t *testing.T) {
 		len(beforeReview.Queries) != len(afterAttempt.Queries) {
 		t.Fatalf("summary changed after Seal: before %#v, after %#v", beforeReview, afterAttempt)
 	}
+}
+
+func TestClientTransactionTranslationAndAbortedState(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	defer postgresSide.Close()
+	proxy := &Proxy{
+		upstream:        proxySide,
+		frontend:        pgproto3.NewFrontend(proxySide, proxySide),
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+	}
+	queries := make(chan string, 64)
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		for {
+			message, err := backend.Receive()
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+				errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if err != nil {
+				serverErrors <- err
+				return
+			}
+			query, ok := message.(*pgproto3.Query)
+			if !ok {
+				serverErrors <- fmt.Errorf("unexpected backend message %T", message)
+				return
+			}
+			queries <- query.String
+			if strings.Contains(query.String, "fail_table") {
+				backend.Send(&pgproto3.ErrorResponse{
+					Severity: "ERROR", Code: "23505", Message: "duplicate key",
+				})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'E'})
+			} else {
+				tag := strings.ToUpper(strings.Fields(query.String)[0])
+				backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+			}
+			if err := backend.Flush(); err != nil {
+				serverErrors <- err
+				return
+			}
+		}
+	}()
+
+	var output bytes.Buffer
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), &output))
+	for _, sql := range []string{
+		"BEGIN",
+		"INSERT INTO example VALUES (1)",
+		"SAVEPOINT a",
+		"INSERT INTO fail_table VALUES (1)",
+		"SELECT 1",
+		"ROLLBACK TO SAVEPOINT a",
+		"INSERT INTO example VALUES (2)",
+		"COMMIT",
+	} {
+		proxy.relayQuery(client, sql)
+	}
+	if proxy.Err() != nil {
+		t.Fatalf("transaction translation marked proxy fatal: %v", proxy.Err())
+	}
+	if client.transactionSavepoint != "" || client.transactionFailed || client.locked {
+		t.Fatalf("client state after COMMIT = %#v, want idle and unlocked", client)
+	}
+	_ = proxySide.Close()
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+	close(queries)
+	var backendQueries []string
+	for query := range queries {
+		backendQueries = append(backendQueries, query)
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		if upper == "COMMIT" || upper == "ROLLBACK" || upper == "BEGIN" {
+			t.Fatalf("client transaction control reached outer backend: %q", query)
+		}
+	}
+	for _, query := range backendQueries {
+		if query == "SELECT 1" {
+			t.Fatalf("query after error reached backend before rollback: %#v", backendQueries)
+		}
+	}
+
+	frontend := pgproto3.NewFrontend(&output, io.Discard)
+	var statuses []byte
+	var sawAbortedError bool
+	for {
+		message, err := frontend.Receive()
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode translated transaction responses: %v", err)
+		}
+		switch message := message.(type) {
+		case *pgproto3.ReadyForQuery:
+			statuses = append(statuses, message.TxStatus)
+		case *pgproto3.ErrorResponse:
+			sawAbortedError = sawAbortedError || message.Code == "25P02"
+		}
+	}
+	if !sawAbortedError {
+		t.Fatal("query after error did not receive SQLSTATE 25P02")
+	}
+	wantStatuses := []byte{'T', 'T', 'T', 'E', 'E', 'T', 'T', 'I'}
+	if !bytes.Equal(statuses, wantStatuses) {
+		t.Fatalf("ReadyForQuery statuses = %q, want %q", statuses, wantStatuses)
+	}
+}
+
+func TestClientCancellationReleasesPendingIrreversibleApproval(t *testing.T) {
+	t.Parallel()
+
+	approvalStarted := make(chan struct{})
+	proxy := &Proxy{
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+		approve: func(context.Context, ApprovalRequest) (bool, error) {
+			close(approvalStarted)
+			select {}
+		},
+	}
+
+	var output bytes.Buffer
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), &output))
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	proxy.acquireClient(client)
+	done := make(chan struct{})
+	go func() {
+		proxy.executeIrreversibleLocked(client, clientStatement{
+			SQL: "VACUUM", Irreversible: "VACUUM cannot run inside a transaction block",
+		})
+		proxy.releaseClientIfIdle(client)
+		close(done)
+	}()
+	select {
+	case <-approvalStarted:
+	case <-time.After(time.Second):
+		t.Fatal("approval hook did not start")
+	}
+	client.cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client cancellation did not release pending approval")
+	}
+}
+
+func TestClientDisconnectCancelsWorkWhileHandlerIsBusy(t *testing.T) {
+	t.Parallel()
+
+	proxySide, clientSide := net.Pipe()
+	backend := pgproto3.NewBackend(proxySide, proxySide)
+	client := newClientState(1, backend)
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	client.incoming = make(chan clientInput)
+	proxy := &Proxy{}
+	go proxy.receiveClient(client)
+
+	_ = clientSide.Close()
+	select {
+	case <-client.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("client disconnect did not cancel in-flight work")
+	}
+	_ = proxySide.Close()
 }

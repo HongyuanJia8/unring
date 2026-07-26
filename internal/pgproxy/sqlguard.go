@@ -2,67 +2,215 @@ package pgproxy
 
 import (
 	"fmt"
+	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
-// unsafeClientSQL uses PostgreSQL's own parser, embedded by libpg_query, as
-// the sole authority for statement boundaries and transaction statement
-// types. There is intentionally no handwritten lexer or text fallback.
-func unsafeClientSQL(sql string) string {
+type statementKind uint8
+
+const (
+	statementRegular statementKind = iota
+	statementBegin
+	statementCommit
+	statementRollback
+	statementSavepoint
+	statementRollbackTo
+	statementRelease
+	statementForbidden
+)
+
+type clientStatement struct {
+	SQL           string
+	Kind          statementKind
+	Savepoint     string
+	Chain         bool
+	Options       bool
+	Irreversible  string
+	Refusal       string
+	ReadOnly      bool
+	RollbackAfter bool
+}
+
+// analyzeClientSQL uses PostgreSQL's own parser, embedded by libpg_query, as
+// the sole authority for statement boundaries and statement types. There is
+// intentionally no handwritten lexer or text fallback: parser failure is a
+// refusal to forward, because guessing here could expose the outer transaction.
+func analyzeClientSQL(sql string) ([]clientStatement, error) {
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
-		// libpg_query embeds a specific PostgreSQL major version, while unring
-		// may proxy a newer server that accepts syntax this parser does not.
-		// Forwarding a parse error could therefore execute a batch containing
-		// transaction control on that newer server. Fail closed instead.
-		return fmt.Sprintf(
-			"unring could not verify this query with PostgreSQL's parser and refused to forward it: %v",
+		return nil, fmt.Errorf(
+			"unring could not verify this query with PostgreSQL's parser and refused to forward it: %w",
 			err,
 		)
 	}
 
-	for _, rawStatement := range tree.GetStmts() {
-		transaction := rawStatement.GetStmt().GetTransactionStmt()
-		if transaction == nil {
-			continue
+	statements := make([]clientStatement, 0, len(tree.GetStmts()))
+	for index, raw := range tree.GetStmts() {
+		start := int(raw.GetStmtLocation())
+		end := len(sql)
+		if raw.GetStmtLen() > 0 {
+			end = start + int(raw.GetStmtLen())
+		} else if index+1 < len(tree.GetStmts()) {
+			end = int(tree.GetStmts()[index+1].GetStmtLocation())
 		}
-		if reason := unsafeTransactionKind(transaction.GetKind()); reason != "" {
-			return reason
+		if start < 0 || end < start || end > len(sql) {
+			return nil, errorsInternalStatementBounds(sql, start, end)
+		}
+
+		statement := clientStatement{SQL: strings.TrimSpace(sql[start:end])}
+		node := raw.GetStmt()
+		if transaction := node.GetTransactionStmt(); transaction != nil {
+			statement.Savepoint = transaction.GetSavepointName()
+			statement.Chain = transaction.GetChain()
+			statement.Options = len(transaction.GetOptions()) != 0
+			switch transaction.GetKind() {
+			case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN,
+				pg_query.TransactionStmtKind_TRANS_STMT_START:
+				statement.Kind = statementBegin
+			case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT:
+				statement.Kind = statementCommit
+			case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK:
+				statement.Kind = statementRollback
+			case pg_query.TransactionStmtKind_TRANS_STMT_SAVEPOINT:
+				statement.Kind = statementSavepoint
+			case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+				statement.Kind = statementRollbackTo
+			case pg_query.TransactionStmtKind_TRANS_STMT_RELEASE:
+				statement.Kind = statementRelease
+			case pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
+				pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
+				pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
+				statement.Kind = statementForbidden
+			default:
+				return nil, fmt.Errorf(
+					"unring refused unaudited PostgreSQL transaction statement kind %s",
+					transaction.GetKind(),
+				)
+			}
+		}
+
+		statement.Irreversible = irreversibleReason(node)
+		statement.ReadOnly = readOnlySelect(node.GetSelectStmt())
+		if node.GetDiscardStmt() != nil &&
+			node.GetDiscardStmt().GetTarget() == pg_query.DiscardMode_DISCARD_ALL {
+			statement.Irreversible = ""
+			statement.Refusal = "unring cannot emulate DISCARD ALL without discarding its shared transaction"
+		}
+		statements = append(statements, statement)
+	}
+	return statements, nil
+}
+
+func readOnlySelect(statement *pg_query.SelectStmt) bool {
+	if statement == nil || statement.GetIntoClause() != nil {
+		return false
+	}
+	with := statement.GetWithClause()
+	if with == nil {
+		return true
+	}
+	for _, raw := range with.GetCtes() {
+		query := raw.GetCommonTableExpr().GetCtequery()
+		if query == nil || query.GetSelectStmt() == nil ||
+			!readOnlySelect(query.GetSelectStmt()) {
+			return false
+		}
+	}
+	return true
+}
+
+func errorsInternalStatementBounds(sql string, start, end int) error {
+	return fmt.Errorf(
+		"unring's PostgreSQL parser returned invalid statement bounds %d:%d for %d-byte query",
+		start, end, len(sql),
+	)
+}
+
+func irreversibleReason(node *pg_query.Node) string {
+	switch {
+	case node.GetCreatedbStmt() != nil:
+		return "CREATE DATABASE cannot run inside a transaction block"
+	case node.GetDropdbStmt() != nil:
+		return "DROP DATABASE cannot run inside a transaction block"
+	case node.GetCreateTableSpaceStmt() != nil:
+		return "CREATE TABLESPACE cannot run inside a transaction block"
+	case node.GetDropTableSpaceStmt() != nil:
+		return "DROP TABLESPACE cannot run inside a transaction block"
+	case node.GetAlterSystemStmt() != nil:
+		return "ALTER SYSTEM cannot run inside a transaction block"
+	case node.GetCheckPointStmt() != nil:
+		return "CHECKPOINT changes cluster state outside the shared transaction"
+	case clusterAll(node.GetClusterStmt()):
+		return "CLUSTER without a table cannot run inside a transaction block"
+	case node.GetVacuumStmt() != nil && node.GetVacuumStmt().GetIsVacuumcmd():
+		return "VACUUM cannot run inside a transaction block"
+	case node.GetIndexStmt() != nil && node.GetIndexStmt().GetConcurrent():
+		return "CREATE INDEX CONCURRENTLY cannot run inside a transaction block"
+	case node.GetDropStmt() != nil && node.GetDropStmt().GetConcurrent():
+		return "DROP INDEX CONCURRENTLY cannot run inside a transaction block"
+	case reindexOutsideTransaction(node.GetReindexStmt()):
+		return "this form of REINDEX cannot run inside a transaction block"
+	case alterDatabaseTablespace(node.GetAlterDatabaseStmt()):
+		return "ALTER DATABASE SET TABLESPACE cannot run inside a transaction block"
+	default:
+		return ""
+	}
+}
+
+func clusterAll(statement *pg_query.ClusterStmt) bool {
+	return statement != nil && statement.GetRelation() == nil
+}
+
+func reindexOutsideTransaction(statement *pg_query.ReindexStmt) bool {
+	if statement == nil {
+		return false
+	}
+	switch statement.GetKind() {
+	case pg_query.ReindexObjectType_REINDEX_OBJECT_SCHEMA,
+		pg_query.ReindexObjectType_REINDEX_OBJECT_SYSTEM,
+		pg_query.ReindexObjectType_REINDEX_OBJECT_DATABASE:
+		return true
+	}
+	for _, parameter := range statement.GetParams() {
+		if definition := parameter.GetDefElem(); definition != nil &&
+			strings.EqualFold(definition.GetDefname(), "concurrently") {
+			return true
+		}
+	}
+	return false
+}
+
+func alterDatabaseTablespace(statement *pg_query.AlterDatabaseStmt) bool {
+	if statement == nil {
+		return false
+	}
+	for _, option := range statement.GetOptions() {
+		if definition := option.GetDefElem(); definition != nil &&
+			strings.EqualFold(definition.GetDefname(), "tablespace") {
+			return true
+		}
+	}
+	return false
+}
+
+// unsafeClientSQL is retained for the original guard regression suite. A
+// non-empty result now means "must not be forwarded unchanged": ordinary
+// transaction control is translated, while prepared-transaction control is
+// rejected. Keeping detection separate protects the parser boundary without
+// conflating it with the new execution policy.
+func unsafeClientSQL(sql string) string {
+	statements, err := analyzeClientSQL(sql)
+	if err != nil {
+		return err.Error()
+	}
+	for _, statement := range statements {
+		switch statement.Kind {
+		case statementBegin, statementCommit, statementRollback:
+			return "unring detected transaction control that must be translated"
+		case statementForbidden:
+			return "unring cannot allow prepared-transaction control in the shared transaction"
 		}
 	}
 	return ""
-}
-
-func unsafeTransactionKind(kind pg_query.TransactionStmtKind) string {
-	switch kind {
-	case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN,
-		pg_query.TransactionStmtKind_TRANS_STMT_START,
-		pg_query.TransactionStmtKind_TRANS_STMT_COMMIT,
-		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK:
-		return "unring owns the shared transaction; client transaction-control commands are not supported"
-
-	case pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
-		pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
-		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
-		return "unring cannot allow prepared-transaction control in the shared transaction"
-
-	case pg_query.TransactionStmtKind_TRANS_STMT_SAVEPOINT,
-		pg_query.TransactionStmtKind_TRANS_STMT_RELEASE,
-		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
-		// Client savepoints do not finish the outer transaction. Unring's own
-		// savepoints live in an unpredictable per-session namespace.
-		return ""
-
-	case pg_query.TransactionStmtKind_TRANSACTION_STMT_KIND_UNDEFINED:
-		return "unring refused an unknown PostgreSQL transaction statement kind"
-
-	default:
-		// A future libpg_query may add a transaction kind with semantics this
-		// version of unring has not audited.
-		return fmt.Sprintf(
-			"unring refused unaudited PostgreSQL transaction statement kind %s",
-			kind,
-		)
-	}
 }

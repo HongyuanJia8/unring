@@ -1,5 +1,4 @@
-// Package pgproxy implements the PostgreSQL simple-query proxy used by one
-// unring session.
+// Package pgproxy implements the PostgreSQL proxy used by one unring session.
 package pgproxy
 
 import (
@@ -41,10 +40,34 @@ type QueryRecord struct {
 	Failed      bool
 }
 
+// IrreversibleAction records a statement that was approved and executed on a
+// separate autocommit connection. It cannot be affected by the final decision.
+type IrreversibleAction struct {
+	SQL string
+}
+
+// ApprovalRequest describes an action that cannot be included in unring's
+// shared transaction.
+type ApprovalRequest struct {
+	SQL    string
+	Reason string
+}
+
+// ApprovalFunc asks whether an irreversible statement may run. Returning
+// false is a normal decline; errors are reported to the client.
+type ApprovalFunc func(context.Context, ApprovalRequest) (bool, error)
+
+// Options configures behavior that requires the embedding application.
+type Options struct {
+	Approve ApprovalFunc
+}
+
 // Summary is a point-in-time copy of the session activity.
 type Summary struct {
-	Connections int
-	Queries     []QueryRecord
+	Connections         int
+	Queries             []QueryRecord
+	FullyReversible     bool
+	IrreversibleActions []IrreversibleAction
 }
 
 // Proxy owns one real PostgreSQL backend connection and transaction.
@@ -52,13 +75,19 @@ type Proxy struct {
 	listener net.Listener
 	address  string
 
-	upstream net.Conn
-	frontend *pgproto3.Frontend
-	queryMu  sync.Mutex
+	upstream          net.Conn
+	frontend          *pgproto3.Frontend
+	queryMu           sync.Mutex
+	activeTransaction uint64
+	escapeClient      uint64
+	config            *pgconn.Config
+	approve           ApprovalFunc
+	runCtx            context.Context
+	cancel            context.CancelFunc
 
 	paramsMu sync.RWMutex
 	params   map[string]string
-	queryID  atomic.Uint64
+	clientID atomic.Uint64
 
 	savepointPrefix string
 
@@ -67,9 +96,10 @@ type Proxy struct {
 	clientWG  sync.WaitGroup
 	acceptWG  sync.WaitGroup
 
-	summaryMu   sync.Mutex
-	connections int
-	queries     []QueryRecord
+	summaryMu           sync.Mutex
+	connections         int
+	queries             []QueryRecord
+	irreversibleActions []IrreversibleAction
 
 	finishMu sync.Mutex
 	finished bool
@@ -88,6 +118,11 @@ type Proxy struct {
 // Start connects to the real database, starts the shared transaction, and
 // begins listening on an ephemeral loopback port.
 func Start(ctx context.Context, config *pgconn.Config) (*Proxy, error) {
+	return StartWithOptions(ctx, config, Options{})
+}
+
+// StartWithOptions is Start with an approval hook for irreversible actions.
+func StartWithOptions(ctx context.Context, config *pgconn.Config, options Options) (*Proxy, error) {
 	if config == nil {
 		return nil, errors.New("start postgres proxy: nil backend config")
 	}
@@ -108,6 +143,7 @@ func Start(ctx context.Context, config *pgconn.Config) (*Proxy, error) {
 		return nil, fmt.Errorf("take ownership of postgres connection: %w", err)
 	}
 
+	runCtx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
 		upstream:        hijacked.Conn,
 		frontend:        hijacked.Frontend,
@@ -115,6 +151,10 @@ func Start(ctx context.Context, config *pgconn.Config) (*Proxy, error) {
 		clients:         make(map[net.Conn]struct{}),
 		fatalDone:       make(chan struct{}),
 		savepointPrefix: savepointPrefix,
+		config:          config.Copy(),
+		approve:         options.Approve,
+		runCtx:          runCtx,
+		cancel:          cancel,
 	}
 
 	if _, err := p.internalQueryLocked("BEGIN"); err != nil {
@@ -167,7 +207,13 @@ func (p *Proxy) Summary() Summary {
 			Failed:      record.Failed,
 		}
 	}
-	return Summary{Connections: p.connections, Queries: queries}
+	actions := append([]IrreversibleAction(nil), p.irreversibleActions...)
+	return Summary{
+		Connections:         p.connections,
+		Queries:             queries,
+		FullyReversible:     len(actions) == 0,
+		IrreversibleActions: actions,
+	}
 }
 
 // Seal stops accepting clients, disconnects existing clients, and waits for
@@ -309,8 +355,21 @@ func (p *Proxy) handleClient(conn net.Conn) {
 		return
 	}
 
+	clientContext, cancelClient := context.WithCancel(p.context())
+	client := newClientState(p.clientID.Add(1), backend)
+	client.ctx = clientContext
+	client.cancel = cancelClient
+	client.incoming = make(chan clientInput)
+	go p.receiveClient(client)
+	defer cancelClient()
+	defer p.cleanupClient(client)
+
 	for {
-		message, err := backend.Receive()
+		input, ok := <-client.incoming
+		if !ok {
+			return
+		}
+		message, err := input.message, input.err
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
 				errors.Is(err, io.ErrUnexpectedEOF) {
@@ -322,7 +381,14 @@ func (p *Proxy) handleClient(conn net.Conn) {
 
 		switch message := message.(type) {
 		case *pgproto3.Query:
-			p.relayQuery(backend, message.String)
+			p.relayQuery(client, message.String)
+			if p.Err() != nil {
+				return
+			}
+		case *pgproto3.Parse, *pgproto3.Bind, *pgproto3.Describe,
+			*pgproto3.Execute, *pgproto3.Close, *pgproto3.Flush,
+			*pgproto3.Sync:
+			p.relayExtended(client, message)
 			if p.Err() != nil {
 				return
 			}
@@ -330,9 +396,28 @@ func (p *Proxy) handleClient(conn net.Conn) {
 			return
 		default:
 			p.sendFatal(backend, fmt.Sprintf(
-				"unring slice 1 supports only PostgreSQL simple Query and Terminate messages; received %T",
+				"unring does not support PostgreSQL frontend message %T",
 				message,
 			))
+			return
+		}
+	}
+}
+
+func (p *Proxy) receiveClient(client *clientState) {
+	defer close(client.incoming)
+	for {
+		message, err := client.backend.Receive()
+		if err != nil {
+			client.cancel()
+		}
+		input := clientInput{message: message, err: err}
+		select {
+		case client.incoming <- input:
+		case <-client.ctx.Done():
+			return
+		}
+		if err != nil {
 			return
 		}
 	}
@@ -369,13 +454,13 @@ func (p *Proxy) handshake(conn net.Conn, backend *pgproto3.Backend) error {
 				ProcessID: uint32(time.Now().UnixNano()),
 				SecretKey: key,
 			})
-			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 			if err := backend.Flush(); err != nil {
 				return fmt.Errorf("send startup response: %w", err)
 			}
 			return nil
 		case *pgproto3.CancelRequest:
-			return errors.New("query cancellation is not supported in slice 1")
+			return errors.New("query cancellation is not supported")
 		default:
 			return fmt.Errorf("unsupported startup message %T", message)
 		}
@@ -383,6 +468,9 @@ func (p *Proxy) handshake(conn net.Conn, backend *pgproto3.Backend) error {
 }
 
 func (p *Proxy) stopClients() {
+	if p.cancel != nil {
+		p.cancel()
+	}
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
@@ -394,6 +482,13 @@ func (p *Proxy) stopClients() {
 	}
 	p.clientsMu.Unlock()
 	p.clientWG.Wait()
+}
+
+func (p *Proxy) context() context.Context {
+	if p.runCtx != nil {
+		return p.runCtx
+	}
+	return context.Background()
 }
 
 func (p *Proxy) markFatal(err error) {

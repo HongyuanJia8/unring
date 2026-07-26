@@ -31,8 +31,9 @@ sufficient.
 `unring` opens one real transaction on the configured database, binds a proxy to an
 ephemeral loopback port, and injects `DATABASE_URL` plus the standard `PG*` connection
 variables into the child process only. Every client connection opened by that child
-is serialized onto the same backend transaction. Closing one client connection does
-not close the transaction.
+uses the same backend transaction; individual protocol exchanges are serialized
+because PostgreSQL has only one backend connection. Closing one client connection
+does not close the transaction.
 
 After the child exits, `unring` prints the simple-query batches and asks whether to
 commit or discard. Automation must choose explicitly:
@@ -90,16 +91,19 @@ ability to make any of it permanent without you saying so.
 
 - Sequences do not roll back — discarded runs still leave gaps in auto-increment IDs.
 - Postgres only. MySQL commits DDL implicitly, which breaks the core guarantee.
-- This slice supports PostgreSQL's simple query protocol only. Clients using
-  `Parse`/`Bind`/`Execute` fail loudly; extended-query support is M1.5.
-- Statements PostgreSQL forbids inside a transaction (`CREATE DATABASE`, `VACUUM`,
-  `CREATE INDEX CONCURRENTLY`, `ALTER SYSTEM`, and similar) return their real backend
-  errors. The session recovers and remains usable, but the M1.6 approval escape hatch
-  is not part of this slice.
-- Client transaction-control statements are rejected because only unring may commit
-  or roll back the shared transaction.
-- Concurrent client queries are intentionally serialized on the one backend
-  connection.
+- Both PostgreSQL's simple and extended query protocols are supported. Prepared
+  statement and portal names are isolated per client on the shared backend.
+- Statements that must run outside a transaction (`CREATE DATABASE`, `VACUUM`,
+  `CREATE INDEX CONCURRENTLY`, `ALTER SYSTEM`, `CHECKPOINT`, and similar) require
+  approval and make the session not fully reversible. They are refused if the shared
+  transaction already has uncommitted database changes.
+- Client transaction control is mapped to private savepoints. One client-visible
+  transaction may be open at a time; it does not pin the backend while idle.
+- While that transaction is open, other clients may run read-only queries. Unring
+  rolls those query cycles back internally so they cannot become part of the open
+  client's savepoint. A concurrent write or second `BEGIN` fails immediately with
+  SQLSTATE `55P03`: waiting would recreate the cross-connection deadlock this policy
+  is intended to prevent.
 - Connection options passed directly as child command arguments can bypass injected
   environment variables. This tool guards against accidents, not deliberate bypass.
 - Some effects genuinely cannot be undone: mail that has been delivered, a message
