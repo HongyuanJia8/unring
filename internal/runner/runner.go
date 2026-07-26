@@ -13,13 +13,27 @@ import (
 
 // Options controls one child process.
 type Options struct {
-	Command []string
-	Env     []string
-	Stdin   io.Reader
-	Stdout  io.Writer
-	Stderr  io.Writer
-	Signals <-chan os.Signal
-	Abort   <-chan struct{}
+	Command   []string
+	Env       []string
+	Stdin     io.Reader
+	Stdout    io.Writer
+	Stderr    io.Writer
+	Signals   <-chan os.Signal
+	Abort     <-chan struct{}
+	Approvals <-chan ApprovalRequest
+}
+
+// ApprovalRequest lets the supervisor temporarily reclaim an interactive
+// terminal while a child is blocked waiting for an unring decision.
+type ApprovalRequest struct {
+	Decide func() (bool, error)
+	Reply  chan<- ApprovalResult
+}
+
+// ApprovalResult is returned after the child has regained its terminal.
+type ApprovalResult struct {
+	Approved bool
+	Err      error
 }
 
 // Result describes how the child ended.
@@ -63,6 +77,7 @@ func Run(options Options) Result {
 
 	signals := options.Signals
 	abort := options.Abort
+	approvals := options.Approvals
 	var forceKill <-chan time.Time
 	var interrupted bool
 	var sessionLost bool
@@ -139,6 +154,13 @@ func Run(options Options) Result {
 			abort = nil
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGTERM)
 			forceKill = time.After(2 * time.Second)
+		case request, ok := <-approvals:
+			if !ok {
+				approvals = nil
+				continue
+			}
+			approvalResult := processGroup.handleApproval(command.Process.Pid, request.Decide)
+			request.Reply <- approvalResult
 		case <-forceKill:
 			forceKill = nil
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)

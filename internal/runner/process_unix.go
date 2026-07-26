@@ -3,6 +3,8 @@
 package runner
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -13,6 +15,57 @@ import (
 
 	"golang.org/x/term"
 )
+
+func (control processGroupControl) handleApproval(
+	childPID int,
+	decide func() (bool, error),
+) ApprovalResult {
+	if control.terminal == nil {
+		approved, err := decide()
+		return ApprovalResult{Approved: approved, Err: err}
+	}
+	if err := signalProcessGroup(childPID, syscall.SIGSTOP); err != nil {
+		return ApprovalResult{Err: fmt.Errorf("pause child for approval: %w", err)}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stopped, err := childStopped(childPID)
+		if err == nil && stopped {
+			break
+		}
+		if err != nil && !errors.Is(err, syscall.ECHILD) {
+			_ = signalProcessGroup(childPID, syscall.SIGCONT)
+			return ApprovalResult{Err: fmt.Errorf("wait for child to pause: %w", err)}
+		}
+		if time.Now().After(deadline) {
+			_ = signalProcessGroup(childPID, syscall.SIGCONT)
+			return ApprovalResult{Err: errors.New("timed out pausing child for approval")}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := control.restoreForeground(); err != nil {
+		_ = signalProcessGroup(childPID, syscall.SIGCONT)
+		return ApprovalResult{Err: fmt.Errorf("reclaim terminal for approval: %w", err)}
+	}
+	approved, decisionErr := decide()
+	foregroundErr := control.setForeground(int32(childPID))
+	continueErr := signalProcessGroup(childPID, syscall.SIGCONT)
+	return ApprovalResult{
+		Approved: approved,
+		Err: errors.Join(
+			decisionErr,
+			wrapApprovalError("return terminal to child", foregroundErr),
+			wrapApprovalError("resume child after approval", continueErr),
+		),
+	}
+}
+
+func wrapApprovalError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
 
 type processGroupControl struct {
 	terminal           *os.File

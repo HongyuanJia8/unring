@@ -73,7 +73,29 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	proxy, err := pgproxy.Start(ctx, backendConfig)
+	approvalRequests := make(chan runner.ApprovalRequest)
+	proxy, err := pgproxy.StartWithOptions(ctx, backendConfig, pgproxy.Options{
+		Approve: func(approvalContext context.Context, request pgproxy.ApprovalRequest) (bool, error) {
+			reply := make(chan runner.ApprovalResult, 1)
+			work := runner.ApprovalRequest{
+				Decide: func() (bool, error) {
+					return promptIrreversibleApproval(stdin, stdout, request), nil
+				},
+				Reply: reply,
+			}
+			select {
+			case approvalRequests <- work:
+			case <-approvalContext.Done():
+				return false, approvalContext.Err()
+			}
+			select {
+			case result := <-reply:
+				return result.Approved, result.Err
+			case <-approvalContext.Done():
+				return false, approvalContext.Err()
+			}
+		},
+	})
 	cancel()
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: start postgres session: %v\n", err)
@@ -96,13 +118,14 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	defer signal.Stop(signalChannel)
 
 	result := runner.Run(runner.Options{
-		Command: command,
-		Env:     childEnvironment,
-		Stdin:   stdin,
-		Stdout:  stdout,
-		Stderr:  stderr,
-		Signals: signalChannel,
-		Abort:   proxy.Done(),
+		Command:   command,
+		Env:       childEnvironment,
+		Stdin:     stdin,
+		Stdout:    stdout,
+		Stderr:    stderr,
+		Signals:   signalChannel,
+		Abort:     proxy.Done(),
+		Approvals: approvalRequests,
 	})
 	interrupted := result.Interrupted || pendingSignal(signalChannel)
 
@@ -203,6 +226,36 @@ func promptDecision(input io.Reader, output io.Writer) pgproxy.Decision {
 	}
 }
 
+func promptIrreversibleApproval(
+	input io.Reader,
+	output io.Writer,
+	request pgproxy.ApprovalRequest,
+) bool {
+	fmt.Fprintln(output, "\nIrreversible PostgreSQL action requested")
+	fmt.Fprintln(output, "  SQL (exactly as requested):")
+	fmt.Fprintln(output, request.SQL)
+	fmt.Fprintf(output, "  Reason: %s.\n", request.Reason)
+	fmt.Fprintln(output,
+		"  This will run now on a separate non-transactional connection and cannot be undone by discard.")
+	if !isTerminal(input) {
+		fmt.Fprintln(output, "  No interactive terminal; declining the action.")
+		return false
+	}
+
+	fmt.Fprint(output, "Run this irreversible action? [y/N] ")
+	answer, err := bufio.NewReader(input).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintf(output, "\nCould not read approval (%v); declining.\n", err)
+		return false
+	}
+	approved := strings.EqualFold(strings.TrimSpace(answer), "y") ||
+		strings.EqualFold(strings.TrimSpace(answer), "yes")
+	if !approved {
+		fmt.Fprintln(output, "Action declined; it was not run.")
+	}
+	return approved
+}
+
 func promptDecisionWithSignal(
 	input io.Reader,
 	output io.Writer,
@@ -262,6 +315,15 @@ func printSummary(output io.Writer, summary pgproxy.Summary) {
 		fmt.Fprintln(output)
 	}
 	fmt.Fprintln(output, "  Note: PostgreSQL sequences do not roll back; discarded sessions can leave ID gaps.")
+	if !summary.FullyReversible {
+		fmt.Fprintln(output,
+			"  WARNING: This session is NOT FULLY REVERSIBLE. The following approved actions already ran")
+		fmt.Fprintln(output,
+			"  outside the shared transaction; commit or discard cannot undo them:")
+		for _, action := range summary.IrreversibleActions {
+			fmt.Fprintf(output, "  - %s\n", compactSQL(action.SQL))
+		}
+	}
 }
 
 func compactSQL(sql string) string {

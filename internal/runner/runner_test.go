@@ -82,6 +82,36 @@ func TestRunTreatsSignaledChildAsInterrupted(t *testing.T) {
 	}
 }
 
+func TestRunServicesApprovalWhileChildIsActive(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan ApprovalRequest)
+	approvalDone := make(chan ApprovalResult, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		reply := make(chan ApprovalResult, 1)
+		requests <- ApprovalRequest{
+			Decide: func() (bool, error) { return true, nil },
+			Reply:  reply,
+		}
+		approvalDone <- <-reply
+	}()
+	result := Run(Options{
+		Command:   []string{"/bin/sh", "-c", "sleep 0.2"},
+		Env:       os.Environ(),
+		Stdout:    io.Discard,
+		Stderr:    io.Discard,
+		Approvals: requests,
+	})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run() = %#v", result)
+	}
+	approval := <-approvalDone
+	if !approval.Approved || approval.Err != nil {
+		t.Fatalf("approval result = %#v", approval)
+	}
+}
+
 func TestChildStoppedObservesStopWithoutReapingExit(t *testing.T) {
 	t.Parallel()
 

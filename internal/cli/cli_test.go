@@ -34,3 +34,36 @@ func TestPromptDefaultsToRollbackWithoutTerminal(t *testing.T) {
 		t.Fatalf("non-interactive guidance missing: %s", output.String())
 	}
 }
+
+func TestSummaryWarnsWhenSessionIsNotFullyReversible(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	printSummary(&output, pgproxy.Summary{
+		FullyReversible: false,
+		IrreversibleActions: []pgproxy.IrreversibleAction{
+			{SQL: "VACUUM"},
+		},
+	})
+	text := output.String()
+	if !strings.Contains(text, "NOT FULLY REVERSIBLE") ||
+		!strings.Contains(text, "VACUUM") ||
+		!strings.Contains(text, "discard cannot undo") {
+		t.Fatalf("irreversible summary warning missing:\n%s", text)
+	}
+}
+
+func TestIrreversibleApprovalDefaultsToDeclineWithoutTerminal(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	approved := promptIrreversibleApproval(strings.NewReader("yes\n"), &output,
+		pgproxy.ApprovalRequest{SQL: "VACUUM", Reason: "outside a transaction"})
+	if approved {
+		t.Fatal("non-interactive irreversible approval unexpectedly succeeded")
+	}
+	if !strings.Contains(output.String(), "cannot be undone by discard") ||
+		!strings.Contains(output.String(), "declining") {
+		t.Fatalf("approval warning missing:\n%s", output.String())
+	}
+}
