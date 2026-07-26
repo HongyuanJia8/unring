@@ -118,7 +118,7 @@ func skipDoubleQuoted(sql string, i int) int {
 }
 
 func skipLineComment(sql string, i int) int {
-	for i < len(sql) && sql[i] != '\n' {
+	for i < len(sql) && sql[i] != '\n' && sql[i] != '\r' {
 		i++
 	}
 	return i
@@ -143,9 +143,14 @@ func skipBlockComment(sql string, i int) int {
 
 func skipDollarQuoted(sql string, i int) (int, bool) {
 	end := i + 1
-	for end < len(sql) && (sql[end] == '_' || unicode.IsLetter(rune(sql[end])) ||
-		unicode.IsDigit(rune(sql[end]))) {
+	if end < len(sql) && sql[end] != '$' {
+		if !isDollarQuoteStart(sql[end]) {
+			return i, false
+		}
 		end++
+		for end < len(sql) && isDollarQuoteContinuation(sql[end]) {
+			end++
+		}
 	}
 	if end >= len(sql) || sql[end] != '$' {
 		return i, false
@@ -156,6 +161,15 @@ func skipDollarQuoted(sql string, i int) (int, bool) {
 		return len(sql), true
 	}
 	return end + 1 + closeAt + len(tag), true
+}
+
+func isDollarQuoteStart(b byte) bool {
+	return b == '_' || b >= 0x80 ||
+		b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+}
+
+func isDollarQuoteContinuation(b byte) bool {
+	return isDollarQuoteStart(b) || b >= '0' && b <= '9'
 }
 
 func isSpace(b byte) bool {

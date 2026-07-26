@@ -42,6 +42,8 @@ func Run(options Options) Result {
 	command.Stdout = options.Stdout
 	command.Stderr = options.Stderr
 	processGroup := configureProcessGroup(command, options.Stdin)
+	childChanges, stopWatchingChild := processGroup.watchChildChanges()
+	defer stopWatchingChild()
 
 	if err := command.Start(); err != nil {
 		restoreErr := processGroup.restoreForeground()
@@ -70,6 +72,7 @@ func Run(options Options) Result {
 		select {
 		case err := <-waited:
 			exitCode := processExitCode(command.ProcessState, err)
+			interrupted = interrupted || processWasSignaled(command.ProcessState)
 			if restoreErr := processGroup.restoreForeground(); restoreErr != nil {
 				supervisionErr = errors.Join(
 					supervisionErr,
@@ -84,6 +87,24 @@ func Run(options Options) Result {
 				Interrupted: interrupted,
 				SessionLost: sessionLost,
 				Err:         errors.Join(childWaitError(err), supervisionErr),
+			}
+		case <-childChanges:
+			stopped, err := childStopped(command.Process.Pid)
+			if err != nil && !errors.Is(err, syscall.ECHILD) {
+				supervisionErr = errors.Join(
+					supervisionErr,
+					fmt.Errorf("inspect child job-control state: %w", err),
+				)
+				continue
+			}
+			if stopped {
+				if err := processGroup.suspendWithChild(command.Process.Pid); err != nil {
+					supervisionErr = errors.Join(
+						supervisionErr,
+						fmt.Errorf("suspend with stopped child: %w", err),
+					)
+					_ = signalProcessGroup(command.Process.Pid, syscall.SIGCONT)
+				}
 			}
 		case signal, ok := <-signals:
 			if !ok {
@@ -112,6 +133,14 @@ func Run(options Options) Result {
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)
 		}
 	}
+}
+
+func processWasSignaled(state *os.ProcessState) bool {
+	if state == nil {
+		return false
+	}
+	status, ok := state.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled()
 }
 
 func childWaitError(err error) error {

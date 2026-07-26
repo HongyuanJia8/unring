@@ -4,6 +4,8 @@ package pgproxy
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +60,8 @@ type Proxy struct {
 	params   map[string]string
 	queryID  atomic.Uint64
 
+	savepointPrefix string
+
 	clientsMu sync.Mutex
 	clients   map[net.Conn]struct{}
 	clientWG  sync.WaitGroup
@@ -88,6 +92,11 @@ func Start(ctx context.Context, config *pgconn.Config) (*Proxy, error) {
 		return nil, errors.New("start postgres proxy: nil backend config")
 	}
 
+	savepointPrefix, err := randomSavepointPrefix()
+	if err != nil {
+		return nil, fmt.Errorf("create private savepoint namespace: %w", err)
+	}
+
 	pgConn, err := pgconn.ConnectConfig(ctx, config.Copy())
 	if err != nil {
 		return nil, fmt.Errorf("connect to real postgres: %w", err)
@@ -100,11 +109,12 @@ func Start(ctx context.Context, config *pgconn.Config) (*Proxy, error) {
 	}
 
 	p := &Proxy{
-		upstream:  hijacked.Conn,
-		frontend:  hijacked.Frontend,
-		params:    cloneMap(hijacked.ParameterStatuses),
-		clients:   make(map[net.Conn]struct{}),
-		fatalDone: make(chan struct{}),
+		upstream:        hijacked.Conn,
+		frontend:        hijacked.Frontend,
+		params:          cloneMap(hijacked.ParameterStatuses),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: savepointPrefix,
 	}
 
 	if _, err := p.internalQueryLocked("BEGIN"); err != nil {
@@ -411,4 +421,12 @@ func cloneMap(source map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func randomSavepointPrefix() (string, error) {
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", err
+	}
+	return "unring_" + hex.EncodeToString(entropy[:]), nil
 }

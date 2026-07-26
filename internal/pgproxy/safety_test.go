@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -23,11 +24,12 @@ func TestRelayQueryDetectsLostTransaction(t *testing.T) {
 	})
 
 	proxy := &Proxy{
-		upstream:  proxySide,
-		frontend:  pgproto3.NewFrontend(proxySide, proxySide),
-		params:    make(map[string]string),
-		clients:   make(map[net.Conn]struct{}),
-		fatalDone: make(chan struct{}),
+		upstream:        proxySide,
+		frontend:        pgproto3.NewFrontend(proxySide, proxySide),
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
 	}
 
 	serverErrors := make(chan error, 1)
@@ -41,7 +43,7 @@ func TestRelayQueryDetectsLostTransaction(t *testing.T) {
 			return
 		}
 		if query, ok := message.(*pgproto3.Query); !ok ||
-			!strings.HasPrefix(query.String, "SAVEPOINT unring_internal_") {
+			!strings.HasPrefix(query.String, "SAVEPOINT unring_testtoken_") {
 			serverErrors <- errors.New("first proxy query was not its internal savepoint")
 			return
 		}
@@ -96,6 +98,81 @@ func TestRelayQueryDetectsLostTransaction(t *testing.T) {
 	if !ok || errorResponse.Severity != "FATAL" ||
 		!strings.Contains(errorResponse.Message, "interception was lost") {
 		t.Fatalf("client interception-loss message = %#v", message)
+	}
+}
+
+func TestInternalQueryAllowsAsynchronousMessages(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	t.Cleanup(func() {
+		_ = proxySide.Close()
+		_ = postgresSide.Close()
+	})
+	proxy := &Proxy{
+		upstream: proxySide,
+		frontend: pgproto3.NewFrontend(proxySide, proxySide),
+		params:   make(map[string]string),
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		message, err := backend.Receive()
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		query, ok := message.(*pgproto3.Query)
+		if !ok || query.String != "SAVEPOINT unring_test" {
+			serverErrors <- fmt.Errorf("got %#v, want internal SAVEPOINT query", message)
+			return
+		}
+		backend.Send(&pgproto3.NoticeResponse{
+			Severity: "DEBUG",
+			Message:  "debug notice from internal savepoint",
+		})
+		backend.Send(&pgproto3.NotificationResponse{
+			PID:     42,
+			Channel: "events",
+			Payload: "payload",
+		})
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SAVEPOINT")})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	status, err := proxy.internalQueryLocked("SAVEPOINT unring_test")
+	if err != nil {
+		t.Fatalf("internalQueryLocked() rejected asynchronous backend messages: %v", err)
+	}
+	if status != 'T' {
+		t.Fatalf("internalQueryLocked() status = %q, want T", status)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+}
+
+func TestRandomSavepointPrefix(t *testing.T) {
+	t.Parallel()
+
+	first, err := randomSavepointPrefix()
+	if err != nil {
+		t.Fatalf("first randomSavepointPrefix(): %v", err)
+	}
+	second, err := randomSavepointPrefix()
+	if err != nil {
+		t.Fatalf("second randomSavepointPrefix(): %v", err)
+	}
+	if first == second {
+		t.Fatalf("random savepoint prefixes unexpectedly match: %q", first)
+	}
+	if !strings.HasPrefix(first, "unring_") || len(first) != len("unring_")+32 {
+		t.Fatalf("random savepoint prefix has unexpected shape: %q", first)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/term"
@@ -34,6 +35,17 @@ func configureProcessGroup(command *exec.Cmd, stdin io.Reader) processGroupContr
 	}
 }
 
+func (control processGroupControl) watchChildChanges() (<-chan time.Time, func()) {
+	if control.terminal == nil {
+		return nil, func() {}
+	}
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	return ticker.C, func() {
+		ticker.Stop()
+	}
+}
+
 func signalProcessGroup(pid int, signal os.Signal) error {
 	unixSignal, ok := signal.(syscall.Signal)
 	if !ok {
@@ -46,14 +58,16 @@ func (control processGroupControl) restoreForeground() error {
 	if control.terminal == nil {
 		return nil
 	}
+	return control.setForeground(int32(control.parentProcessGroup))
+}
 
+func (control processGroupControl) setForeground(processGroup int32) error {
 	wasIgnored := signal.Ignored(syscall.SIGTTOU)
 	if !wasIgnored {
 		signal.Ignore(syscall.SIGTTOU)
 		defer signal.Reset(syscall.SIGTTOU)
 	}
 
-	processGroup := control.parentProcessGroup
 	_, _, errno := syscall.RawSyscall(
 		syscall.SYS_IOCTL,
 		control.terminal.Fd(),
@@ -64,6 +78,52 @@ func (control processGroupControl) restoreForeground() error {
 		return errno
 	}
 	return nil
+}
+
+func (control processGroupControl) foreground() (int32, error) {
+	var processGroup int32
+	_, _, errno := syscall.RawSyscall(
+		syscall.SYS_IOCTL,
+		control.terminal.Fd(),
+		uintptr(syscall.TIOCGPGRP),
+		uintptr(unsafe.Pointer(&processGroup)),
+	)
+	if errno != 0 {
+		return 0, errno
+	}
+	return processGroup, nil
+}
+
+func (control processGroupControl) suspendWithChild(childPID int) error {
+	if control.terminal == nil {
+		return nil
+	}
+	foreground, err := control.foreground()
+	if err != nil {
+		return err
+	}
+	if foreground == int32(childPID) {
+		if err := control.restoreForeground(); err != nil {
+			return err
+		}
+	}
+
+	// The wrapped command is a nested foreground job. Stop unring so its
+	// invoking shell can perform normal job control. Execution resumes here
+	// after that shell runs fg/bg and sends SIGCONT to unring.
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTSTP); err != nil {
+		return err
+	}
+	foreground, err = control.foreground()
+	if err != nil {
+		return err
+	}
+	if foreground == int32(control.parentProcessGroup) {
+		if err := control.setForeground(int32(childPID)); err != nil {
+			return err
+		}
+	}
+	return signalProcessGroup(childPID, syscall.SIGCONT)
 }
 
 func isTerminal(file *os.File) bool {

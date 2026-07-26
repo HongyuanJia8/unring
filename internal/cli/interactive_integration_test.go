@@ -60,6 +60,38 @@ func TestBuiltBinaryRunsInteractiveChild(t *testing.T) {
 	}
 }
 
+func TestCommitFlagCannotOverrideSignaledChild(t *testing.T) {
+	connectionString, backendDone := startInteractiveTestBackend(t)
+	t.Setenv("DATABASE_URL", connectionString)
+
+	binary := buildTestBinary(t)
+	command := exec.Command(
+		binary,
+		"run",
+		"--commit",
+		"--",
+		"/bin/sh",
+		"-c",
+		"kill -INT $$",
+	)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) {
+		t.Fatalf("signal-terminated unring error = %v, want *exec.ExitError\n%s", err, output)
+	}
+	if got, want := exitError.ExitCode(), 128+int(syscall.SIGINT); got != want {
+		t.Fatalf("signal-terminated unring exit code = %d, want %d\n%s", got, want, output)
+	}
+	if strings.Contains(string(output), "Session committed.") ||
+		!strings.Contains(string(output), "Session discarded.") {
+		t.Fatalf("--commit overrode a signal-terminated child:\n%s", output)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
 func TestBuiltBinaryRunsInteractivePsql(t *testing.T) {
 	psqlPath, err := exec.LookPath("psql")
 	if err != nil {

@@ -89,6 +89,10 @@ func TestSharedTransactionIntegration(t *testing.T) {
 	if got := scalarTest(t, ctx, second, "SELECT 42"); got != "42" {
 		t.Fatalf("session did not recover after backend error: got %s", got)
 	}
+	execTest(t, ctx, second, "SET client_min_messages TO DEBUG5")
+	if got := scalarTest(t, ctx, second, "SELECT 43"); got != "43" {
+		t.Fatalf("session did not tolerate notices around internal queries: got %s", got)
+	}
 	if _, err := second.Exec(ctx, "COMMIT").ReadAll(); err == nil ||
 		!strings.Contains(err.Error(), "unring owns") {
 		t.Fatalf("client COMMIT error = %v, want loud transaction-owner error", err)
@@ -100,6 +104,21 @@ func TestSharedTransactionIntegration(t *testing.T) {
 	if _, err := second.Exec(ctx, smuggledCommit).ReadAll(); err == nil ||
 		!strings.Contains(err.Error(), "unring owns") {
 		t.Fatalf("backslash-smuggled COMMIT error = %v, want loud transaction-owner error", err)
+	}
+	for name, sql := range map[string]string{
+		"carriage-return comment": "SELECT 1; --\rCOMMIT;",
+		"guessed savepoint escalation": "SELECT 1; --\rCOMMIT; BEGIN; " +
+			"SAVEPOINT unring_internal_1;",
+		"UTF-8 dollar tag": "SELECT $\xc3\xa9$'$\xc3\xa9$; COMMIT;",
+	} {
+		if _, err := second.Exec(ctx, sql).ReadAll(); err == nil ||
+			!strings.Contains(err.Error(), "unring owns") {
+			t.Fatalf("%s guard error = %v, want loud transaction-owner error", name, err)
+		}
+	}
+	if got := scalarTest(t, ctx, second,
+		"SELECT $\xe4\xb8\xad$; COMMIT;$\xe4\xb8\xad$"); got != "; COMMIT;" {
+		t.Fatalf("valid UTF-8 dollar-quoted literal = %q, want ; COMMIT;", got)
 	}
 	if got := scalarTest(t, ctx, second,
 		fmt.Sprintf("SELECT value FROM %s", table)); got != "inside" {

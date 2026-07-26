@@ -30,7 +30,7 @@ func (p *Proxy) relayQuery(client *pgproto3.Backend, sql string) {
 		return
 	}
 
-	savepoint := fmt.Sprintf("unring_internal_%d", p.queryID.Add(1))
+	savepoint := fmt.Sprintf("%s_%d", p.savepointPrefix, p.queryID.Add(1))
 	if _, err := p.internalQueryLocked("SAVEPOINT " + savepoint); err != nil {
 		p.markFatal(fmt.Errorf("create query savepoint: %w", err))
 		return
@@ -208,6 +208,10 @@ func (p *Proxy) internalQueryLocked(sql string) (byte, error) {
 			p.paramsMu.Lock()
 			p.params[message.Name] = message.Value
 			p.paramsMu.Unlock()
+		case *pgproto3.NoticeResponse, *pgproto3.NotificationResponse:
+			// These asynchronous messages are valid between any two protocol
+			// messages. Internal maintenance has no client-visible result stream,
+			// so there is nowhere meaningful to forward them.
 		case *pgproto3.ReadyForQuery:
 			if responseErr != nil {
 				return message.TxStatus, responseErr
