@@ -8,8 +8,46 @@ what it did and what it is about to do, then you decide: **commit** or **discard
 
 The name comes from *you can't unring a bell*. That is the whole point: now you can.
 
-> **Status: early development.** Nothing here is usable yet. See [ROADMAP.md](ROADMAP.md)
-> for what is built and what is next.
+> **Status: first Postgres vertical slice.** The shared-transaction `run` command
+> works with PostgreSQL's simple query protocol. Extended-query clients and other
+> side-effect types are not supported yet. See [ROADMAP.md](ROADMAP.md) for what is
+> built and what is next.
+
+## Try the Postgres slice
+
+Set your normal PostgreSQL connection environment, then wrap a command:
+
+```sh
+export DATABASE_URL='postgresql://user:password@real-host/database'
+go build -o unring ./cmd/unring
+./unring run -- psql
+```
+
+`unring` opens one real transaction on the configured database, binds a proxy to an
+ephemeral loopback port, and injects `DATABASE_URL` plus the standard `PG*` connection
+variables into the child process only. Every client connection opened by that child
+is serialized onto the same backend transaction. Closing one client connection does
+not close the transaction.
+
+After the child exits, `unring` prints the simple-query batches and asks whether to
+commit or discard. Automation must choose explicitly:
+
+```sh
+unring run --commit -- your-command
+unring run --discard -- your-command
+```
+
+Without a terminal or a decision flag, the session defaults to discard. SIGINT,
+SIGTERM, an unring panic, or loss of the real database connection also defaults to
+rollback. The child's exit code is returned after a successful decision.
+
+Database integration tests start and stop their own throwaway PostgreSQL cluster.
+They skip when PostgreSQL is not installed; CI and explicit verification require a
+real server and fail instead of skipping:
+
+```sh
+make test-integration
+```
 
 ## How it works
 
@@ -44,6 +82,18 @@ ability to make any of it permanent without you saying so.
 
 - Sequences do not roll back — discarded runs still leave gaps in auto-increment IDs.
 - Postgres only. MySQL commits DDL implicitly, which breaks the core guarantee.
+- This slice supports PostgreSQL's simple query protocol only. Clients using
+  `Parse`/`Bind`/`Execute` fail loudly; extended-query support is M1.5.
+- Statements PostgreSQL forbids inside a transaction (`CREATE DATABASE`, `VACUUM`,
+  `CREATE INDEX CONCURRENTLY`, `ALTER SYSTEM`, and similar) return their real backend
+  errors. The session recovers and remains usable, but the M1.6 approval escape hatch
+  is not part of this slice.
+- Client transaction-control statements are rejected because only unring may commit
+  or roll back the shared transaction.
+- Concurrent client queries are intentionally serialized on the one backend
+  connection.
+- Connection options passed directly as child command arguments can bypass injected
+  environment variables. This tool guards against accidents, not deliberate bypass.
 - Some effects genuinely cannot be undone: mail that has been delivered, a message
   someone already read. The value is that most side effects never happen at all;
   compensation is only the fallback.
