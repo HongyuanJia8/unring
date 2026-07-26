@@ -21,12 +21,15 @@ const (
 )
 
 type clientStatement struct {
-	SQL          string
-	Kind         statementKind
-	Savepoint    string
-	Chain        bool
-	Options      bool
-	Irreversible string
+	SQL           string
+	Kind          statementKind
+	Savepoint     string
+	Chain         bool
+	Options       bool
+	Irreversible  string
+	Refusal       string
+	ReadOnly      bool
+	RollbackAfter bool
 }
 
 // analyzeClientSQL uses PostgreSQL's own parser, embedded by libpg_query, as
@@ -88,9 +91,33 @@ func analyzeClientSQL(sql string) ([]clientStatement, error) {
 		}
 
 		statement.Irreversible = irreversibleReason(node)
+		statement.ReadOnly = readOnlySelect(node.GetSelectStmt())
+		if node.GetDiscardStmt() != nil &&
+			node.GetDiscardStmt().GetTarget() == pg_query.DiscardMode_DISCARD_ALL {
+			statement.Irreversible = ""
+			statement.Refusal = "unring cannot emulate DISCARD ALL without discarding its shared transaction"
+		}
 		statements = append(statements, statement)
 	}
 	return statements, nil
+}
+
+func readOnlySelect(statement *pg_query.SelectStmt) bool {
+	if statement == nil || statement.GetIntoClause() != nil {
+		return false
+	}
+	with := statement.GetWithClause()
+	if with == nil {
+		return true
+	}
+	for _, raw := range with.GetCtes() {
+		query := raw.GetCommonTableExpr().GetCtequery()
+		if query == nil || query.GetSelectStmt() == nil ||
+			!readOnlySelect(query.GetSelectStmt()) {
+			return false
+		}
+	}
+	return true
 }
 
 func errorsInternalStatementBounds(sql string, start, end int) error {
@@ -120,9 +147,6 @@ func irreversibleReason(node *pg_query.Node) string {
 		return "CREATE INDEX CONCURRENTLY cannot run inside a transaction block"
 	case node.GetDropStmt() != nil && node.GetDropStmt().GetConcurrent():
 		return "DROP INDEX CONCURRENTLY cannot run inside a transaction block"
-	case node.GetDiscardStmt() != nil &&
-		node.GetDiscardStmt().GetTarget() == pg_query.DiscardMode_DISCARD_ALL:
-		return "DISCARD ALL cannot run inside a transaction block"
 	case reindexOutsideTransaction(node.GetReindexStmt()):
 		return "this form of REINDEX cannot run inside a transaction block"
 	case alterDatabaseTablespace(node.GetAlterDatabaseStmt()):

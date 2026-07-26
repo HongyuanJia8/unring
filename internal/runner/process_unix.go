@@ -60,6 +60,18 @@ func (control processGroupControl) handleApproval(
 	}
 }
 
+func (control processGroupControl) cancelApproval(childPID int) error {
+	var foregroundErr error
+	if control.terminal != nil {
+		foregroundErr = control.setForeground(int32(childPID))
+	}
+	continueErr := signalProcessGroup(childPID, syscall.SIGCONT)
+	return errors.Join(
+		wrapApprovalError("return terminal to interrupted child", foregroundErr),
+		wrapApprovalError("resume interrupted child", continueErr),
+	)
+}
+
 func wrapApprovalError(operation string, err error) error {
 	if err == nil {
 		return nil

@@ -358,6 +358,259 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 	}
 }
 
+func TestExtendedCopyFromRelaysClientDataWithoutDeadlock(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	defer proxySide.Close()
+	defer postgresSide.Close()
+	proxy := &Proxy{
+		upstream:        proxySide,
+		frontend:        pgproto3.NewFrontend(proxySide, proxySide),
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+	}
+	var output bytes.Buffer
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), &output))
+	client.incoming = make(chan clientInput, 2)
+	prepared := &preparedStatement{
+		backendName: "copy_statement",
+		query:       "COPY example FROM STDIN",
+		statement:   clientStatement{SQL: "COPY example FROM STDIN"},
+	}
+	client.portals["copy_portal"] = &portal{
+		backendName: "copy_portal_backend",
+		statement:   prepared,
+	}
+	client.incoming <- clientInput{message: &pgproto3.CopyData{Data: []byte("1\n")}}
+	client.incoming <- clientInput{message: &pgproto3.CopyDone{}}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		if err := expectInternalQuery(backend, "SAVEPOINT unring_testtoken_"); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err := receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		execute, ok := message.(*pgproto3.Execute)
+		if !ok || execute.Portal != "copy_portal_backend" {
+			serverErrors <- fmt.Errorf("extended COPY Execute = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.CopyInResponse{OverallFormat: pgproto3.TextFormat})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err = receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		data, ok := message.(*pgproto3.CopyData)
+		if !ok || string(data.Data) != "1\n" {
+			serverErrors <- fmt.Errorf("extended COPY data = %#v", message)
+			return
+		}
+		message, err = receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		if _, ok := message.(*pgproto3.CopyDone); !ok {
+			serverErrors <- fmt.Errorf("extended COPY completion = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COPY 1")})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		proxy.relayExtended(client, &pgproto3.Execute{Portal: "copy_portal"})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("extended COPY FROM deadlocked")
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+	if proxy.Err() != nil {
+		t.Fatalf("extended COPY marked proxy fatal: %v", proxy.Err())
+	}
+	responses := pgproto3.NewFrontend(&output, io.Discard)
+	if message, err := responses.Receive(); err != nil {
+		t.Fatalf("decode CopyInResponse: %v", err)
+	} else if _, ok := message.(*pgproto3.CopyInResponse); !ok {
+		t.Fatalf("first extended COPY response = %#v", message)
+	}
+	if message, err := responses.Receive(); err != nil {
+		t.Fatalf("decode COPY CommandComplete: %v", err)
+	} else if complete, ok := message.(*pgproto3.CommandComplete); !ok ||
+		string(complete.CommandTag) != "COPY 1" {
+		t.Fatalf("second extended COPY response = %#v", message)
+	}
+}
+
+func TestExtendedCopyBothFailsWithoutDeadlock(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	defer postgresSide.Close()
+	proxy := &Proxy{
+		upstream:        proxySide,
+		frontend:        pgproto3.NewFrontend(proxySide, proxySide),
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+	}
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), io.Discard))
+	prepared := &preparedStatement{
+		backendName: "both_statement",
+		query:       "START_REPLICATION",
+		statement:   clientStatement{SQL: "START_REPLICATION"},
+	}
+	client.portals["both"] = &portal{backendName: "both_backend", statement: prepared}
+	go func() {
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		_ = expectInternalQuery(backend, "SAVEPOINT unring_testtoken_")
+		_, _ = receiveNonFlush(backend)
+		backend.Send(&pgproto3.CopyBothResponse{})
+		_ = backend.Flush()
+	}()
+	done := make(chan struct{})
+	go func() {
+		proxy.relayExtended(client, &pgproto3.Execute{Portal: "both"})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("extended copy-both mode deadlocked")
+	}
+	if proxy.Err() == nil {
+		t.Fatal("extended copy-both mode did not fail closed")
+	}
+}
+
+func TestSimpleQuerySafelyEndsFailedExtendedCycle(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	defer proxySide.Close()
+	defer postgresSide.Close()
+	proxy := &Proxy{
+		upstream:        proxySide,
+		frontend:        pgproto3.NewFrontend(proxySide, proxySide),
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+	}
+	var output bytes.Buffer
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), &output))
+	client.prepared[""] = &preparedStatement{backendName: "unnamed_backend"}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		if err := expectInternalQuery(backend, "SAVEPOINT unring_testtoken_"); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err := receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		if _, ok := message.(*pgproto3.Sync); !ok {
+			serverErrors <- fmt.Errorf("failed-cycle synchronization = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'E'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+			return
+		}
+		if err := expectInternalQuery(backend, "ROLLBACK TO SAVEPOINT unring_testtoken_"); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err = receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		closeMessage, ok := message.(*pgproto3.Close)
+		if !ok || closeMessage.Name != "unnamed_backend" {
+			serverErrors <- fmt.Errorf("unnamed close after Sync = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.CloseComplete{})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+			return
+		}
+		if err := expectInternalQuery(backend, "SAVEPOINT unring_testtoken_"); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err = receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		query, ok := message.(*pgproto3.Query)
+		if !ok || query.String != "SELECT 1" {
+			serverErrors <- fmt.Errorf("simple query after failed cycle = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+			return
+		}
+		if err := expectInternalQuery(backend, "RELEASE SAVEPOINT unring_testtoken_"); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	proxy.startExtended(client)
+	client.extendedFailed = true
+	done := make(chan struct{})
+	go func() {
+		proxy.relayQuery(client, "SELECT 1")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("simple query hung behind failed extended cycle")
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+	if proxy.Err() != nil {
+		t.Fatalf("mixed protocol marked proxy fatal: %v", proxy.Err())
+	}
+}
+
 func testRowDescription() *pgproto3.RowDescription {
 	return &pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{
 		Name: []byte("value"), DataTypeOID: 25, DataTypeSize: -1,

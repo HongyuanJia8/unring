@@ -1,6 +1,7 @@
 package pgproxy
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -31,6 +32,8 @@ type clientState struct {
 	extended       bool
 	extendedFailed bool
 	cycleSavepoint string
+	pendingEscape  *clientStatement
+	rollbackCycle  bool
 
 	transactionSavepoint string
 	transactionFailed    bool
@@ -39,6 +42,15 @@ type clientState struct {
 	prepared map[string]*preparedStatement
 	portals  map[string]*portal
 	objectID uint64
+
+	ctx      context.Context
+	cancel   context.CancelFunc
+	incoming chan clientInput
+}
+
+type clientInput struct {
+	message pgproto3.FrontendMessage
+	err     error
 }
 
 func newClientState(id uint64, backend *pgproto3.Backend) *clientState {
@@ -47,6 +59,7 @@ func newClientState(id uint64, backend *pgproto3.Backend) *clientState {
 		backend:  backend,
 		prepared: make(map[string]*preparedStatement),
 		portals:  make(map[string]*portal),
+		ctx:      context.Background(),
 	}
 }
 
@@ -74,7 +87,15 @@ func (p *Proxy) acquireClient(client *clientState) {
 }
 
 func (p *Proxy) releaseClientIfIdle(client *clientState) {
-	if !client.locked || client.extended || client.transactionSavepoint != "" {
+	if !client.locked || client.extended {
+		return
+	}
+	client.locked = false
+	p.queryMu.Unlock()
+}
+
+func (p *Proxy) releaseClient(client *clientState) {
+	if !client.locked {
 		return
 	}
 	client.locked = false
@@ -102,12 +123,14 @@ func (p *Proxy) cleanupClient(client *clientState) {
 		client.cycleSavepoint = ""
 	}
 
-	if client.transactionSavepoint != "" && p.Err() == nil {
-		if _, err := p.internalQueryLocked("ROLLBACK TO SAVEPOINT " + client.transactionSavepoint +
-			"; RELEASE SAVEPOINT " + client.transactionSavepoint); err != nil {
-			p.markFatal(fmt.Errorf("roll back disconnected client transaction: %w", err))
+	if client.transactionSavepoint != "" {
+		if p.Err() == nil {
+			if _, err := p.internalQueryLocked("ROLLBACK TO SAVEPOINT " + client.transactionSavepoint +
+				"; RELEASE SAVEPOINT " + client.transactionSavepoint); err != nil {
+				p.markFatal(fmt.Errorf("roll back disconnected client transaction: %w", err))
+			}
 		}
-		client.transactionSavepoint = ""
+		p.clearClientTransaction(client)
 	}
 
 	if p.Err() == nil {

@@ -75,11 +75,15 @@ type Proxy struct {
 	listener net.Listener
 	address  string
 
-	upstream net.Conn
-	frontend *pgproto3.Frontend
-	queryMu  sync.Mutex
-	config   *pgconn.Config
-	approve  ApprovalFunc
+	upstream          net.Conn
+	frontend          *pgproto3.Frontend
+	queryMu           sync.Mutex
+	activeTransaction uint64
+	escapeClient      uint64
+	config            *pgconn.Config
+	approve           ApprovalFunc
+	runCtx            context.Context
+	cancel            context.CancelFunc
 
 	paramsMu sync.RWMutex
 	params   map[string]string
@@ -139,6 +143,7 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		return nil, fmt.Errorf("take ownership of postgres connection: %w", err)
 	}
 
+	runCtx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
 		upstream:        hijacked.Conn,
 		frontend:        hijacked.Frontend,
@@ -148,6 +153,8 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		savepointPrefix: savepointPrefix,
 		config:          config.Copy(),
 		approve:         options.Approve,
+		runCtx:          runCtx,
+		cancel:          cancel,
 	}
 
 	if _, err := p.internalQueryLocked("BEGIN"); err != nil {
@@ -348,11 +355,21 @@ func (p *Proxy) handleClient(conn net.Conn) {
 		return
 	}
 
+	clientContext, cancelClient := context.WithCancel(p.context())
 	client := newClientState(p.clientID.Add(1), backend)
+	client.ctx = clientContext
+	client.cancel = cancelClient
+	client.incoming = make(chan clientInput)
+	go p.receiveClient(client)
+	defer cancelClient()
 	defer p.cleanupClient(client)
 
 	for {
-		message, err := backend.Receive()
+		input, ok := <-client.incoming
+		if !ok {
+			return
+		}
+		message, err := input.message, input.err
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
 				errors.Is(err, io.ErrUnexpectedEOF) {
@@ -382,6 +399,25 @@ func (p *Proxy) handleClient(conn net.Conn) {
 				"unring does not support PostgreSQL frontend message %T",
 				message,
 			))
+			return
+		}
+	}
+}
+
+func (p *Proxy) receiveClient(client *clientState) {
+	defer close(client.incoming)
+	for {
+		message, err := client.backend.Receive()
+		if err != nil {
+			client.cancel()
+		}
+		input := clientInput{message: message, err: err}
+		select {
+		case client.incoming <- input:
+		case <-client.ctx.Done():
+			return
+		}
+		if err != nil {
 			return
 		}
 	}
@@ -432,6 +468,9 @@ func (p *Proxy) handshake(conn net.Conn, backend *pgproto3.Backend) error {
 }
 
 func (p *Proxy) stopClients() {
+	if p.cancel != nil {
+		p.cancel()
+	}
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
@@ -443,6 +482,13 @@ func (p *Proxy) stopClients() {
 	}
 	p.clientsMu.Unlock()
 	p.clientWG.Wait()
+}
+
+func (p *Proxy) context() context.Context {
+	if p.runCtx != nil {
+		return p.runCtx
+	}
+	return context.Background()
 }
 
 func (p *Proxy) markFatal(err error) {

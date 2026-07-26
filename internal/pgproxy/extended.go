@@ -1,7 +1,9 @@
 package pgproxy
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"sort"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -96,7 +98,8 @@ func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
 		backendName: client.nextObjectName(p.savepointPrefix, "s"),
 		query:       message.Query,
 		statement:   statement,
-		synthetic:   statement.Kind != statementRegular || statement.Irreversible != "",
+		synthetic: statement.Kind != statementRegular || statement.Irreversible != "" ||
+			statement.Refusal != "",
 	}
 	if prepared.synthetic {
 		client.prepared[message.Name] = prepared
@@ -228,6 +231,15 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 		return
 	}
 	statement := portal.statement.statement
+	if statement.Kind == statementRegular &&
+		p.sharedLeaseHeldByOther(client) {
+		if !statement.ReadOnly {
+			p.extendedLocalError(client, "55P03",
+				"another client has an open transaction; unring cannot safely interleave this statement")
+			return
+		}
+		client.rollbackCycle = true
+	}
 	if client.transactionFailed && statement.Kind != statementRollback &&
 		statement.Kind != statementRollbackTo && statement.Kind != statementCommit {
 		p.extendedLocalError(client, "25P02",
@@ -235,14 +247,14 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 		return
 	}
 	if portal.statement.synthetic {
-		if statement.Kind != statementRegular {
+		if statement.Kind != statementRegular || statement.Irreversible != "" {
 			if err := p.rotateExtendedCycleSavepointLocked(client, false); err != nil {
 				p.markFatal(err)
 				return
 			}
 		}
 		tags, failed := p.executeStatementLocked(client, statement)
-		if statement.Kind != statementRegular && p.Err() == nil {
+		if (statement.Kind != statementRegular || statement.Irreversible != "") && p.Err() == nil {
 			if err := p.rotateExtendedCycleSavepointLocked(client, true); err != nil {
 				p.markFatal(err)
 				return
@@ -270,6 +282,13 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 		}
 	})
 	if ok {
+		if responseError, failed := response.(*pgproto3.ErrorResponse); failed &&
+			responseError.Code == "25001" {
+			pending := portal.statement.statement
+			pending.Irreversible = responseError.Message
+			client.pendingEscape = &pending
+			return
+		}
 		_, record.Failed = response.(*pgproto3.ErrorResponse)
 		p.recordQuery(record)
 	}
@@ -397,9 +416,36 @@ func (p *Proxy) exchangeExtendedLocked(
 			p.updateParameter(response)
 		case *pgproto3.ErrorResponse:
 			client.extendedFailed = true
+			if _, executing := message.(*pgproto3.Execute); executing &&
+				response.Code == "25001" && terminal(response) {
+				return response, true
+			}
+		case *pgproto3.CopyInResponse:
+			client.backend.Send(response)
+			if err := client.backend.Flush(); err != nil {
+				p.markFatal(fmt.Errorf("send copy-in response to client: %w", err))
+				return nil, false
+			}
+			if err := p.relayCopyIn(client); err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					p.markFatal(fmt.Errorf("relay extended copy-in data: %w", err))
+				}
+				return nil, false
+			}
+			continue
+		case *pgproto3.CopyBothResponse:
+			p.sendStatementError(client, "0A000",
+				"unring does not support PostgreSQL copy-both mode", true)
+			_ = client.backend.Flush()
+			p.markFatal(errors.New("real postgres entered unsupported copy-both mode"))
+			return nil, false
 		}
 		client.backend.Send(response)
 		if terminal(response) {
+			if err := client.backend.Flush(); err != nil {
+				p.markFatal(fmt.Errorf("flush response to %T to client: %w", message, err))
+				return nil, false
+			}
 			return response, true
 		}
 	}
@@ -416,36 +462,49 @@ func (p *Proxy) extendedSync(client *clientState) {
 		_ = client.backend.Flush()
 		return
 	}
-	if err := p.synchronizeExtendedBackendLocked(client); err != nil {
+	if err := p.finishExtendedCycleLocked(client, true); err != nil {
 		p.markFatal(err)
-		return
 	}
+}
 
+func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) error {
+	if err := p.synchronizeExtendedBackendLocked(client); err != nil {
+		return err
+	}
 	recovery := "RELEASE SAVEPOINT " + client.cycleSavepoint
-	if client.extendedFailed {
+	if client.extendedFailed || client.rollbackCycle {
 		recovery = "ROLLBACK TO SAVEPOINT " + client.cycleSavepoint +
 			"; RELEASE SAVEPOINT " + client.cycleSavepoint
 	}
 	if _, err := p.internalQueryLocked(recovery); err != nil {
-		p.markFatal(fmt.Errorf("finish extended-query cycle: %w", err))
-		return
+		return fmt.Errorf("finish extended-query cycle: %w", err)
 	}
-	if client.extendedFailed && client.transactionSavepoint != "" {
+	if client.extendedFailed && client.pendingEscape == nil &&
+		client.transactionSavepoint != "" {
 		client.transactionFailed = true
 	}
 	client.extended = false
 	client.extendedFailed = false
+	client.rollbackCycle = false
 	client.cycleSavepoint = ""
 
+	if client.pendingEscape != nil {
+		statement := *client.pendingEscape
+		client.pendingEscape = nil
+		tags, failed := p.executeIrreversibleLocked(client, statement)
+		p.recordQuery(QueryRecord{SQL: statement.SQL, CommandTags: tags, Failed: failed})
+	}
 	if client.transactionSavepoint == "" {
 		if err := p.closePortalsLocked(client); err != nil {
-			p.markFatal(fmt.Errorf("close autocommit portals: %w", err))
-			return
+			return fmt.Errorf("close autocommit portals: %w", err)
 		}
 	}
-	client.backend.Send(&pgproto3.ReadyForQuery{TxStatus: client.transactionStatus()})
-	_ = client.backend.Flush()
-	p.releaseClientIfIdle(client)
+	if sendReady {
+		client.backend.Send(&pgproto3.ReadyForQuery{TxStatus: client.transactionStatus()})
+		_ = client.backend.Flush()
+		p.releaseClientIfIdle(client)
+	}
+	return nil
 }
 
 func (p *Proxy) synchronizeExtendedBackendLocked(client *clientState) error {

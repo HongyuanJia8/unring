@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -15,6 +17,12 @@ import (
 func (p *Proxy) relayQuery(client *clientState, sql string) {
 	p.acquireClient(client)
 	defer p.releaseClientIfIdle(client)
+	if client.extended {
+		if err := p.finishExtendedCycleLocked(client, false); err != nil {
+			p.markFatal(fmt.Errorf("finish extended-query cycle before simple query: %w", err))
+			return
+		}
+	}
 	if err := p.clearUnnamedObjectsLocked(client); err != nil {
 		p.markFatal(fmt.Errorf("clear unnamed protocol objects before simple query: %w", err))
 		return
@@ -109,6 +117,13 @@ func (p *Proxy) executeStatementLocked(
 	client *clientState,
 	statement clientStatement,
 ) ([]string, bool) {
+	if statement.Refusal != "" {
+		p.sendStatementError(client, "0A000", statement.Refusal, false)
+		if client.transactionSavepoint != "" {
+			client.transactionFailed = true
+		}
+		return nil, true
+	}
 	if statement.Kind == statementForbidden {
 		p.sendStatementError(client, "0A000",
 			"unring cannot allow prepared-transaction control in the shared transaction", true)
@@ -125,6 +140,15 @@ func (p *Proxy) executeStatementLocked(
 	}
 	if statement.Kind != statementRegular {
 		return p.executeTransactionControlLocked(client, statement)
+	}
+	if p.sharedLeaseHeldByOther(client) {
+		if !statement.ReadOnly {
+			p.sendStatementError(client, "55P03",
+				"another client has an open transaction; unring cannot safely interleave this statement",
+				true)
+			return nil, true
+		}
+		statement.RollbackAfter = true
 	}
 	if statement.Irreversible != "" {
 		return p.executeIrreversibleLocked(client, statement)
@@ -153,6 +177,11 @@ func (p *Proxy) executeTransactionControlLocked(
 			})
 			client.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")})
 			return []string{"BEGIN"}, false
+		}
+		if p.sharedLeaseHeldByOther(client) {
+			p.sendStatementError(client, "55P03",
+				"another client already has an open transaction", true)
+			return nil, true
 		}
 		if err := p.beginClientTransactionLocked(client); err != nil {
 			p.markFatal(err)
@@ -278,12 +307,16 @@ func (p *Proxy) beginClientTransactionLocked(client *clientState) error {
 		return fmt.Errorf("begin client transaction: %w", err)
 	}
 	client.transactionSavepoint = name
+	p.activeTransaction = client.id
 	client.transactionFailed = false
 	client.savepoints = nil
 	return nil
 }
 
 func (p *Proxy) clearClientTransaction(client *clientState) {
+	if p.activeTransaction == client.id {
+		p.activeTransaction = 0
+	}
 	client.transactionSavepoint = ""
 	client.transactionFailed = false
 	client.savepoints = nil
@@ -317,6 +350,11 @@ func (p *Proxy) noTransactionNotice(client *clientState) {
 		Severity: "WARNING", Code: "25P01",
 		Message: "there is no transaction in progress",
 	})
+}
+
+func (p *Proxy) sharedLeaseHeldByOther(client *clientState) bool {
+	return (p.activeTransaction != 0 && p.activeTransaction != client.id) ||
+		(p.escapeClient != 0 && p.escapeClient != client.id)
 }
 
 func (p *Proxy) executeRegularLocked(
@@ -372,7 +410,7 @@ func (p *Proxy) executeRegularLocked(
 				client.backend.Send(message)
 				clientErr = client.backend.Flush()
 			}
-			if err := p.relayCopyIn(client.backend); err != nil {
+			if err := p.relayCopyIn(client); err != nil {
 				clientErr = err
 			}
 			continue
@@ -390,7 +428,7 @@ func (p *Proxy) executeRegularLocked(
 
 complete:
 	recoverySQL := "RELEASE SAVEPOINT " + savepoint
-	if backendFailed {
+	if backendFailed || statement.RollbackAfter {
 		recoverySQL = "ROLLBACK TO SAVEPOINT " + savepoint + "; RELEASE SAVEPOINT " + savepoint
 	}
 	if _, err := p.internalQueryLocked(recoverySQL); err != nil {
@@ -411,10 +449,21 @@ func (p *Proxy) executeIrreversibleLocked(
 	client *clientState,
 	statement clientStatement,
 ) ([]string, bool) {
+	// The approval prompt and the side connection must not pin the shared
+	// backend. In particular, Seal must be able to cancel this client's context
+	// while an external command is waiting for a lock.
+	p.releaseClient(client)
+	defer func() {
+		p.acquireClient(client)
+		if p.escapeClient == client.id {
+			p.escapeClient = 0
+		}
+	}()
+
 	approved := false
 	var approvalErr error
 	if p.approve != nil {
-		approved, approvalErr = p.approve(context.Background(), ApprovalRequest{
+		approved, approvalErr = p.requestApproval(client.ctx, ApprovalRequest{
 			SQL: statement.SQL, Reason: statement.Irreversible,
 		})
 	}
@@ -435,7 +484,32 @@ func (p *Proxy) executeIrreversibleLocked(
 		return nil, true
 	}
 
-	connection, err := pgconn.ConnectConfig(context.Background(), p.config.Copy())
+	p.acquireClient(client)
+	sessionState, stateErr := p.escapeSessionStateLocked()
+	if stateErr == nil {
+		p.escapeClient = client.id
+	}
+	p.releaseClient(client)
+	if stateErr != nil {
+		p.sendStatementError(client, "58000",
+			fmt.Sprintf("unring could not capture session state for the irreversible statement: %v",
+				stateErr), true)
+		if client.transactionSavepoint != "" {
+			client.transactionFailed = true
+		}
+		return nil, true
+	}
+	if sessionState.hasUncommittedChanges {
+		p.sendStatementError(client, "25001",
+			"unring cannot safely run this irreversible statement while the shared transaction "+
+				"contains uncommitted database changes", true)
+		if client.transactionSavepoint != "" {
+			client.transactionFailed = true
+		}
+		return nil, true
+	}
+
+	connection, err := pgconn.ConnectConfig(client.ctx, p.config.Copy())
 	if err != nil {
 		p.sendStatementError(client, "08001",
 			fmt.Sprintf("unring could not open the non-transactional connection: %v", err), true)
@@ -444,21 +518,26 @@ func (p *Proxy) executeIrreversibleLocked(
 		}
 		return nil, true
 	}
-	p.summaryMu.Lock()
-	p.irreversibleActions = append(p.irreversibleActions, IrreversibleAction{SQL: statement.SQL})
-	p.summaryMu.Unlock()
-	results, execErr := connection.Exec(context.Background(), statement.SQL).ReadAll()
-	closeErr := connection.Close(context.Background())
-	if execErr != nil {
-		p.sendPgError(client, execErr)
+	defer func() {
+		closeContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = connection.Close(closeContext)
+	}()
+	if err := applyEscapeSessionState(client.ctx, connection, sessionState); err != nil {
+		p.sendStatementError(client, "08001",
+			fmt.Sprintf("unring could not mirror session state on the non-transactional connection: %v",
+				err), true)
 		if client.transactionSavepoint != "" {
 			client.transactionFailed = true
 		}
 		return nil, true
 	}
-	if closeErr != nil {
-		p.sendStatementError(client, "08006",
-			fmt.Sprintf("the irreversible statement ran but its connection did not close cleanly: %v", closeErr), true)
+	p.summaryMu.Lock()
+	p.irreversibleActions = append(p.irreversibleActions, IrreversibleAction{SQL: statement.SQL})
+	p.summaryMu.Unlock()
+	results, execErr := connection.Exec(client.ctx, statement.SQL).ReadAll()
+	if execErr != nil {
+		p.sendPgError(client, execErr)
 		if client.transactionSavepoint != "" {
 			client.transactionFailed = true
 		}
@@ -474,6 +553,111 @@ func (p *Proxy) executeIrreversibleLocked(
 		}
 	}
 	return tags, false
+}
+
+func (p *Proxy) requestApproval(
+	ctx context.Context,
+	request ApprovalRequest,
+) (bool, error) {
+	type result struct {
+		approved bool
+		err      error
+	}
+	completed := make(chan result, 1)
+	go func() {
+		approved, err := p.approve(ctx, request)
+		completed <- result{approved: approved, err: err}
+	}()
+	select {
+	case outcome := <-completed:
+		return outcome.approved, outcome.err
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+type escapeSessionState struct {
+	sessionAuthorization  string
+	role                  string
+	settings              map[string]string
+	hasUncommittedChanges bool
+}
+
+func (p *Proxy) escapeSessionStateLocked() (escapeSessionState, error) {
+	rows, err := p.internalRowsLocked(
+		"SELECT '__unring_session_authorization__', session_user " +
+			"UNION ALL SELECT '__unring_role__', current_user " +
+			"UNION ALL SELECT '__unring_transaction_id__', " +
+			"COALESCE(txid_current_if_assigned()::text, '') " +
+			"UNION ALL SELECT name, setting FROM pg_settings " +
+			"WHERE (source = 'session' OR name = 'search_path') " +
+			"AND name NOT IN ('role', 'session_authorization') ORDER BY 1",
+	)
+	if err != nil {
+		return escapeSessionState{}, err
+	}
+	state := escapeSessionState{settings: make(map[string]string)}
+	for _, row := range rows {
+		if len(row) != 2 || row[0] == nil || row[1] == nil {
+			return escapeSessionState{}, errors.New("postgres returned malformed session state")
+		}
+		name, value := string(row[0]), string(row[1])
+		switch name {
+		case "__unring_session_authorization__":
+			state.sessionAuthorization = value
+		case "__unring_role__":
+			state.role = value
+		case "__unring_transaction_id__":
+			state.hasUncommittedChanges = value != ""
+		default:
+			state.settings[name] = value
+		}
+	}
+	if state.sessionAuthorization == "" || state.role == "" {
+		return escapeSessionState{}, errors.New("postgres omitted session authorization or role")
+	}
+	return state, nil
+}
+
+func applyEscapeSessionState(
+	ctx context.Context,
+	connection *pgconn.PgConn,
+	state escapeSessionState,
+) error {
+	names := make([]string, 0, len(state.settings))
+	for name := range state.settings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		result := connection.ExecParams(ctx, "SELECT set_config($1, $2, false)",
+			[][]byte{[]byte(name), []byte(state.settings[name])},
+			[]uint32{25, 25}, []int16{0, 0}, []int16{0}).Read()
+		if result.Err != nil {
+			return fmt.Errorf("set %s: %w", name, result.Err)
+		}
+	}
+	if _, err := connection.Exec(ctx, "SET SESSION AUTHORIZATION "+
+		quoteIdentifier(state.sessionAuthorization)).ReadAll(); err != nil {
+		return fmt.Errorf("set session authorization: %w", err)
+	}
+	if state.role != state.sessionAuthorization {
+		if _, err := connection.Exec(ctx, "SET ROLE "+
+			quoteIdentifier(state.role)).ReadAll(); err != nil {
+			return fmt.Errorf("set role: %w", err)
+		}
+	}
+	// An irreversible command must not wait forever for locks held by unring's
+	// own shared transaction. This still permits arbitrarily long work once the
+	// command has acquired its locks.
+	if _, err := connection.Exec(ctx, "SET lock_timeout = '1s'").ReadAll(); err != nil {
+		return fmt.Errorf("set escape lock timeout: %w", err)
+	}
+	return nil
+}
+
+func quoteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
 func (p *Proxy) sendExternalResult(client *clientState, result *pgconn.Result) {
@@ -537,9 +721,20 @@ func (p *Proxy) updateParameter(message *pgproto3.ParameterStatus) {
 	p.paramsMu.Unlock()
 }
 
-func (p *Proxy) relayCopyIn(client *pgproto3.Backend) error {
+func (p *Proxy) relayCopyIn(client *clientState) error {
 	for {
-		message, err := client.Receive()
+		var message pgproto3.FrontendMessage
+		var err error
+		if client.incoming == nil {
+			message, err = client.backend.Receive()
+		} else {
+			input, ok := <-client.incoming
+			if !ok {
+				err = net.ErrClosed
+			} else {
+				message, err = input.message, input.err
+			}
+		}
 		if err != nil {
 			p.frontend.Send(&pgproto3.CopyFail{Message: "unring client disconnected during COPY"})
 			_ = p.frontend.Flush()
@@ -602,6 +797,48 @@ func (p *Proxy) internalQueryLocked(sql string) (byte, error) {
 			return message.TxStatus, nil
 		default:
 			return 0, fmt.Errorf("unexpected backend message %T while running internal query %q",
+				message, sql)
+		}
+	}
+}
+
+func (p *Proxy) internalRowsLocked(sql string) ([][][]byte, error) {
+	p.frontend.Send(&pgproto3.Query{String: sql})
+	if err := p.frontend.Flush(); err != nil {
+		return nil, fmt.Errorf("send %q: %w", sql, err)
+	}
+	var rows [][][]byte
+	var responseErr error
+	for {
+		message, err := p.frontend.Receive()
+		if err != nil {
+			return nil, fmt.Errorf("receive result for %q: %w", sql, err)
+		}
+		switch message := message.(type) {
+		case *pgproto3.RowDescription, *pgproto3.CommandComplete:
+		case *pgproto3.DataRow:
+			row := make([][]byte, len(message.Values))
+			for index, value := range message.Values {
+				row[index] = append([]byte(nil), value...)
+			}
+			rows = append(rows, row)
+		case *pgproto3.ErrorResponse:
+			responseErr = fmt.Errorf("postgres %s: %s (SQLSTATE %s)",
+				strings.ToLower(message.Severity), message.Message, message.Code)
+		case *pgproto3.ParameterStatus:
+			p.updateParameter(message)
+		case *pgproto3.NoticeResponse, *pgproto3.NotificationResponse:
+		case *pgproto3.ReadyForQuery:
+			if responseErr != nil {
+				return nil, responseErr
+			}
+			if message.TxStatus != 'T' {
+				return nil, fmt.Errorf("session-state query ended with transaction status %q",
+					message.TxStatus)
+			}
+			return rows, nil
+		default:
+			return nil, fmt.Errorf("unexpected backend message %T while running row query %q",
 				message, sql)
 		}
 	}

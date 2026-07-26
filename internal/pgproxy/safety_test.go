@@ -360,3 +360,63 @@ func TestClientTransactionTranslationAndAbortedState(t *testing.T) {
 		t.Fatalf("ReadyForQuery statuses = %q, want %q", statuses, wantStatuses)
 	}
 }
+
+func TestClientCancellationReleasesPendingIrreversibleApproval(t *testing.T) {
+	t.Parallel()
+
+	approvalStarted := make(chan struct{})
+	proxy := &Proxy{
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+		approve: func(context.Context, ApprovalRequest) (bool, error) {
+			close(approvalStarted)
+			select {}
+		},
+	}
+
+	var output bytes.Buffer
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), &output))
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	proxy.acquireClient(client)
+	done := make(chan struct{})
+	go func() {
+		proxy.executeIrreversibleLocked(client, clientStatement{
+			SQL: "VACUUM", Irreversible: "VACUUM cannot run inside a transaction block",
+		})
+		proxy.releaseClientIfIdle(client)
+		close(done)
+	}()
+	select {
+	case <-approvalStarted:
+	case <-time.After(time.Second):
+		t.Fatal("approval hook did not start")
+	}
+	client.cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client cancellation did not release pending approval")
+	}
+}
+
+func TestClientDisconnectCancelsWorkWhileHandlerIsBusy(t *testing.T) {
+	t.Parallel()
+
+	proxySide, clientSide := net.Pipe()
+	backend := pgproto3.NewBackend(proxySide, proxySide)
+	client := newClientState(1, backend)
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	client.incoming = make(chan clientInput)
+	proxy := &Proxy{}
+	go proxy.receiveClient(client)
+
+	_ = clientSide.Close()
+	select {
+	case <-client.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("client disconnect did not cancel in-flight work")
+	}
+	_ = proxySide.Close()
+}

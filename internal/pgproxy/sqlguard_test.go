@@ -134,7 +134,6 @@ func TestAnalyzeClientSQLClassifiesIrreversibleStatements(t *testing.T) {
 		"DROP INDEX CONCURRENTLY example_idx",
 		"ALTER SYSTEM SET work_mem = '4MB'",
 		"REINDEX (CONCURRENTLY) INDEX example_idx",
-		"DISCARD ALL",
 		"CREATE TABLESPACE example LOCATION '/tmp/example'",
 		"DROP TABLESPACE example",
 		"CLUSTER",
@@ -148,6 +147,19 @@ func TestAnalyzeClientSQLClassifiesIrreversibleStatements(t *testing.T) {
 		if len(statements) != 1 || statements[0].Irreversible == "" {
 			t.Fatalf("analyzeClientSQL(%q) = %#v, want irreversible", sql, statements)
 		}
+	}
+}
+
+func TestAnalyzeClientSQLRefusesDiscardAllWithoutMarkingItIrreversible(t *testing.T) {
+	t.Parallel()
+
+	statements, err := analyzeClientSQL("DISCARD ALL")
+	if err != nil {
+		t.Fatalf("analyzeClientSQL(DISCARD ALL): %v", err)
+	}
+	if len(statements) != 1 || statements[0].Refusal == "" ||
+		statements[0].Irreversible != "" {
+		t.Fatalf("DISCARD ALL classification = %#v, want a reversible local refusal", statements)
 	}
 }
 

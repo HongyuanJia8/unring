@@ -78,14 +78,28 @@ func Run(options Options) Result {
 	signals := options.Signals
 	abort := options.Abort
 	approvals := options.Approvals
+	allApprovals := approvals
 	var forceKill <-chan time.Time
 	var interrupted bool
 	var sessionLost bool
 	var supervisionErr error
+	type completedApproval struct {
+		id     uint64
+		result ApprovalResult
+	}
+	approvalResults := make(chan completedApproval, 1)
+	var approvalID uint64
+	var activeApproval *ApprovalRequest
 
 	for {
 		select {
 		case err := <-waited:
+			if activeApproval != nil {
+				activeApproval.Reply <- ApprovalResult{
+					Err: errors.New("child exited while irreversible-statement approval was pending"),
+				}
+				activeApproval = nil
+			}
 			exitCode := processExitCode(command.ProcessState, err)
 			interrupted = interrupted || processWasSignaled(command.ProcessState)
 			if restoreErr := processGroup.restoreForeground(); restoreErr != nil {
@@ -149,6 +163,15 @@ func Run(options Options) Result {
 				abort = nil
 				_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)
 			}
+			if activeApproval != nil {
+				_ = processGroup.cancelApproval(command.Process.Pid)
+				activeApproval.Reply <- ApprovalResult{
+					Err: fmt.Errorf("approval interrupted by %s", signal),
+				}
+				activeApproval = nil
+				approvals = allApprovals
+				approvalID++
+			}
 		case <-abort:
 			sessionLost = true
 			abort = nil
@@ -159,8 +182,23 @@ func Run(options Options) Result {
 				approvals = nil
 				continue
 			}
-			approvalResult := processGroup.handleApproval(command.Process.Pid, request.Decide)
-			request.Reply <- approvalResult
+			activeApproval = &request
+			approvals = nil
+			approvalID++
+			currentID := approvalID
+			go func() {
+				approvalResults <- completedApproval{
+					id:     currentID,
+					result: processGroup.handleApproval(command.Process.Pid, request.Decide),
+				}
+			}()
+		case completed := <-approvalResults:
+			if activeApproval == nil || completed.id != approvalID {
+				continue
+			}
+			activeApproval.Reply <- completed.result
+			activeApproval = nil
+			approvals = allApprovals
 		case <-forceKill:
 			forceKill = nil
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)
