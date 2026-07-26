@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    env:
+      CGO_ENABLED: "1"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Ensure PostgreSQL tools
+        shell: bash
+        run: |
+          if ! command -v initdb >/dev/null 2>&1 || ! command -v pg_ctl >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo apt-get update
+              sudo apt-get install --yes postgresql
+              postgres_bin="$(find /usr/lib/postgresql -type f -name initdb -print -quit)"
+              echo "$(dirname "$postgres_bin")" >> "$GITHUB_PATH"
+            else
+              brew install postgresql@17
+              echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+
+      - name: Check formatting
+        run: make fmt
+
+      - name: Vet
+        run: make vet
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test-integration

@@ -10,21 +10,21 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ## M0 — Scaffold
 
-- [ ] Repo, MIT license, README, roadmap
-- [ ] Go module, `cmd/unring` entrypoint, `make`/task targets for fmt/vet/lint/test
-- [ ] CI (GitHub Actions): build + vet + test on macOS and Linux
+- [x] Repo, MIT license, README, roadmap
+- [x] Go module, `cmd/unring` entrypoint, `make`/task targets for fmt/vet/lint/test
+- [x] CI (GitHub Actions): build + vet + test on macOS and Linux
 
 ## M1 — Postgres shared-transaction proxy
 
 The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 
-- [ ] M1.1 Wire protocol skeleton — listen, answer the client handshake ourselves
+- [x] M1.1 Wire protocol skeleton — listen, answer the client handshake ourselves
       (`AuthenticationOk` / `ParameterStatus` / `BackendKeyData` /
       `ReadyForQuery{TxStatus:'T'}`), relay the simple query protocol upstream
-- [ ] M1.2 One shared backend transaction across every client connection in a session;
+- [x] M1.2 One shared backend transaction across every client connection in a session;
       a client `Terminate` must **not** end the transaction
-- [ ] M1.3 Serialize backend access across concurrent clients (documented trade-off)
-- [ ] M1.4 Session decision: `COMMIT` / `ROLLBACK`, plus crash-safe default to rollback
+- [x] M1.3 Serialize backend access across concurrent clients (documented trade-off)
+- [x] M1.4 Session decision: `COMMIT` / `ROLLBACK`, plus crash-safe default to rollback
 - [ ] M1.5 Extended query protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`) —
       required by every ORM; rewrite prepared-statement names to avoid collisions
       between clients sharing one backend (see pgbouncer's known pitfalls)
@@ -33,19 +33,25 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
       `ALTER SYSTEM`) — classify as *needs approval*, run on a separate
       non-transactional connection, mark the session as no longer fully reversible
 - [ ] M1.7 Change summary — what the transaction actually did, for the review screen
+- [ ] M1.8 Map client transaction control onto savepoints. Today `BEGIN`/`COMMIT`/
+      `ROLLBACK` from a client are rejected outright, which is safe but breaks the
+      many tools and ORMs that manage their own transactions. Nesting them as
+      savepoints inside our shared transaction keeps the single-decision guarantee
+      while letting real clients work. Belongs with M1.5 — both are prerequisites
+      for "a real ORM can run under unring unmodified"
 
 ## M2 — Wrapper CLI
 
-- [ ] M2.1 `unring run -- <cmd>` — start proxies, spawn child, forward signals,
+- [x] M2.1 `unring run -- <cmd>` — start proxies, spawn child, forward signals,
       propagate exit code
-- [ ] M2.2 Environment injection for the child only (`PGHOST`/`PGPORT`/`DATABASE_URL`;
+- [x] M2.2 Environment injection for the child only (`PGHOST`/`PGPORT`/`DATABASE_URL`;
       later `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`)
 - [ ] M2.3 `unring claude` and friends — thin aliases over `run`
 - [ ] M2.4 Read-only sessions exit silently: no prompt when nothing was written
 
 ## M3 — Review interface
 
-- [ ] M3.1 Non-interactive text summary + commit/discard prompt (unblocks end-to-end)
+- [x] M3.1 Non-interactive text summary + commit/discard prompt (unblocks end-to-end)
 - [ ] M3.2 Bubble Tea TUI: overall commit/discard, expandable per-item detail
       (diffs, affected rows, request bodies). **No partial commit** — by design
 - [ ] M3.3 Un-intercepted traffic gets its own, unmissable section

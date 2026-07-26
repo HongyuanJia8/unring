@@ -7,6 +7,7 @@
 *.test
 *.out
 /coverage.txt
+/.cache/
 
 # Local test Postgres instances
 /pgdata/
