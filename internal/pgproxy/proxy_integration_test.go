@@ -109,7 +109,8 @@ func TestSharedTransactionIntegration(t *testing.T) {
 		"carriage-return comment": "SELECT 1; --\rCOMMIT;",
 		"guessed savepoint escalation": "SELECT 1; --\rCOMMIT; BEGIN; " +
 			"SAVEPOINT unring_internal_1;",
-		"UTF-8 dollar tag": "SELECT $\xc3\xa9$'$\xc3\xa9$; COMMIT;",
+		"UTF-8 dollar tag":        "SELECT $\xc3\xa9$'$\xc3\xa9$; COMMIT;",
+		"continued escape string": "SELECT E'a'\n'\\'e'; COMMIT; --'",
 	} {
 		if _, err := second.Exec(ctx, sql).ReadAll(); err == nil ||
 			!strings.Contains(err.Error(), "unring owns") {
@@ -119,6 +120,11 @@ func TestSharedTransactionIntegration(t *testing.T) {
 	if got := scalarTest(t, ctx, second,
 		"SELECT $\xe4\xb8\xad$; COMMIT;$\xe4\xb8\xad$"); got != "; COMMIT;" {
 		t.Fatalf("valid UTF-8 dollar-quoted literal = %q, want ; COMMIT;", got)
+	}
+	if got := scalarTest(t, ctx, second,
+		"SELECT E'a'\n'\\'; COMMIT; --'"); got != "a'; COMMIT; --" {
+		t.Fatalf("valid continued escape string = %q, want %q",
+			got, "a'; COMMIT; --")
 	}
 	if got := scalarTest(t, ctx, second,
 		fmt.Sprintf("SELECT value FROM %s", table)); got != "inside" {

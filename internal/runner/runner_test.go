@@ -175,8 +175,8 @@ func TestRunInteractiveChildUsesForegroundTTY(t *testing.T) {
 }
 
 func TestRunInteractiveChildHandlesTerminalStop(t *testing.T) {
-	command := exec.Command(os.Args[0], "-test.run=^TestRunJobControlShellProcess$")
-	command.Env = append(os.Environ(), "UNRING_RUNNER_JOB_SHELL=1")
+	command := exec.Command(os.Args[0], "-test.run=^TestRunInteractiveChildHelper$")
+	command.Env = append(os.Environ(), "UNRING_RUNNER_PTY_HELPER=job-control")
 
 	terminal, err := pty.Start(command)
 	if err != nil {
@@ -216,35 +216,36 @@ func TestRunInteractiveChildHandlesTerminalStop(t *testing.T) {
 		t.Fatalf("send terminal Ctrl-Z to foreground child: %v", err)
 	}
 
-	wrapperStopped := make(chan error, 1)
+	interrupted := make(chan error, 1)
 	go func() {
 		for {
 			line, err := reader.ReadString('\n')
 			initialOutput.WriteString(line)
-			if strings.Contains(line, "wrapper-stopped") {
-				wrapperStopped <- nil
+			if strings.Contains(line, "wrapper-interrupted") {
+				interrupted <- nil
 				return
 			}
 			if err != nil {
-				wrapperStopped <- err
+				interrupted <- err
 				return
 			}
 		}
 	}()
-
 	select {
-	case err := <-wrapperStopped:
+	case err := <-interrupted:
 		if err != nil {
-			t.Fatalf("wait for unring job-control stop: %v\n%s", err, initialOutput.String())
+			t.Fatalf("wait for stopped child interruption: %v\n%s",
+				err, initialOutput.String())
 		}
 	case <-time.After(5 * time.Second):
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		_ = command.Wait()
-		t.Fatalf("shell did not observe unring stopping with its child:\n%s",
+		t.Fatalf("runner did not abort after its foreground child stopped:\n%s",
 			initialOutput.String())
 	}
-	if _, err := terminal.Write([]byte("hello-after-stop\nparent-after-stop\n")); err != nil {
-		t.Fatalf("write input after continuing interactive job: %v", err)
+
+	if _, err := terminal.Write([]byte("parent-after-stop\n")); err != nil {
+		t.Fatalf("write input after stopping interactive child: %v", err)
 	}
 
 	type readResult struct {
@@ -263,19 +264,19 @@ func TestRunInteractiveChildHandlesTerminalStop(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		_ = command.Wait()
-		t.Fatal("interactive job did not finish after being continued")
+		t.Fatal("interactive job did not abort after its foreground child stopped")
 	}
 	if result.err != nil && !errors.Is(result.err, syscall.EIO) {
-		t.Fatalf("read continued interactive output: %v\n%s", result.err, result.output)
+		t.Fatalf("read stopped interactive output: %v\n%s", result.err, result.output)
 	}
 	if err := command.Wait(); err != nil {
-		t.Fatalf("continued interactive helper failed: %v\n%s", err, result.output)
+		t.Fatalf("stopped interactive helper failed: %v\n%s", err, result.output)
 	}
-	if !strings.Contains(result.output, "child-read:hello-after-stop") {
-		t.Fatalf("continued child did not regain its foreground TTY:\n%s", result.output)
+	if !strings.Contains(result.output, "wrapper-interrupted") {
+		t.Fatalf("runner did not treat Ctrl-Z as an interruption:\n%s", result.output)
 	}
 	if !strings.Contains(result.output, "parent-read:parent-after-stop") {
-		t.Fatalf("unring did not regain the TTY after the continued child exited:\n%s", result.output)
+		t.Fatalf("runner did not reclaim a readable foreground TTY:\n%s", result.output)
 	}
 }
 
@@ -305,9 +306,24 @@ func TestRunInteractiveChildHelper(t *testing.T) {
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
 	})
-	if result.Err != nil || result.ExitCode != 0 {
+	if result.Err != nil {
 		fmt.Fprintf(os.Stderr, "interactive runner failed: exit=%d err=%v\n",
 			result.ExitCode, result.Err)
+		os.Exit(1)
+	}
+	if mode == "job-control" {
+		if !result.Interrupted || result.ExitCode != 128+int(syscall.SIGKILL) {
+			fmt.Fprintf(os.Stderr,
+				"stopped child result: exit=%d interrupted=%v, want exit=%d interrupted\n",
+				result.ExitCode,
+				result.Interrupted,
+				128+int(syscall.SIGKILL),
+			)
+			os.Exit(1)
+		}
+		fmt.Println("wrapper-interrupted")
+	} else if result.ExitCode != 0 {
+		fmt.Fprintf(os.Stderr, "interactive child exit=%d, want 0\n", result.ExitCode)
 		os.Exit(1)
 	}
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -330,66 +346,5 @@ func TestRunForegroundChildProcess(t *testing.T) {
 		os.Exit(1)
 	}
 	fmt.Printf("child-read:%s", line)
-	os.Exit(0)
-}
-
-func TestRunJobControlShellProcess(t *testing.T) {
-	if os.Getenv("UNRING_RUNNER_JOB_SHELL") != "1" {
-		return
-	}
-
-	command := exec.Command(os.Args[0], "-test.run=^TestRunInteractiveChildHelper$")
-	command.Env = append(os.Environ(), "UNRING_RUNNER_PTY_HELPER=job-control")
-	command.Stdin = os.Stdin
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	command.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:    true,
-		Foreground: true,
-		Ctty:       int(os.Stdin.Fd()),
-	}
-	if err := command.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "job-control shell failed to start unring helper: %v\n", err)
-		os.Exit(1)
-	}
-
-	var status syscall.WaitStatus
-	pid, err := syscall.Wait4(command.Process.Pid, &status, syscall.WUNTRACED, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "job-control shell wait failed: %v\n", err)
-		os.Exit(1)
-	}
-	if pid != command.Process.Pid || !status.Stopped() {
-		fmt.Fprintf(os.Stderr, "unring helper did not stop: pid=%d status=%#x\n",
-			pid, uint32(status))
-		os.Exit(1)
-	}
-
-	control := processGroupControl{
-		terminal:           os.Stdin,
-		parentProcessGroup: syscall.Getpgrp(),
-	}
-	if err := control.restoreForeground(); err != nil {
-		fmt.Fprintf(os.Stderr, "job-control shell could not reclaim TTY: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("wrapper-stopped")
-	if err := control.setForeground(int32(command.Process.Pid)); err != nil {
-		fmt.Fprintf(os.Stderr, "job-control shell could not foreground unring: %v\n", err)
-		os.Exit(1)
-	}
-	if err := signalProcessGroup(command.Process.Pid, syscall.SIGCONT); err != nil {
-		fmt.Fprintf(os.Stderr, "job-control shell could not continue unring: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := command.Wait(); err != nil {
-		fmt.Fprintf(os.Stderr, "continued unring helper failed: %v\n", err)
-		os.Exit(1)
-	}
-	if err := control.restoreForeground(); err != nil {
-		fmt.Fprintf(os.Stderr, "job-control shell could not reclaim final TTY: %v\n", err)
-		os.Exit(1)
-	}
 	os.Exit(0)
 }

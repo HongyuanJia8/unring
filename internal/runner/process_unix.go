@@ -94,7 +94,7 @@ func (control processGroupControl) foreground() (int32, error) {
 	return processGroup, nil
 }
 
-func (control processGroupControl) suspendWithChild(childPID int) error {
+func (control processGroupControl) reclaimStoppedChild(childPID int) error {
 	if control.terminal == nil {
 		return nil
 	}
@@ -103,27 +103,9 @@ func (control processGroupControl) suspendWithChild(childPID int) error {
 		return err
 	}
 	if foreground == int32(childPID) {
-		if err := control.restoreForeground(); err != nil {
-			return err
-		}
+		return control.restoreForeground()
 	}
-
-	// The wrapped command is a nested foreground job. Stop unring so its
-	// invoking shell can perform normal job control. Execution resumes here
-	// after that shell runs fg/bg and sends SIGCONT to unring.
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTSTP); err != nil {
-		return err
-	}
-	foreground, err = control.foreground()
-	if err != nil {
-		return err
-	}
-	if foreground == int32(control.parentProcessGroup) {
-		if err := control.setForeground(int32(childPID)); err != nil {
-			return err
-		}
-	}
-	return signalProcessGroup(childPID, syscall.SIGCONT)
+	return nil
 }
 
 func isTerminal(file *os.File) bool {

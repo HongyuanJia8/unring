@@ -23,6 +23,11 @@ go build -o unring ./cmd/unring
 ./unring run -- psql
 ```
 
+Building requires cgo and a working C compiler because unring uses
+`pg_query_go`/libpg_query—the PostgreSQL parser itself—to classify transaction
+statements. The standard Go toolchain plus Clang on macOS or GCC/Clang on Linux is
+sufficient.
+
 `unring` opens one real transaction on the configured database, binds a proxy to an
 ephemeral loopback port, and injects `DATABASE_URL` plus the standard `PG*` connection
 variables into the child process only. Every client connection opened by that child
@@ -40,6 +45,9 @@ unring run --discard -- your-command
 Without a terminal or a decision flag, the session defaults to discard. SIGINT,
 SIGTERM, an unring panic, or loss of the real database connection also defaults to
 rollback. The child's exit code is returned after a successful decision.
+If an interactive child is stopped with Ctrl-Z, unring reclaims the terminal,
+terminates the stopped child, and discards the session; nested job suspension is not
+preserved because an arbitrary parent process cannot be trusted to resume it safely.
 
 Database integration tests start and stop their own throwaway PostgreSQL cluster.
 They skip when PostgreSQL is not installed; CI and explicit verification require a

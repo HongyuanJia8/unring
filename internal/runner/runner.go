@@ -98,12 +98,23 @@ func Run(options Options) Result {
 				continue
 			}
 			if stopped {
-				if err := processGroup.suspendWithChild(command.Process.Pid); err != nil {
+				interrupted = true
+				if err := processGroup.reclaimStoppedChild(command.Process.Pid); err != nil {
 					supervisionErr = errors.Join(
 						supervisionErr,
-						fmt.Errorf("suspend with stopped child: %w", err),
+						fmt.Errorf("reclaim terminal from stopped child: %w", err),
 					)
-					_ = signalProcessGroup(command.Process.Pid, syscall.SIGCONT)
+				}
+				// A stopped process cannot perform graceful cleanup, and
+				// continuing it in the background can immediately stop it again
+				// on SIGTTIN. Kill the stopped group after reclaiming the TTY;
+				// the CLI will discard the database transaction.
+				if err := signalProcessGroup(command.Process.Pid, syscall.SIGKILL); err != nil &&
+					!errors.Is(err, syscall.ESRCH) {
+					supervisionErr = errors.Join(
+						supervisionErr,
+						fmt.Errorf("kill stopped child: %w", err),
+					)
 				}
 			}
 		case signal, ok := <-signals:

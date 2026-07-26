@@ -1,185 +1,68 @@
 package pgproxy
 
 import (
-	"strings"
-	"unicode"
+	"fmt"
+
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
-// unsafeClientSQL protects the transaction that belongs to unring rather than
-// any individual client. It is deliberately conservative: commands that can
-// finish or prepare the outer transaction are rejected instead of guessed at.
+// unsafeClientSQL uses PostgreSQL's own parser, embedded by libpg_query, as
+// the sole authority for statement boundaries and transaction statement
+// types. There is intentionally no handwritten lexer or text fallback.
 func unsafeClientSQL(sql string) string {
-	return unsafeClientSQLMode(sql, false)
-}
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		// libpg_query embeds a specific PostgreSQL major version, while unring
+		// may proxy a newer server that accepts syntax this parser does not.
+		// Forwarding a parse error could therefore execute a batch containing
+		// transaction control on that newer server. Fail closed instead.
+		return fmt.Sprintf(
+			"unring could not verify this query with PostgreSQL's parser and refused to forward it: %v",
+			err,
+		)
+	}
 
-func unsafeClientSQLMode(sql string, plainStringBackslashEscapes bool) string {
-	for _, firstWords := range statementFirstWords(sql, plainStringBackslashEscapes) {
-		if len(firstWords) == 0 {
+	for _, rawStatement := range tree.GetStmts() {
+		transaction := rawStatement.GetStmt().GetTransactionStmt()
+		if transaction == nil {
 			continue
 		}
-		switch firstWords[0] {
-		case "ABORT", "BEGIN", "COMMIT", "END", "ROLLBACK":
-			return "unring owns the shared transaction; client transaction-control commands are not supported"
-		case "START":
-			if len(firstWords) > 1 && firstWords[1] == "TRANSACTION" {
-				return "unring owns the shared transaction; START TRANSACTION is not supported"
-			}
-		case "PREPARE":
-			if len(firstWords) > 1 && firstWords[1] == "TRANSACTION" {
-				return "unring cannot allow PREPARE TRANSACTION to detach the shared transaction"
-			}
+		if reason := unsafeTransactionKind(transaction.GetKind()); reason != "" {
+			return reason
 		}
 	}
 	return ""
 }
 
-// statementFirstWords returns at most the first two bare words of each
-// semicolon-delimited statement while ignoring strings, quoted identifiers,
-// dollar-quoted bodies, and comments.
-func statementFirstWords(sql string, plainStringBackslashEscapes bool) [][]string {
-	var statements [][]string
-	var words []string
-	for i := 0; i < len(sql); {
-		switch {
-		case isSpace(sql[i]):
-			i++
-		case sql[i] == ';':
-			if len(words) > 0 {
-				statements = append(statements, words)
-			}
-			words = nil
-			i++
-		case (sql[i] == 'E' || sql[i] == 'e') &&
-			i+1 < len(sql) && sql[i+1] == '\'':
-			i = skipSingleQuoted(sql, i+2, true)
-		case sql[i] == '\'':
-			i = skipSingleQuoted(sql, i+1, plainStringBackslashEscapes)
-		case sql[i] == '"':
-			i = skipDoubleQuoted(sql, i+1)
-		case i+1 < len(sql) && sql[i:i+2] == "--":
-			i = skipLineComment(sql, i+2)
-		case i+1 < len(sql) && sql[i:i+2] == "/*":
-			i = skipBlockComment(sql, i+2)
-		case sql[i] == '$':
-			if next, ok := skipDollarQuoted(sql, i); ok {
-				i = next
-			} else {
-				i++
-			}
-		case isWordStart(rune(sql[i])):
-			start := i
-			i++
-			for i < len(sql) && isWordPart(rune(sql[i])) {
-				i++
-			}
-			if len(words) < 2 {
-				words = append(words, strings.ToUpper(sql[start:i]))
-			}
-		default:
-			i++
-		}
+func unsafeTransactionKind(kind pg_query.TransactionStmtKind) string {
+	switch kind {
+	case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN,
+		pg_query.TransactionStmtKind_TRANS_STMT_START,
+		pg_query.TransactionStmtKind_TRANS_STMT_COMMIT,
+		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK:
+		return "unring owns the shared transaction; client transaction-control commands are not supported"
+
+	case pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
+		pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
+		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
+		return "unring cannot allow prepared-transaction control in the shared transaction"
+
+	case pg_query.TransactionStmtKind_TRANS_STMT_SAVEPOINT,
+		pg_query.TransactionStmtKind_TRANS_STMT_RELEASE,
+		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+		// Client savepoints do not finish the outer transaction. Unring's own
+		// savepoints live in an unpredictable per-session namespace.
+		return ""
+
+	case pg_query.TransactionStmtKind_TRANSACTION_STMT_KIND_UNDEFINED:
+		return "unring refused an unknown PostgreSQL transaction statement kind"
+
+	default:
+		// A future libpg_query may add a transaction kind with semantics this
+		// version of unring has not audited.
+		return fmt.Sprintf(
+			"unring refused unaudited PostgreSQL transaction statement kind %s",
+			kind,
+		)
 	}
-	if len(words) > 0 {
-		statements = append(statements, words)
-	}
-	return statements
-}
-
-func skipSingleQuoted(sql string, i int, backslashEscapes bool) int {
-	for i < len(sql) {
-		if sql[i] == '\'' {
-			if i+1 < len(sql) && sql[i+1] == '\'' {
-				i += 2
-				continue
-			}
-			return i + 1
-		}
-		if backslashEscapes && sql[i] == '\\' && i+1 < len(sql) {
-			i += 2
-			continue
-		}
-		i++
-	}
-	return i
-}
-
-func skipDoubleQuoted(sql string, i int) int {
-	for i < len(sql) {
-		if sql[i] == '"' {
-			if i+1 < len(sql) && sql[i+1] == '"' {
-				i += 2
-				continue
-			}
-			return i + 1
-		}
-		i++
-	}
-	return i
-}
-
-func skipLineComment(sql string, i int) int {
-	for i < len(sql) && sql[i] != '\n' && sql[i] != '\r' {
-		i++
-	}
-	return i
-}
-
-func skipBlockComment(sql string, i int) int {
-	depth := 1
-	for i < len(sql) && depth > 0 {
-		switch {
-		case i+1 < len(sql) && sql[i:i+2] == "/*":
-			depth++
-			i += 2
-		case i+1 < len(sql) && sql[i:i+2] == "*/":
-			depth--
-			i += 2
-		default:
-			i++
-		}
-	}
-	return i
-}
-
-func skipDollarQuoted(sql string, i int) (int, bool) {
-	end := i + 1
-	if end < len(sql) && sql[end] != '$' {
-		if !isDollarQuoteStart(sql[end]) {
-			return i, false
-		}
-		end++
-		for end < len(sql) && isDollarQuoteContinuation(sql[end]) {
-			end++
-		}
-	}
-	if end >= len(sql) || sql[end] != '$' {
-		return i, false
-	}
-	tag := sql[i : end+1]
-	closeAt := strings.Index(sql[end+1:], tag)
-	if closeAt < 0 {
-		return len(sql), true
-	}
-	return end + 1 + closeAt + len(tag), true
-}
-
-func isDollarQuoteStart(b byte) bool {
-	return b == '_' || b >= 0x80 ||
-		b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
-}
-
-func isDollarQuoteContinuation(b byte) bool {
-	return isDollarQuoteStart(b) || b >= '0' && b <= '9'
-}
-
-func isSpace(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f'
-}
-
-func isWordStart(r rune) bool {
-	return r == '_' || unicode.IsLetter(r)
-}
-
-func isWordPart(r rune) bool {
-	return isWordStart(r) || unicode.IsDigit(r) || r == '$'
 }

@@ -25,6 +25,11 @@ func TestUnsafeClientSQL(t *testing.T) {
 		},
 		{name: "start transaction", sql: "-- comment\nSTART TRANSACTION", unsafe: true},
 		{name: "prepare transaction", sql: "PREPARE TRANSACTION 'session'", unsafe: true},
+		{name: "commit prepared", sql: "COMMIT PREPARED 'session'", unsafe: true},
+		{name: "rollback prepared", sql: "ROLLBACK PREPARED 'session'", unsafe: true},
+		{name: "client savepoint", sql: "SAVEPOINT client_checkpoint"},
+		{name: "client release", sql: "RELEASE SAVEPOINT client_checkpoint"},
+		{name: "client rollback to", sql: "ROLLBACK TO SAVEPOINT client_checkpoint"},
 		{name: "word in string", sql: "SELECT 'commit; rollback'"},
 		{
 			name:   "plain string ending in backslash cannot hide commit",
@@ -61,6 +66,15 @@ func TestUnsafeClientSQL(t *testing.T) {
 			sql:  "INSERT INTO log VALUES ($\xe4\xb8\xad$; COMMIT;$\xe4\xb8\xad$)",
 		},
 		{
+			name:   "continued escape string cannot hide commit",
+			sql:    "SELECT E'a'\n'\\'e'; COMMIT; --'",
+			unsafe: true,
+		},
+		{
+			name: "continued escape string contains transaction words",
+			sql:  "SELECT E'a'\n'\\'; COMMIT; --'",
+		},
+		{
 			name:   "quotes in dollar body do not hide outer rollback",
 			sql:    `DO $body$ BEGIN RAISE NOTICE 'quoted '' COMMIT'; END $body$; ROLLBACK`,
 			unsafe: true,
@@ -81,16 +95,10 @@ func TestUnsafeClientSQL(t *testing.T) {
 	}
 }
 
-func TestUnsafeClientSQLWithBackslashEscapesEnabled(t *testing.T) {
+func TestUnsafeClientSQLFailsClosedOnParserError(t *testing.T) {
 	t.Parallel()
 
-	sql := `SELECT 'quoted \'; COMMIT inside string'; COMMIT`
-	if reason := unsafeClientSQLMode(sql, true); reason == "" {
-		t.Fatalf("transaction control hidden after a backslash-escaped quote was not detected: %s", sql)
-	}
-
-	safe := `SELECT 'quoted \'; COMMIT inside string'`
-	if reason := unsafeClientSQLMode(safe, true); reason != "" {
-		t.Fatalf("transaction word inside a backslash-escaped string was rejected: %v", reason)
+	if reason := unsafeClientSQL("SELECT ("); reason == "" {
+		t.Fatal("query rejected by the embedded PostgreSQL parser was forwarded")
 	}
 }

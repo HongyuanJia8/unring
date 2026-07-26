@@ -14,11 +14,7 @@ func (p *Proxy) relayQuery(client *pgproto3.Backend, sql string) {
 	p.queryMu.Lock()
 	defer p.queryMu.Unlock()
 
-	p.paramsMu.RLock()
-	plainStringBackslashEscapes :=
-		strings.EqualFold(p.params["standard_conforming_strings"], "off")
-	p.paramsMu.RUnlock()
-	if reason := unsafeClientSQLMode(sql, plainStringBackslashEscapes); reason != "" {
+	if reason := unsafeClientSQL(sql); reason != "" {
 		client.Send(&pgproto3.ErrorResponse{
 			Severity: "ERROR",
 			Code:     "0A000",

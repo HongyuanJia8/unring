@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -90,6 +91,94 @@ func TestCommitFlagCannotOverrideSignaledChild(t *testing.T) {
 	if err := <-backendDone; err != nil {
 		t.Fatalf("fake Postgres backend: %v", err)
 	}
+}
+
+func TestBuiltBinaryDiscardsStoppedInteractiveChild(t *testing.T) {
+	connectionString, backendDone := startInteractiveTestBackend(t)
+	t.Setenv("DATABASE_URL", connectionString)
+
+	binary := buildTestBinary(t)
+	command := exec.Command(
+		binary,
+		"run",
+		"--commit",
+		"--",
+		os.Args[0],
+		"-test.run=^TestStoppedInteractiveChildProcess$",
+	)
+	command.Env = append(os.Environ(), "UNRING_CLI_STOP_CHILD=1")
+	terminal, err := pty.Start(command)
+	if err != nil {
+		t.Fatalf("start built unring binary under PTY: %v", err)
+	}
+	defer terminal.Close()
+
+	reader := bufio.NewReader(terminal)
+	var output strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		output.WriteString(line)
+		if strings.Contains(line, "child-ready") {
+			break
+		}
+		if err != nil {
+			t.Fatalf("wait for stopped-child readiness: %v\n%s", err, output.String())
+		}
+	}
+	if _, err := terminal.Write([]byte{0x1a}); err != nil {
+		t.Fatalf("send terminal Ctrl-Z: %v", err)
+	}
+
+	type readResult struct {
+		output []byte
+		err    error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		remaining, err := io.ReadAll(reader)
+		readDone <- readResult{output: remaining, err: err}
+	}()
+
+	var readResultValue readResult
+	select {
+	case readResultValue = <-readDone:
+	case <-time.After(10 * time.Second):
+		_ = terminal.Close()
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = command.Wait()
+		t.Fatalf("built unring did not abort after Ctrl-Z:\n%s", output.String())
+	}
+	output.Write(readResultValue.output)
+	if readResultValue.err != nil && !errors.Is(readResultValue.err, syscall.EIO) {
+		t.Fatalf("read Ctrl-Z session output: %v\n%s",
+			readResultValue.err, output.String())
+	}
+
+	err = command.Wait()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) {
+		t.Fatalf("Ctrl-Z unring error = %v, want *exec.ExitError\n%s", err, output.String())
+	}
+	if got, want := exitError.ExitCode(), 128+int(syscall.SIGKILL); got != want {
+		t.Fatalf("Ctrl-Z unring exit code = %d, want %d\n%s", got, want, output.String())
+	}
+	if strings.Contains(output.String(), "Session committed.") ||
+		!strings.Contains(output.String(), "Session discarded.") {
+		t.Fatalf("--commit overrode a Ctrl-Z interruption:\n%s", output.String())
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
+func TestStoppedInteractiveChildProcess(t *testing.T) {
+	if os.Getenv("UNRING_CLI_STOP_CHILD") != "1" {
+		return
+	}
+
+	fmt.Println("child-ready")
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	os.Exit(0)
 }
 
 func TestBuiltBinaryRunsInteractivePsql(t *testing.T) {
