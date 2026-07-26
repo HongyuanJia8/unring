@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -608,6 +609,139 @@ func TestSimpleQuerySafelyEndsFailedExtendedCycle(t *testing.T) {
 	}
 	if proxy.Err() != nil {
 		t.Fatalf("mixed protocol marked proxy fatal: %v", proxy.Err())
+	}
+}
+
+func TestExtendedTransactionBlockErrorDefersApprovalUntilSync(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	defer proxySide.Close()
+	defer postgresSide.Close()
+	var approvals atomic.Int32
+	proxy := &Proxy{
+		upstream:        proxySide,
+		frontend:        pgproto3.NewFrontend(proxySide, proxySide),
+		params:          make(map[string]string),
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+		approve: func(context.Context, ApprovalRequest) (bool, error) {
+			approvals.Add(1)
+			return false, nil
+		},
+	}
+	var output bytes.Buffer
+	client := newClientState(1, pgproto3.NewBackend(strings.NewReader(""), &output))
+	prepared := &preparedStatement{
+		backendName: "checkpoint_statement",
+		query:       "CHECKPOINT",
+		statement:   clientStatement{SQL: "CHECKPOINT"},
+	}
+	client.portals["checkpoint_portal"] = &portal{
+		backendName: "checkpoint_portal_backend",
+		statement:   prepared,
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		if err := expectInternalQuery(backend, "SAVEPOINT unring_testtoken_"); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err := receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		if _, ok := message.(*pgproto3.Execute); !ok {
+			serverErrors <- fmt.Errorf("extended escape Execute = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.ErrorResponse{
+			Severity: "ERROR", Code: "25001",
+			Message: "CHECKPOINT cannot run inside a transaction block",
+		})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err = receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		if _, ok := message.(*pgproto3.Sync); !ok {
+			serverErrors <- fmt.Errorf("extended escape Sync = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'E'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+			return
+		}
+		if err := expectInternalQuery(backend, "ROLLBACK TO SAVEPOINT unring_testtoken_"); err != nil {
+			serverErrors <- err
+			return
+		}
+		message, err = receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		closeMessage, ok := message.(*pgproto3.Close)
+		if !ok || closeMessage.ObjectType != 'P' ||
+			closeMessage.Name != "checkpoint_portal_backend" {
+			serverErrors <- fmt.Errorf("extended escape portal cleanup = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.CloseComplete{})
+		message, err = receiveNonFlush(backend)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		if _, ok := message.(*pgproto3.Sync); !ok {
+			serverErrors <- fmt.Errorf("extended escape cleanup Sync = %#v", message)
+			return
+		}
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	proxy.relayExtended(client, &pgproto3.Execute{Portal: "checkpoint_portal"})
+	if approvals.Load() != 0 {
+		t.Fatal("extended transaction-block error requested approval before Sync")
+	}
+	proxy.relayExtended(client, &pgproto3.Sync{})
+	if approvals.Load() != 1 {
+		t.Fatalf("extended transaction-block approvals = %d, want 1", approvals.Load())
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+	if proxy.Err() != nil {
+		t.Fatalf("extended escape marked proxy fatal: %v", proxy.Err())
+	}
+	responses := pgproto3.NewFrontend(&output, io.Discard)
+	message, err := responses.Receive()
+	if err != nil {
+		t.Fatalf("decode deferred approval result: %v", err)
+	}
+	decline, ok := message.(*pgproto3.ErrorResponse)
+	if !ok || decline.Code != "57014" {
+		t.Fatalf("deferred approval result = %#v, want local decline", message)
+	}
+	message, err = responses.Receive()
+	if err != nil {
+		t.Fatalf("decode ReadyForQuery after deferred approval: %v", err)
+	}
+	if ready, ok := message.(*pgproto3.ReadyForQuery); !ok || ready.TxStatus != 'I' {
+		t.Fatalf("deferred approval ReadyForQuery = %#v", message)
 	}
 }
 

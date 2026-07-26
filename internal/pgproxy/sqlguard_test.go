@@ -133,6 +133,7 @@ func TestAnalyzeClientSQLClassifiesIrreversibleStatements(t *testing.T) {
 		"CREATE INDEX CONCURRENTLY example_idx ON example (id)",
 		"DROP INDEX CONCURRENTLY example_idx",
 		"ALTER SYSTEM SET work_mem = '4MB'",
+		"CHECKPOINT",
 		"REINDEX (CONCURRENTLY) INDEX example_idx",
 		"CREATE TABLESPACE example LOCATION '/tmp/example'",
 		"DROP TABLESPACE example",

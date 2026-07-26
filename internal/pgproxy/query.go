@@ -819,7 +819,10 @@ func (p *Proxy) internalRowsLocked(sql string) ([][][]byte, error) {
 		case *pgproto3.DataRow:
 			row := make([][]byte, len(message.Values))
 			for index, value := range message.Values {
-				row[index] = append([]byte(nil), value...)
+				if value != nil {
+					row[index] = make([]byte, len(value))
+					copy(row[index], value)
+				}
 			}
 			rows = append(rows, row)
 		case *pgproto3.ErrorResponse:

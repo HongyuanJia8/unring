@@ -157,6 +157,111 @@ func TestInternalQueryAllowsAsynchronousMessages(t *testing.T) {
 	}
 }
 
+func TestInternalRowsPreservesEmptyValuesAndSQLNull(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	t.Cleanup(func() {
+		_ = proxySide.Close()
+		_ = postgresSide.Close()
+	})
+	proxy := &Proxy{
+		upstream: proxySide,
+		frontend: pgproto3.NewFrontend(proxySide, proxySide),
+		params:   make(map[string]string),
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		if _, err := backend.Receive(); err != nil {
+			serverErrors <- err
+			return
+		}
+		backend.Send(&pgproto3.RowDescription{})
+		backend.Send(&pgproto3.DataRow{Values: [][]byte{
+			[]byte("empty"), {}, nil, []byte("value"),
+		}})
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	rows, err := proxy.internalRowsLocked("SELECT test_values")
+	if err != nil {
+		t.Fatalf("internalRowsLocked(): %v", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != 4 {
+		t.Fatalf("internalRowsLocked() = %#v", rows)
+	}
+	if rows[0][1] == nil || len(rows[0][1]) != 0 {
+		t.Fatalf("empty value decoded as %#v, want non-nil empty slice", rows[0][1])
+	}
+	if rows[0][2] != nil {
+		t.Fatalf("SQL NULL decoded as %#v, want nil", rows[0][2])
+	}
+	if string(rows[0][3]) != "value" {
+		t.Fatalf("non-empty value decoded as %q", rows[0][3])
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+}
+
+func TestEscapeSessionStateAcceptsEmptyTransactionIDAndGUC(t *testing.T) {
+	t.Parallel()
+
+	proxySide, postgresSide := net.Pipe()
+	t.Cleanup(func() {
+		_ = proxySide.Close()
+		_ = postgresSide.Close()
+	})
+	proxy := &Proxy{
+		upstream: proxySide,
+		frontend: pgproto3.NewFrontend(proxySide, proxySide),
+		params:   make(map[string]string),
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer close(serverErrors)
+		backend := pgproto3.NewBackend(postgresSide, postgresSide)
+		if _, err := backend.Receive(); err != nil {
+			serverErrors <- err
+			return
+		}
+		backend.Send(&pgproto3.RowDescription{})
+		for _, values := range [][][]byte{
+			{[]byte("__unring_session_authorization__"), []byte("postgres")},
+			{[]byte("__unring_role__"), []byte("postgres")},
+			{[]byte("__unring_transaction_id__"), {}},
+			{[]byte("search_path"), {}},
+		} {
+			backend.Send(&pgproto3.DataRow{Values: values})
+		}
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 4")})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+		if err := backend.Flush(); err != nil {
+			serverErrors <- err
+		}
+	}()
+
+	state, err := proxy.escapeSessionStateLocked()
+	if err != nil {
+		t.Fatalf("escapeSessionStateLocked() rejected ordinary empty values: %v", err)
+	}
+	if state.hasUncommittedChanges {
+		t.Fatal("empty transaction ID was treated as an assigned transaction ID")
+	}
+	if value, ok := state.settings["search_path"]; !ok || value != "" {
+		t.Fatalf("empty search_path = %q, present=%v", value, ok)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+}
+
 func TestRandomSavepointPrefix(t *testing.T) {
 	t.Parallel()
 

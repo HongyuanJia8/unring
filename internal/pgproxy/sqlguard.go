@@ -139,6 +139,8 @@ func irreversibleReason(node *pg_query.Node) string {
 		return "DROP TABLESPACE cannot run inside a transaction block"
 	case node.GetAlterSystemStmt() != nil:
 		return "ALTER SYSTEM cannot run inside a transaction block"
+	case node.GetCheckPointStmt() != nil:
+		return "CHECKPOINT changes cluster state outside the shared transaction"
 	case clusterAll(node.GetClusterStmt()):
 		return "CLUSTER without a table cannot run inside a transaction block"
 	case node.GetVacuumStmt() != nil && node.GetVacuumStmt().GetIsVacuumcmd():
