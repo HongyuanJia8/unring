@@ -1,0 +1,26 @@
+# Binaries
+/unring
+/dist/
+*.exe
+
+# Go
+*.test
+*.out
+/coverage.txt
+
+# Local test Postgres instances
+/pgdata/
+/pg.log
+*.pid
+
+# Local session state / generated CA material
+/.unring/
+*.pem
+*.key
+!testdata/**/*.pem
+!testdata/**/*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
