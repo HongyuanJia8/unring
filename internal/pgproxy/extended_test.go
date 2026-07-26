@@ -2,15 +2,134 @@ package pgproxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
+
+func TestPGXDefaultParameterizedExecuteCompletes(t *testing.T) {
+	t.Parallel()
+
+	proxyUpstream, postgresSide := net.Pipe()
+	clientSide, proxyClient := net.Pipe()
+	proxy := &Proxy{
+		upstream:        proxyUpstream,
+		frontend:        pgproto3.NewFrontend(proxyUpstream, proxyUpstream),
+		params:          map[string]string{"client_encoding": "UTF8", "server_version": "17.0"},
+		clients:         make(map[net.Conn]struct{}),
+		fatalDone:       make(chan struct{}),
+		savepointPrefix: "unring_testtoken",
+	}
+
+	serverErrors := make(chan error, 1)
+	go serveParameterizedFakeBackend(postgresSide, serverErrors)
+	handlerDone := make(chan struct{})
+	proxy.clientWG.Add(1)
+	go func() {
+		proxy.handleClient(proxyClient)
+		close(handlerDone)
+	}()
+
+	config, err := pgx.ParseConfig("postgresql://postgres@127.0.0.1/postgres?sslmode=disable")
+	if err != nil {
+		t.Fatalf("parse client config: %v", err)
+	}
+	var dialed bool
+	config.DialFunc = func(context.Context, string, string) (net.Conn, error) {
+		if dialed {
+			return nil, errors.New("unexpected second client dial")
+		}
+		dialed = true
+		return clientSide, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	connection, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatalf("connect protocol client: %v", err)
+	}
+	if _, err := connection.Exec(ctx, "CREATE TABLE example (id integer, value text)"); err != nil {
+		t.Fatalf("unparameterized Exec() did not complete: %v", err)
+	}
+	if _, err := connection.Exec(ctx,
+		"INSERT INTO example (id, value) VALUES ($1, $2)", 1, "value"); err != nil {
+		t.Fatalf("parameterized Exec() did not complete: %v", err)
+	}
+	if err := connection.Close(ctx); err != nil {
+		t.Fatalf("close protocol client: %v", err)
+	}
+	select {
+	case <-handlerDone:
+	case <-ctx.Done():
+		t.Fatal("proxy client handler did not stop")
+	}
+	_ = proxyUpstream.Close()
+	_ = postgresSide.Close()
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fake postgres server: %v", err)
+	}
+}
+
+func serveParameterizedFakeBackend(connection net.Conn, errorsFound chan<- error) {
+	defer close(errorsFound)
+	defer connection.Close()
+	backend := pgproto3.NewBackend(connection, connection)
+	for {
+		message, err := backend.Receive()
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+			errors.Is(err, net.ErrClosed) {
+			return
+		}
+		if err != nil {
+			errorsFound <- err
+			return
+		}
+		switch message := message.(type) {
+		case *pgproto3.Query:
+			backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(strings.Fields(message.String)[0])})
+			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+			if err := backend.Flush(); err != nil {
+				errorsFound <- err
+				return
+			}
+		case *pgproto3.Parse:
+			backend.Send(&pgproto3.ParseComplete{})
+		case *pgproto3.Bind:
+			backend.Send(&pgproto3.BindComplete{})
+		case *pgproto3.Describe:
+			if message.ObjectType == 'S' {
+				backend.Send(&pgproto3.ParameterDescription{ParameterOIDs: []uint32{23, 25}})
+			}
+			backend.Send(&pgproto3.NoData{})
+		case *pgproto3.Execute:
+			backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("INSERT 0 1")})
+		case *pgproto3.Close:
+			backend.Send(&pgproto3.CloseComplete{})
+		case *pgproto3.Flush:
+			if err := backend.Flush(); err != nil {
+				errorsFound <- err
+				return
+			}
+		case *pgproto3.Sync:
+			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
+			if err := backend.Flush(); err != nil {
+				errorsFound <- err
+				return
+			}
+		default:
+			errorsFound <- fmt.Errorf("unexpected frontend message %T", message)
+			return
+		}
+	}
+}
 
 func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 	t.Parallel()
@@ -40,7 +159,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				return
 			}
 
-			message, err := backend.Receive()
+			message, err := receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -57,7 +176,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				return
 			}
 
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -74,7 +193,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				return
 			}
 
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -91,7 +210,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				return
 			}
 
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -107,7 +226,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				return
 			}
 
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -124,7 +243,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				return
 			}
 
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -140,7 +259,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				return
 			}
 
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -159,7 +278,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				serverErrors <- err
 				return
 			}
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -174,7 +293,7 @@ func TestExtendedProtocolRewritesSameNamesPerClient(t *testing.T) {
 				serverErrors <- err
 				return
 			}
-			message, err = backend.Receive()
+			message, err = receiveNonFlush(backend)
 			if err != nil {
 				serverErrors <- err
 				return
@@ -247,7 +366,7 @@ func testRowDescription() *pgproto3.RowDescription {
 }
 
 func expectInternalQuery(backend *pgproto3.Backend, prefix string) error {
-	message, err := backend.Receive()
+	message, err := receiveNonFlush(backend)
 	if err != nil {
 		return err
 	}
@@ -258,6 +377,19 @@ func expectInternalQuery(backend *pgproto3.Backend, prefix string) error {
 	backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(strings.Fields(prefix)[0])})
 	backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
 	return backend.Flush()
+}
+
+func receiveNonFlush(backend *pgproto3.Backend) (pgproto3.FrontendMessage, error) {
+	for {
+		message, err := backend.Receive()
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := message.(*pgproto3.Flush); ok {
+			continue
+		}
+		return message, nil
+	}
 }
 
 func strconvItoa(value int) string {

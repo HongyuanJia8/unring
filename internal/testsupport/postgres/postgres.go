@@ -31,6 +31,13 @@ func Start(t *testing.T) string {
 	if err != nil {
 		skipOrFailUnavailable(t, "pg_ctl is not available: %v", err)
 	}
+	if err := checkSystemVSharedMemoryAccess(); err != nil {
+		skipOrFailUnavailable(
+			t,
+			"System V shared memory is unavailable; refusing to run initdb and risk leaking a segment: %v",
+			err,
+		)
+	}
 
 	root := t.TempDir()
 	dataDirectory := filepath.Join(root, "data")
@@ -123,6 +130,20 @@ func Start(t *testing.T) string {
 	query.Set("sslmode", "disable")
 	connectionURL.RawQuery = query.Encode()
 	return connectionURL.String()
+}
+
+func checkSystemVSharedMemoryAccess() error {
+	ipcs, err := exec.LookPath("ipcs")
+	if err != nil {
+		// Some minimal environments do not install ipcs. In that case retain
+		// the historical behavior and let initdb make the availability check.
+		return nil
+	}
+	output, err := exec.Command(ipcs, "-m").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("inspect existing segments: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func skipOrFailUnavailable(t *testing.T, format string, arguments ...any) {

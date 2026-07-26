@@ -350,6 +350,7 @@ func (p *Proxy) closePortalLocked(client *clientState, clientName string, portal
 
 func (p *Proxy) closeBackendObjectLocked(objectType byte, name string) error {
 	p.frontend.Send(&pgproto3.Close{ObjectType: objectType, Name: name})
+	p.frontend.Send(&pgproto3.Flush{})
 	if err := p.frontend.Flush(); err != nil {
 		return fmt.Errorf("send backend object close: %w", err)
 	}
@@ -376,6 +377,11 @@ func (p *Proxy) exchangeExtendedLocked(
 	terminal func(pgproto3.BackendMessage) bool,
 ) (pgproto3.BackendMessage, bool) {
 	p.frontend.Send(message)
+	// PostgreSQL may buffer every extended-query response until it receives
+	// Flush or Sync. This proxy processes one frontend message at a time, so it
+	// must request an upstream flush before synchronously waiting for that
+	// message's response. Without this, pgx Prepare deadlocks after Parse.
+	p.frontend.Send(&pgproto3.Flush{})
 	if err := p.frontend.Flush(); err != nil {
 		p.markFatal(fmt.Errorf("send %T to real postgres: %w", message, err))
 		return nil, false
