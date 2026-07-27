@@ -36,7 +36,7 @@ func TestBuiltBinaryRunsInteractiveChild(t *testing.T) {
 		"--",
 		"/bin/sh",
 		"-c",
-		`IFS= read -r line; printf 'child-read:%s\n' "$line"`,
+		`printf 'unring-test-child-ready\n'; IFS= read -r line; printf 'child-read:%s\n' "$line"`,
 	)
 	command.Env = os.Environ()
 	terminal, err := pty.Start(command)
@@ -45,11 +45,19 @@ func TestBuiltBinaryRunsInteractiveChild(t *testing.T) {
 	}
 	defer terminal.Close()
 
-	if _, err := terminal.Write([]byte("hello-terminal\nd\n")); err != nil {
-		t.Fatalf("write interactive input: %v", err)
-	}
-
-	output := readInteractiveOutput(t, terminal, command)
+	session := newInteractiveSession(t, terminal, command)
+	session.waitFor(
+		"unring-test-child-ready",
+		"the interactive child to take the foreground terminal",
+	)
+	session.write("hello-terminal\n", "the interactive child's input")
+	session.waitFor(
+		"child-read:hello-terminal",
+		"the interactive child to read from the foreground terminal",
+	)
+	session.waitFor(interactiveReviewMarker, "unring to display its review prompt")
+	session.write("d", "the review discard decision")
+	output := session.finish("unring to exit after the review discard decision")
 	if !strings.Contains(output, "child-read:hello-terminal") {
 		t.Fatalf("interactive child did not read from the foreground TTY:\n%s", output)
 	}
@@ -287,6 +295,7 @@ func TestBuiltBinaryRunsInteractivePsql(t *testing.T) {
 		"-X",
 		"-P", "pager=off",
 		"-v", "ON_ERROR_STOP=1",
+		"-v", "PROMPT1="+interactivePsqlMarker,
 	)
 	command.Env = os.Environ()
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 120})
@@ -295,19 +304,27 @@ func TestBuiltBinaryRunsInteractivePsql(t *testing.T) {
 	}
 	defer terminal.Close()
 
-	script := fmt.Sprintf(
-		"CREATE TABLE %s (value text);\n"+
-			"INSERT INTO %s VALUES ('interactive-value');\n"+
-			"SELECT value FROM %s;\n"+
-			"\\q\n"+
-			"d\n",
-		table, table, table,
+	session := newInteractiveSession(t, terminal, command)
+	session.waitFor(interactivePsqlMarker, "psql to display its initial prompt")
+	session.write(
+		fmt.Sprintf("CREATE TABLE %s (value text);\n", table),
+		"the psql CREATE TABLE statement",
 	)
-	if _, err := terminal.Write([]byte(script)); err != nil {
-		t.Fatalf("write psql interaction: %v", err)
-	}
-
-	outputText := readInteractiveOutput(t, terminal, command)
+	session.waitFor(interactivePsqlMarker, "psql to finish CREATE TABLE")
+	session.write(
+		fmt.Sprintf("INSERT INTO %s VALUES ('interactive-value');\n", table),
+		"the psql INSERT statement",
+	)
+	session.waitFor(interactivePsqlMarker, "psql to finish INSERT")
+	session.write(
+		fmt.Sprintf("SELECT value FROM %s;\n", table),
+		"the psql SELECT statement",
+	)
+	session.waitFor(interactivePsqlMarker, "psql to finish SELECT")
+	session.write("\\q\n", "the psql quit command")
+	session.waitFor(interactiveReviewMarker, "unring to regain the terminal and display its review prompt")
+	session.write("d", "the review discard decision")
+	outputText := session.finish("unring to exit after the review discard decision")
 	if !strings.Contains(outputText, "interactive-value") {
 		t.Fatalf("psql did not read its write through unring:\n%s", outputText)
 	}
@@ -348,7 +365,15 @@ func TestApprovedIrreversibleActionAlwaysGetsReview(t *testing.T) {
 	t.Setenv("DATABASE_URL", connectionString)
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--", psqlPath, "-X", "-P", "pager=off")
+	command := exec.Command(
+		binary,
+		"run",
+		"--",
+		psqlPath,
+		"-X",
+		"-P", "pager=off",
+		"-v", "PROMPT1="+interactivePsqlMarker,
+	)
 	command.Env = os.Environ()
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 30, Cols: 120})
 	if err != nil {
@@ -356,10 +381,25 @@ func TestApprovedIrreversibleActionAlwaysGetsReview(t *testing.T) {
 	}
 	defer terminal.Close()
 
-	if _, err := terminal.Write([]byte("VACUUM;\ny\n\\q\nd\n")); err != nil {
-		t.Fatalf("write irreversible psql interaction: %v", err)
-	}
-	output := readInteractiveOutput(t, terminal, command)
+	session := newInteractiveSession(t, terminal, command)
+	session.waitFor(interactivePsqlMarker, "psql to display its initial prompt")
+	session.write("VACUUM;\n", "the irreversible VACUUM statement")
+	session.waitFor(
+		"Run this irreversible action? [y/N] ",
+		"unring to reclaim the terminal and request irreversible-action approval",
+	)
+	session.write("y\n", "the irreversible-action approval")
+	session.waitFor(
+		interactivePsqlMarker,
+		"psql to regain the terminal after the irreversible-action approval",
+	)
+	session.write("\\q\n", "the psql quit command")
+	session.waitFor(
+		interactiveReviewMarker,
+		"unring to regain the terminal and display the irreversible-session review",
+	)
+	session.write("d", "the review discard decision")
+	output := session.finish("unring to exit after the irreversible-session review")
 	if !strings.Contains(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") ||
 		!strings.Contains(output, "APPROVED IRREVERSIBLE ACTIONS") ||
 		!strings.Contains(output, "Session discarded.") {
@@ -384,56 +424,183 @@ func buildTestBinary(t *testing.T) string {
 	return binary
 }
 
-func readInteractiveOutput(t *testing.T, terminal *os.File, command *exec.Cmd) string {
+const (
+	interactivePsqlMarker   = "unring-test-psql-ready> "
+	interactiveReviewMarker = "Up/down: select  Enter/space: expand  c: commit  d: discard"
+	interactiveTimeout      = 30 * time.Second
+)
+
+type interactiveSession struct {
+	t            *testing.T
+	terminal     *os.File
+	command      *exec.Cmd
+	output       *synchronizedBuffer
+	readDone     chan error
+	deadline     time.Time
+	searchOffset int
+}
+
+func newInteractiveSession(
+	t *testing.T,
+	terminal *os.File,
+	command *exec.Cmd,
+) *interactiveSession {
 	t.Helper()
 
-	var output synchronizedBuffer
-	readDone := make(chan error, 1)
+	session := &interactiveSession{
+		t:        t,
+		terminal: terminal,
+		command:  command,
+		output:   newSynchronizedBuffer(),
+		readDone: make(chan error, 1),
+		deadline: time.Now().Add(interactiveTimeout),
+	}
 	go func() {
-		_, err := io.Copy(&output, terminal)
-		readDone <- err
+		_, err := io.Copy(session.output, terminal)
+		session.readDone <- err
 	}()
+	return session
+}
 
-	var readErr error
-	select {
-	case readErr = <-readDone:
-	case <-time.After(30 * time.Second):
-		_ = terminal.Close()
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-		_ = command.Wait()
-		t.Fatalf(
-			"interactive unring did not exit within 30 seconds\n"+
-				"output captured before timeout:\n%s",
-			output.String(),
+func (session *interactiveSession) waitFor(marker, description string) {
+	session.t.Helper()
+
+	for {
+		output, updated := session.output.snapshot()
+		if index := strings.Index(output[session.searchOffset:], marker); index >= 0 {
+			session.searchOffset += index + len(marker)
+			return
+		}
+
+		timer := time.NewTimer(time.Until(session.deadline))
+		select {
+		case <-updated:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case readErr := <-session.readDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			session.failAfterExit(description, readErr)
+		case <-timer.C:
+			session.failTimeout(description)
+		}
+	}
+}
+
+func (session *interactiveSession) write(input, description string) {
+	session.t.Helper()
+
+	if _, err := io.WriteString(session.terminal, input); err != nil {
+		session.killAndWait()
+		session.t.Fatalf(
+			"write %s: %v\noutput captured before write failure:\n%s",
+			description,
+			err,
+			session.output.String(),
 		)
 	}
+}
+
+func (session *interactiveSession) finish(description string) string {
+	session.t.Helper()
+
+	timer := time.NewTimer(time.Until(session.deadline))
+	var readErr error
+	select {
+	case readErr = <-session.readDone:
+		if !timer.Stop() {
+			<-timer.C
+		}
+	case <-timer.C:
+		session.failTimeout(description)
+	}
 	if readErr != nil && !errors.Is(readErr, syscall.EIO) {
-		_ = terminal.Close()
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-		_ = command.Wait()
-		t.Fatalf("read interactive unring output: %v\n%s", readErr, output.String())
+		session.killAndWait()
+		session.t.Fatalf(
+			"read interactive unring output while waiting for %s: %v\n"+
+				"output captured before read failure:\n%s",
+			description,
+			readErr,
+			session.output.String(),
+		)
 	}
-	if err := command.Wait(); err != nil {
-		t.Fatalf("interactive unring failed: %v\n%s", err, output.String())
+	if err := session.command.Wait(); err != nil {
+		session.t.Fatalf(
+			"interactive unring exited while waiting for %s: %v\n"+
+				"output captured before exit:\n%s",
+			description,
+			err,
+			session.output.String(),
+		)
 	}
-	return output.String()
+	return session.output.String()
+}
+
+func (session *interactiveSession) failAfterExit(description string, readErr error) {
+	session.t.Helper()
+
+	waitErr := session.command.Wait()
+	session.t.Fatalf(
+		"interactive unring exited before %s\n"+
+			"process error: %v\nPTY read error: %v\n"+
+			"output captured before exit:\n%s",
+		description,
+		waitErr,
+		readErr,
+		session.output.String(),
+	)
+}
+
+func (session *interactiveSession) failTimeout(description string) {
+	session.t.Helper()
+
+	session.killAndWait()
+	session.t.Fatalf(
+		"interactive unring timed out after %s waiting for %s\n"+
+			"output captured before timeout:\n%s",
+		interactiveTimeout,
+		description,
+		session.output.String(),
+	)
+}
+
+func (session *interactiveSession) killAndWait() {
+	_ = session.terminal.Close()
+	_ = syscall.Kill(-session.command.Process.Pid, syscall.SIGKILL)
+	_ = session.command.Wait()
 }
 
 type synchronizedBuffer struct {
-	mutex sync.Mutex
-	data  bytes.Buffer
+	mutex   sync.Mutex
+	data    bytes.Buffer
+	updated chan struct{}
+}
+
+func newSynchronizedBuffer() *synchronizedBuffer {
+	return &synchronizedBuffer{updated: make(chan struct{})}
 }
 
 func (buffer *synchronizedBuffer) Write(data []byte) (int, error) {
 	buffer.mutex.Lock()
 	defer buffer.mutex.Unlock()
-	return buffer.data.Write(data)
+	count, err := buffer.data.Write(data)
+	close(buffer.updated)
+	buffer.updated = make(chan struct{})
+	return count, err
 }
 
 func (buffer *synchronizedBuffer) String() string {
 	buffer.mutex.Lock()
 	defer buffer.mutex.Unlock()
 	return buffer.data.String()
+}
+
+func (buffer *synchronizedBuffer) snapshot() (string, <-chan struct{}) {
+	buffer.mutex.Lock()
+	defer buffer.mutex.Unlock()
+	return buffer.data.String(), buffer.updated
 }
 
 func startInteractiveTestBackend(t *testing.T) (string, <-chan error) {
