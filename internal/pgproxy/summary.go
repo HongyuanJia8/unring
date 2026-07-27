@@ -16,7 +16,9 @@ type catalogObject struct {
 
 type catalogSnapshot map[string]catalogObject
 
-const catalogSnapshotSQL = `
+const publicationNamespaceFingerprintToken = "__UNRING_PUBLICATION_NAMESPACE_FINGERPRINT__"
+
+const catalogSnapshotSQLTemplate = `
 SELECT c.oid::text,
        CASE c.relkind
          WHEN 'r' THEN 'table' WHEN 'p' THEN 'table'
@@ -135,7 +137,8 @@ SELECT r.oid::text, 'rule',
    AND n.nspname !~ '^pg_toast'
 UNION ALL
 SELECT s.oid::text, 'extended statistic', format('%I.%I', n.nspname, s.stxname),
-       concat_ws(E'\x1f', pg_get_statisticsobjdef(s.oid), s.stxstattarget::text)
+       concat_ws(E'\x1f', pg_get_statisticsobjdef(s.oid),
+         (to_jsonb(s) - 'oid' - 'stxname' - 'stxnamespace')::text)
   FROM pg_statistic_ext s
   JOIN pg_namespace n ON n.oid = s.stxnamespace
  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -148,30 +151,21 @@ SELECT e.oid::text, 'event trigger', format('%I', e.evtname),
   FROM pg_event_trigger e
 UNION ALL
 SELECT p.oid::text, 'publication', format('%I', p.pubname),
-       concat_ws(E'\x1f', p.pubowner::text, p.puballtables::text,
-         p.pubinsert::text, p.pubupdate::text, p.pubdelete::text,
-         p.pubtruncate::text, p.pubviaroot::text,
+       concat_ws(E'\x1f', (to_jsonb(p) - 'oid' - 'pubname')::text,
          COALESCE((
-           SELECT string_agg(concat_ws(E'\x1d', pr.prrelid::regclass::text,
-                    COALESCE(array_to_string(pr.prattrs, ','), ''),
-                    COALESCE(pg_get_expr(pr.prqual, pr.prrelid), '')),
+           SELECT string_agg(
+                    (to_jsonb(pr) - 'oid' - 'prpubid')::text,
                     E'\x1c' ORDER BY pr.prrelid)
              FROM pg_publication_rel pr WHERE pr.prpubid = p.oid
          ), ''),
-         COALESCE((
-           SELECT string_agg(pn.pnnspid::regnamespace::text, E'\x1c' ORDER BY pn.pnnspid)
-             FROM pg_publication_namespace pn WHERE pn.pnpubid = p.oid
-         ), ''))
+         ` + publicationNamespaceFingerprintToken + `)
   FROM pg_publication p
 UNION ALL
 SELECT s.oid::text, 'subscription', format('%I.%I', d.datname, s.subname),
-       concat_ws(E'\x1f', s.subdbid::text, s.subskiplsn::text,
-         s.subowner::text, s.subenabled::text,
-         s.subbinary::text, s.substream::text, s.subtwophasestate::text,
-         s.subdisableonerr::text, s.subpasswordrequired::text,
-         s.subrunasowner::text, s.subfailover::text,
-         md5(s.subconninfo), COALESCE(s.subslotname, ''), s.subsynccommit,
-         COALESCE(array_to_string(s.subpublications, E'\x1e'), ''), s.suborigin)
+       concat_ws(E'\x1f', s.subdbid::text, s.subowner::text,
+         s.subenabled::text, s.subbinary::text, s.substream::text,
+         COALESCE(s.subslotname, ''), s.subsynccommit,
+         COALESCE(array_to_string(s.subpublications, E'\x1e'), ''))
   FROM pg_subscription s
   JOIN pg_database d ON d.oid = s.subdbid
 UNION ALL
@@ -209,15 +203,47 @@ SELECT o.oid::text, 'operator',
    AND n.nspname !~ '^pg_toast'
 UNION ALL
 SELECT c.oid::text, 'collation', format('%I.%I', n.nspname, c.collname),
-       concat_ws(E'\x1f', c.collowner::text, c.collprovider::text, c.collisdeterministic::text,
-         c.collencoding::text, COALESCE(c.collcollate, ''),
-         COALESCE(c.collctype, ''), COALESCE(c.colllocale, ''),
-         COALESCE(c.collicurules, ''), COALESCE(c.collversion, ''))
+       (to_jsonb(c) - 'oid' - 'collname' - 'collnamespace')::text
   FROM pg_collation c
   JOIN pg_namespace n ON n.oid = c.collnamespace
  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
    AND n.nspname !~ '^pg_toast'
 ORDER BY 2, 3`
+
+func catalogSnapshotSQL(serverVersion int) string {
+	publicationNamespaces := "''"
+	// Publications over every table in a schema and the backing catalog were
+	// both added in PostgreSQL 15. PostgreSQL resolves relation names while
+	// planning, so a to_regclass guard cannot make a static reference safe on
+	// 14; omit the impossible object class from that version's query instead.
+	if serverVersion >= 150000 {
+		publicationNamespaces = `COALESCE((
+           SELECT string_agg(pn.pnnspid::regnamespace::text, E'\x1c' ORDER BY pn.pnnspid)
+             FROM pg_publication_namespace pn WHERE pn.pnpubid = p.oid
+         ), '')`
+	}
+	return strings.Replace(
+		catalogSnapshotSQLTemplate,
+		publicationNamespaceFingerprintToken,
+		publicationNamespaces,
+		1,
+	)
+}
+
+func (p *Proxy) captureServerVersionLocked() (int, error) {
+	rows, err := p.internalRowsLocked("SHOW server_version_num")
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] == nil {
+		return 0, fmt.Errorf("PostgreSQL returned malformed server_version_num")
+	}
+	version, err := strconv.Atoi(string(rows[0][0]))
+	if err != nil || version <= 0 {
+		return 0, fmt.Errorf("parse server_version_num %q", rows[0][0])
+	}
+	return version, nil
+}
 
 func (p *Proxy) captureCatalogLocked() (catalogSnapshot, error) {
 	// Catalog deparser functions qualify names relative to search_path. Pin it
@@ -229,7 +255,7 @@ func (p *Proxy) captureCatalogLocked() (catalogSnapshot, error) {
 	); err != nil {
 		return nil, fmt.Errorf("pin catalog search path: %w", err)
 	}
-	rows, err := p.internalRowsLocked(catalogSnapshotSQL)
+	rows, err := p.internalRowsLocked(catalogSnapshotSQL(p.serverVersion))
 	restoreStatus, restoreErr := p.internalQueryLocked(
 		"ROLLBACK TO SAVEPOINT " + savepoint + "; RELEASE SAVEPOINT " + savepoint,
 	)

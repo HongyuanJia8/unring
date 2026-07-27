@@ -297,7 +297,7 @@ func promptIrreversibleApproval(
 	}
 
 	fmt.Fprint(output, "Run this irreversible action? [y/N] ")
-	answer, err := bufio.NewReader(input).ReadString('\n')
+	answer, err := readOnePromptLine(input)
 	if err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(output, "\nCould not read approval (%v); declining.\n", err)
 		return false
@@ -308,6 +308,30 @@ func promptIrreversibleApproval(
 		fmt.Fprintln(output, "Action declined; it was not run.")
 	}
 	return approved
+}
+
+// readOnePromptLine deliberately limits every Read call to one byte. A
+// bufio.Reader may read several canonical terminal lines at once on Linux;
+// discarding that reader after the approval would then swallow input intended
+// for the resumed child or the final review prompt.
+func readOnePromptLine(input io.Reader) (string, error) {
+	var line strings.Builder
+	var buffer [1]byte
+	for {
+		count, err := input.Read(buffer[:])
+		if count == 1 {
+			line.WriteByte(buffer[0])
+			if buffer[0] == '\n' {
+				return line.String(), nil
+			}
+		}
+		if err != nil {
+			return line.String(), err
+		}
+		if count == 0 {
+			return line.String(), io.ErrNoProgress
+		}
+	}
 }
 
 func promptDecisionWithSignal(

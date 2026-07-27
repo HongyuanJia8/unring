@@ -171,6 +171,7 @@ func TestAnalyzeClientSQLMarksUncountableEffects(t *testing.T) {
 	for _, sql := range []string{
 		"TRUNCATE orders",
 		"REFRESH MATERIALIZED VIEW totals",
+		"ALTER SUBSCRIPTION reporting CONNECTION 'host=publisher'",
 		"SELECT lo_from_bytea(0, 'abc'::bytea)",
 	} {
 		statements, err := analyzeClientSQL(sql)

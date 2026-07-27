@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -121,6 +122,22 @@ func TestSummaryWarnsWhenSessionIsNotFullyReversible(t *testing.T) {
 		!strings.Contains(text, "VACUUM") ||
 		!strings.Contains(text, "discard cannot undo") {
 		t.Fatalf("irreversible summary warning missing:\n%s", text)
+	}
+}
+
+func TestIrreversibleApprovalDoesNotReadAheadPastItsLine(t *testing.T) {
+	t.Parallel()
+	input := strings.NewReader("yes\nchild-input\n")
+	line, err := readOnePromptLine(input)
+	if err != nil || line != "yes\n" {
+		t.Fatalf("approval line = %q, %v", line, err)
+	}
+	remaining, err := io.ReadAll(input)
+	if err != nil {
+		t.Fatalf("read remaining prompt input: %v", err)
+	}
+	if string(remaining) != "child-input\n" {
+		t.Fatalf("approval swallowed later terminal input: %q", remaining)
 	}
 }
 

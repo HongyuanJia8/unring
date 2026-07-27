@@ -28,6 +28,10 @@ Building requires cgo and a working C compiler because unring uses
 statements. The standard Go toolchain plus Clang on macOS or GCC/Clang on Linux is
 sufficient.
 
+PostgreSQL 14 is the minimum supported version. Older servers are rejected at startup
+with an explicit version error before any client traffic is accepted; CI exercises
+the integration suite against PostgreSQL 14 and 17 explicitly.
+
 `unring` opens one real transaction on the configured database, binds a proxy to an
 ephemeral loopback port, and injects `DATABASE_URL` plus the standard `PG*` connection
 variables into the child process only. Every client connection opened by that child
@@ -90,6 +94,9 @@ ability to make any of it permanent without you saying so.
 ## Honest limits
 
 - Sequences do not roll back — discarded runs still leave gaps in auto-increment IDs.
+- PostgreSQL does not expose authoritative per-table row counts for `TRUNCATE`.
+  unring reports that summary as `UNKNOWN` and forces the session to discard, so a
+  session containing a successful `TRUNCATE` cannot currently be committed.
 - Postgres only. MySQL commits DDL implicitly, which breaks the core guarantee.
 - Both PostgreSQL's simple and extended query protocols are supported. Prepared
   statement and portal names are isolated per client on the shared backend.

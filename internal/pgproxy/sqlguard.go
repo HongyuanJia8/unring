@@ -153,6 +153,8 @@ func summaryRisk(node *pg_query.Node, sql string) (string, *relationReference) {
 		return "TRUNCATE resets PostgreSQL's transaction row counters; exact affected-row counts are unavailable", nil
 	case node.GetRefreshMatViewStmt() != nil:
 		return "REFRESH MATERIALIZED VIEW rewrites through a transient relation; exact affected-row counts are unavailable", nil
+	case node.GetAlterSubscriptionStmt() != nil:
+		return "ALTER SUBSCRIPTION changes version-specific or protected catalog state that unring cannot compare portably", nil
 	case containsLargeObjectMutation(sql):
 		return "large-object data changed outside the relations covered by PostgreSQL's per-table transaction counters", nil
 	}

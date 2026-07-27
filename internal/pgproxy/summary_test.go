@@ -9,17 +9,46 @@ import (
 
 func TestCatalogSnapshotCoversReviewableDDLClasses(t *testing.T) {
 	t.Parallel()
-	if _, err := pg_query.Parse(catalogSnapshotSQL); err != nil {
-		t.Fatalf("catalog snapshot SQL does not parse: %v", err)
+	for _, version := range []int{140000, 150000, 160000, 170000} {
+		if _, err := pg_query.Parse(catalogSnapshotSQL(version)); err != nil {
+			t.Fatalf("PostgreSQL %d catalog snapshot SQL does not parse: %v", version, err)
+		}
 	}
+	query := catalogSnapshotSQL(minimumPostgresVersion)
 	for _, catalog := range []string{
 		"pg_rewrite", "pg_statistic_ext", "pg_event_trigger", "pg_publication",
 		"pg_subscription", "pg_description", "pg_cast", "pg_operator", "pg_collation",
 		"pg_shdescription",
 	} {
-		if !strings.Contains(catalogSnapshotSQL, catalog) {
+		if !strings.Contains(query, catalog) {
 			t.Errorf("catalog snapshot omits %s", catalog)
 		}
+	}
+	if strings.Contains(query, "pg_publication_namespace") {
+		t.Fatal("PostgreSQL 14 catalog snapshot references a PostgreSQL 15 catalog")
+	}
+	if !strings.Contains(catalogSnapshotSQL(150000), "pg_publication_namespace") {
+		t.Fatal("PostgreSQL 15 catalog snapshot omits schema publications")
+	}
+	for _, unsupportedColumn := range []string{
+		"stxstattarget", "subskiplsn", "subfailover", "colliculocale", "colllocale",
+	} {
+		if strings.Contains(query, unsupportedColumn) {
+			t.Errorf("PostgreSQL 14 catalog snapshot references version-specific column %s",
+				unsupportedColumn)
+		}
+	}
+}
+
+func TestPostgresMinimumVersionErrorIsActionable(t *testing.T) {
+	t.Parallel()
+	if err := validatePostgresVersion(140000, "14.0"); err != nil {
+		t.Fatalf("PostgreSQL 14 rejected: %v", err)
+	}
+	err := validatePostgresVersion(130016, "13.16")
+	if err == nil || !strings.Contains(err.Error(), "requires PostgreSQL 14 or newer") ||
+		!strings.Contains(err.Error(), "PostgreSQL 13.16") {
+		t.Fatalf("old-server error is not actionable: %v", err)
 	}
 }
 

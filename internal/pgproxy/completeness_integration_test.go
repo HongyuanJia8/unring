@@ -274,14 +274,18 @@ func TestForeignTableWriteForcesExplicitUnknownSummaryIntegration(t *testing.T) 
 	defer direct.Close(ctx)
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 	target, foreign, server := "unring_fdw_target_"+suffix, "unring_fdw_"+suffix, "unring_server_"+suffix
+	mappingOptions := "user " + quoteSQLLiteral(config.User)
+	if config.Password != "" {
+		mappingOptions += ", password " + quoteSQLLiteral(config.Password)
+	}
 	execTest(t, ctx, direct, "CREATE EXTENSION IF NOT EXISTS postgres_fdw")
 	execTest(t, ctx, direct, fmt.Sprintf(
 		"CREATE TABLE %s (id integer); "+
 			"CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host %s, port %s, dbname %s); "+
-			"CREATE USER MAPPING FOR CURRENT_USER SERVER %s OPTIONS (user %s); "+
+			"CREATE USER MAPPING FOR CURRENT_USER SERVER %s OPTIONS (%s); "+
 			"CREATE FOREIGN TABLE %s (id integer) SERVER %s OPTIONS (schema_name 'public', table_name %s)",
 		target, server, quoteSQLLiteral(config.Host), quoteSQLLiteral(strconv.Itoa(int(config.Port))),
-		quoteSQLLiteral(config.Database), server, quoteSQLLiteral(config.User), foreign, server,
+		quoteSQLLiteral(config.Database), server, mappingOptions, foreign, server,
 		quoteSQLLiteral(target)))
 	cleanupCompletenessSQL(t, config, fmt.Sprintf(
 		"DROP FOREIGN TABLE IF EXISTS %s; DROP SERVER IF EXISTS %s CASCADE; DROP TABLE IF EXISTS %s",

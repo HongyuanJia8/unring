@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,11 @@ const (
 // shared transaction. The session outcome cannot be claimed as reversible.
 var ErrTransactionLost = errors.New(
 	"postgres backend left unring's shared transaction; interception was lost",
+)
+
+const (
+	minimumPostgresMajor   = 14
+	minimumPostgresVersion = minimumPostgresMajor * 10000
 )
 
 // QueryRecord is a compact account of one client query batch.
@@ -178,6 +184,7 @@ type Proxy struct {
 	rowLedgerErr        error
 	uncertainEffects    []string
 	sequenceEffects     map[string]struct{}
+	serverVersion       int
 
 	finishMu sync.Mutex
 	finished bool
@@ -243,6 +250,17 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		_ = p.upstream.Close()
 		return nil, fmt.Errorf("begin shared postgres transaction: %w", err)
 	}
+	p.serverVersion, err = p.captureServerVersionLocked()
+	if err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, fmt.Errorf("determine PostgreSQL server version: %w", err)
+	}
+	if err := validatePostgresVersion(p.serverVersion, p.params["server_version"]); err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, err
+	}
 	p.catalogInitial, err = p.captureCatalogLocked()
 	if err != nil {
 		_, _ = p.internalQueryLocked("ROLLBACK")
@@ -271,6 +289,19 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 	go p.acceptLoop()
 
 	return p, nil
+}
+
+func validatePostgresVersion(versionNumber int, versionLabel string) error {
+	if versionNumber >= minimumPostgresVersion {
+		return nil
+	}
+	if versionLabel == "" {
+		versionLabel = strconv.Itoa(versionNumber)
+	}
+	return fmt.Errorf(
+		"unring requires PostgreSQL %d or newer; connected server is PostgreSQL %s",
+		minimumPostgresMajor, versionLabel,
+	)
 }
 
 // Address returns the loopback host and ephemeral port used by the proxy.

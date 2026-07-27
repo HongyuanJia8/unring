@@ -497,6 +497,12 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 			switch {
 			case query.String == "BEGIN":
 				tag = "BEGIN"
+			case query.String == "SHOW server_version_num":
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+					{Name: []byte("server_version_num")},
+				}})
+				backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("170000")}})
+				tag = "SHOW"
 			case query.String == "ROLLBACK":
 				status = 'I'
 			case strings.HasPrefix(query.String, "SAVEPOINT ") &&
