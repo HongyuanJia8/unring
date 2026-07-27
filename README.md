@@ -97,6 +97,11 @@ ability to make any of it permanent without you saying so.
   `CREATE INDEX CONCURRENTLY`, `ALTER SYSTEM`, `CHECKPOINT`, and similar) require
   approval and make the session not fully reversible. They are refused if the shared
   transaction already has uncommitted database changes.
+- Lock-waiting maintenance commands cannot run against a table while the shared
+  transaction holds locks on it. This includes concurrent index builds, `VACUUM FULL`,
+  `CLUSTER`, and `REINDEX`. Unring detects concrete target conflicts before execution;
+  commit or discard the session first, then run the maintenance command separately.
+  A short lock timeout remains as a backstop for conflicts that cannot be predicted.
 - Client transaction control is mapped to private savepoints. One client-visible
   transaction may be open at a time; it does not pin the backend while idle.
 - The shared transaction uses `REPEATABLE READ` so concurrent DDL cannot be mistaken

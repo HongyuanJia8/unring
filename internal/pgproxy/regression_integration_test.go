@@ -55,7 +55,7 @@ func TestOpenClientTransactionDoesNotPinBackendIntegration(t *testing.T) {
 	execTest(t, ctx, first, "ROLLBACK")
 }
 
-func TestIrreversibleCommandCannotDeadlockOnSharedWritesIntegration(t *testing.T) {
+func TestLockConflictingIrreversibleStatementIsExplainedImmediatelyIntegration(t *testing.T) {
 	connectionString := testpostgres.Start(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -86,6 +86,7 @@ func TestIrreversibleCommandCannotDeadlockOnSharedWritesIntegration(t *testing.T
 	execTest(t, ctx, client, fmt.Sprintf("INSERT INTO %s VALUES (1)", table))
 
 	done := make(chan error, 1)
+	started := time.Now()
 	go func() {
 		commandContext, commandCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer commandCancel()
@@ -98,8 +99,13 @@ func TestIrreversibleCommandCannotDeadlockOnSharedWritesIntegration(t *testing.T
 		if commandErr == nil {
 			t.Fatal("lock-conflicting concurrent index unexpectedly succeeded")
 		}
-		if !strings.Contains(commandErr.Error(), "uncommitted database changes") {
-			t.Fatalf("concurrent index error = %v, want safe uncommitted-change refusal", commandErr)
+		if !strings.Contains(commandErr.Error(), table) ||
+			!strings.Contains(commandErr.Error(), "commit or discard") ||
+			!strings.Contains(commandErr.Error(), "holds PostgreSQL lock") {
+			t.Fatalf("concurrent index error = %v, want table-specific lock explanation", commandErr)
+		}
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("lock conflict took %s to refuse; preflight did not avoid the timeout", elapsed)
 		}
 	case <-time.After(6 * time.Second):
 		t.Fatal("approved irreversible statement deadlocked")
@@ -119,19 +125,18 @@ func TestEscapeConnectionMirrorsSearchPathIntegration(t *testing.T) {
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 	schema := "unring_escape_schema_" + suffix
 	table := "target_" + suffix
-	index := "target_idx_" + suffix
 	execTest(t, ctx, direct, fmt.Sprintf(
-		"CREATE SCHEMA %s; CREATE TABLE %s.%s (id integer); CREATE TABLE public.%s (id integer)",
-		schema, schema, table, table))
+		"CREATE SCHEMA %s; "+
+			"CREATE TABLE %s.%s (id integer) WITH (autovacuum_enabled = false); "+
+			"CREATE TABLE public.%s (id integer) WITH (autovacuum_enabled = false); "+
+			"INSERT INTO %s.%s SELECT generate_series(1, 7); "+
+			"INSERT INTO public.%s SELECT generate_series(1, 11)",
+		schema, schema, table, table, schema, table, table))
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		cleanup := connectTest(t, cleanupContext, config)
 		defer cleanup.Close(cleanupContext)
-		execTest(t, cleanupContext, cleanup,
-			fmt.Sprintf("DROP INDEX CONCURRENTLY IF EXISTS %s.%s", schema, index))
-		execTest(t, cleanupContext, cleanup,
-			fmt.Sprintf("DROP INDEX CONCURRENTLY IF EXISTS public.%s", index))
 		execTest(t, cleanupContext, cleanup,
 			fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema))
 		execTest(t, cleanupContext, cleanup,
@@ -147,12 +152,16 @@ func TestEscapeConnectionMirrorsSearchPathIntegration(t *testing.T) {
 	defer proxy.Close()
 	client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
 	execTest(t, ctx, client, "SET search_path = "+schema)
-	execTest(t, ctx, client, fmt.Sprintf(
-		"CREATE INDEX CONCURRENTLY %s ON %s (id)", index, table))
+	execTest(t, ctx, client, fmt.Sprintf("VACUUM (ANALYZE) %s", table))
 	if got := scalarTest(t, ctx, direct, fmt.Sprintf(
-		"SELECT count(*) FROM pg_indexes WHERE schemaname = '%s' AND indexname = '%s'",
-		schema, index)); got != "1" {
-		t.Fatalf("escape statement did not use mirrored search_path; matching indexes = %s", got)
+		"SELECT reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "+
+			"WHERE n.nspname = '%s' AND c.relname = '%s'", schema, table)); got != "7" {
+		t.Fatalf("escape VACUUM did not analyze the search_path table; reltuples = %s", got)
+	}
+	if got := scalarTest(t, ctx, direct, fmt.Sprintf(
+		"SELECT reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "+
+			"WHERE n.nspname = 'public' AND c.relname = '%s'", table)); got != "-1" {
+		t.Fatalf("escape VACUUM analyzed public table instead of mirrored search_path; reltuples = %s", got)
 	}
 }
 

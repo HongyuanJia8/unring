@@ -151,6 +151,65 @@ func TestAnalyzeClientSQLClassifiesIrreversibleStatements(t *testing.T) {
 	}
 }
 
+func TestAnalyzeClientSQLFindsLockWaitingMaintenanceTargets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		sql       string
+		operation string
+		target    relationReference
+	}{
+		{
+			sql:       "CREATE INDEX CONCURRENTLY example_idx ON app.example (id)",
+			operation: "CREATE INDEX CONCURRENTLY",
+			target:    relationReference{Schema: "app", Name: "example"},
+		},
+		{
+			sql:       "VACUUM (FULL) app.example",
+			operation: "VACUUM FULL",
+			target:    relationReference{Schema: "app", Name: "example"},
+		},
+		{
+			sql:       "CLUSTER app.example USING example_idx",
+			operation: "CLUSTER",
+			target:    relationReference{Schema: "app", Name: "example"},
+		},
+		{
+			sql:       "REINDEX (CONCURRENTLY) TABLE app.example",
+			operation: "REINDEX",
+			target:    relationReference{Schema: "app", Name: "example"},
+		},
+		{
+			sql:       "DROP INDEX CONCURRENTLY app.example_idx",
+			operation: "DROP INDEX CONCURRENTLY",
+			target:    relationReference{Schema: "app", Name: "example_idx"},
+		},
+	}
+	for _, test := range tests {
+		statements, err := analyzeClientSQL(test.sql)
+		if err != nil {
+			t.Fatalf("analyzeClientSQL(%q): %v", test.sql, err)
+		}
+		if len(statements) != 1 || statements[0].LockOperation != test.operation ||
+			len(statements[0].LockTargets) != 1 || statements[0].LockTargets[0] != test.target {
+			t.Errorf("lock classification for %q = %#v, want %s on %#v",
+				test.sql, statements, test.operation, test.target)
+		}
+	}
+}
+
+func TestAnalyzeClientSQLDoesNotPreflightOrdinaryVacuumLocks(t *testing.T) {
+	t.Parallel()
+
+	statements, err := analyzeClientSQL("VACUUM (ANALYZE) app.example")
+	if err != nil {
+		t.Fatalf("analyzeClientSQL(): %v", err)
+	}
+	if len(statements) != 1 || len(statements[0].LockTargets) != 0 {
+		t.Fatalf("ordinary VACUUM lock classification = %#v, want timeout backstop only", statements)
+	}
+}
+
 func TestAnalyzeClientSQLRefusesDiscardAllWithoutMarkingItIrreversible(t *testing.T) {
 	t.Parallel()
 

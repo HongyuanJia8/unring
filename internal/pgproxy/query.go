@@ -512,7 +512,12 @@ func (p *Proxy) executeIrreversibleLocked(
 
 	p.acquireClient(client)
 	sessionState, stateErr := p.escapeSessionStateLocked()
+	var lockConflict *escapeLockConflict
+	var lockCheckErr error
 	if stateErr == nil {
+		lockConflict, lockCheckErr = p.escapeLockConflictLocked(statement)
+	}
+	if stateErr == nil && lockCheckErr == nil && lockConflict == nil {
 		p.escapeClient = client.id
 	}
 	p.releaseClient(client)
@@ -521,6 +526,25 @@ func (p *Proxy) executeIrreversibleLocked(
 		p.sendStatementError(client, "58000",
 			fmt.Sprintf("unring could not capture session state for the irreversible statement: %v",
 				stateErr), true)
+		if client.transactionSavepoint != "" {
+			client.transactionFailed = true
+		}
+		return nil, true
+	}
+	if lockCheckErr != nil {
+		err := fmt.Errorf("could not verify whether the shared session holds a conflicting lock: %w",
+			lockCheckErr)
+		p.finishIrreversibleAction(actionIndex, nil, err)
+		p.sendStatementError(client, "58000", err.Error(), true)
+		if client.transactionSavepoint != "" {
+			client.transactionFailed = true
+		}
+		return nil, true
+	}
+	if lockConflict != nil {
+		message := escapeLockConflictMessage(statement, *lockConflict)
+		p.finishIrreversibleAction(actionIndex, nil, errors.New(message))
+		p.sendStatementError(client, "55P03", message, false)
 		if client.transactionSavepoint != "" {
 			client.transactionFailed = true
 		}
@@ -565,8 +589,16 @@ func (p *Proxy) executeIrreversibleLocked(
 	}
 	results, execErr := connection.Exec(client.ctx, statement.SQL).ReadAll()
 	if execErr != nil {
-		p.finishIrreversibleAction(actionIndex, nil, execErr)
-		p.sendPgError(client, execErr)
+		var postgresError *pgconn.PgError
+		if errors.As(execErr, &postgresError) && postgresError.Code == "55P03" {
+			message := escapeLockTimeoutMessage(statement)
+			execErr = errors.New(message)
+			p.finishIrreversibleAction(actionIndex, nil, execErr)
+			p.sendStatementError(client, "55P03", message, false)
+		} else {
+			p.finishIrreversibleAction(actionIndex, nil, execErr)
+			p.sendPgError(client, execErr)
+		}
 		if client.transactionSavepoint != "" {
 			client.transactionFailed = true
 		}
@@ -632,6 +664,105 @@ type escapeSessionState struct {
 	role                  string
 	settings              map[string]string
 	hasUncommittedChanges bool
+}
+
+type escapeLockConflict struct {
+	Relation string
+	Kind     string
+	Modes    string
+}
+
+func (p *Proxy) escapeLockConflictLocked(
+	statement clientStatement,
+) (*escapeLockConflict, error) {
+	if len(statement.LockTargets) == 0 {
+		return nil, nil
+	}
+	// These maintenance operations can wait for a transaction after their
+	// initial table-lock acquisition (concurrent index builds also wait for old
+	// lockers and snapshots). For unring's long-lived transaction, any granted
+	// relation lock on the concrete target is therefore a self-conflict signal,
+	// not just modes that conflict in PostgreSQL's table-lock matrix.
+	values := make([]string, 0, len(statement.LockTargets))
+	for _, target := range statement.LockTargets {
+		values = append(values, "(to_regclass("+quoteSQLLiteral(target.regclassName())+")::oid)")
+	}
+	rows, err := p.internalRowsLocked(`WITH RECURSIVE
+requested(oid) AS (VALUES ` + strings.Join(values, ",") + `),
+seed(oid) AS (
+  SELECT oid FROM requested WHERE oid IS NOT NULL
+  UNION
+  SELECT i.indrelid FROM requested r JOIN pg_index i ON i.indexrelid = r.oid
+),
+targets(oid) AS (
+  SELECT oid FROM seed
+  UNION
+  SELECT i.inhrelid FROM targets t JOIN pg_inherits i ON i.inhparent = t.oid
+)
+SELECT format('%I.%I', n.nspname, c.relname), c.relkind::text,
+       string_agg(DISTINCT l.mode, ', ' ORDER BY l.mode)
+  FROM targets t
+  JOIN pg_class c ON c.oid = t.oid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  JOIN pg_locks l ON l.locktype = 'relation' AND l.relation = t.oid
+ WHERE l.pid = pg_backend_pid() AND l.granted
+ GROUP BY n.nspname, c.relname, c.relkind
+ ORDER BY CASE WHEN c.relkind IN ('r', 'p', 'f', 'm') THEN 0 ELSE 1 END,
+          n.nspname, c.relname
+ LIMIT 1`)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	row := rows[0]
+	if len(row) != 3 || row[0] == nil || row[1] == nil || row[2] == nil {
+		return nil, errors.New("PostgreSQL returned malformed shared-lock information")
+	}
+	return &escapeLockConflict{
+		Relation: string(row[0]), Kind: string(row[1]), Modes: string(row[2]),
+	}, nil
+}
+
+func (target relationReference) regclassName() string {
+	parts := make([]string, 0, 3)
+	for _, part := range []string{target.Catalog, target.Schema, target.Name} {
+		if part != "" {
+			parts = append(parts, quoteIdentifier(part))
+		}
+	}
+	return strings.Join(parts, ".")
+}
+
+func escapeLockConflictMessage(statement clientStatement, conflict escapeLockConflict) string {
+	operation := statement.LockOperation
+	if operation == "" {
+		operation = "this maintenance statement"
+	}
+	noun := "relation"
+	if conflict.Kind != "" && strings.ContainsRune("rpfm", rune(conflict.Kind[0])) {
+		noun = "table"
+	}
+	return fmt.Sprintf(
+		"unring cannot run %s while this session holds PostgreSQL lock(s) %s on %s %s; "+
+			"commit or discard this session first, then run the statement again",
+		operation, conflict.Modes, noun, conflict.Relation,
+	)
+}
+
+func escapeLockTimeoutMessage(statement clientStatement) string {
+	target := ""
+	if len(statement.LockTargets) > 0 {
+		target = " for " + statement.LockTargets[0].regclassName()
+	}
+	return "unring stopped this irreversible statement because it was still waiting for a " +
+		"PostgreSQL lock" + target + "; commit or discard this session first, then retry. " +
+		"If it still waits, another database session holds the conflicting lock"
+}
+
+func quoteSQLLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func (p *Proxy) escapeSessionStateLocked() (escapeSessionState, error) {
@@ -711,7 +842,7 @@ func applyEscapeSessionState(
 	// An irreversible command must not wait forever for locks held by unring's
 	// own shared transaction. This still permits arbitrarily long work once the
 	// command has acquired its locks.
-	if _, err := connection.Exec(ctx, "SET lock_timeout = '1s'").ReadAll(); err != nil {
+	if _, err := connection.Exec(ctx, "SET lock_timeout = '2s'").ReadAll(); err != nil {
 		return fmt.Errorf("set escape lock timeout: %w", err)
 	}
 	return nil

@@ -35,7 +35,9 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 - [x] M1.6 Escape hatch for statements that cannot run in a transaction block
       (`CREATE DATABASE`, `DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`,
       `ALTER SYSTEM`, `CHECKPOINT`) — classify as *needs approval*, run on a separate
-      non-transactional connection, mark the session as no longer fully reversible
+      non-transactional connection, mark the session as no longer fully reversible.
+      Lock-waiting maintenance against relations locked by the shared transaction is
+      refused up front; commit or discard first, then run it outside unring
 - [x] M1.7 Change summary — what the transaction actually did, for the review screen
 - [x] M1.8 Map client `BEGIN`/`COMMIT`/`ROLLBACK` and named savepoints onto private
       savepoints inside the shared transaction. This preserves the single-decision
@@ -99,3 +101,6 @@ multi-user · multi-agent concurrency control · web UI.
 
 - Whether `discard` should hand feedback back to the agent for a retry
   (not in v1, but do not architect it out)
+- Whether approved lock-conflicting maintenance should be deferred until the final
+  decision, so discard omits it entirely; this better fits the promise but changes
+  what the agent observes during the session

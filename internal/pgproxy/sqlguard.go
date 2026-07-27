@@ -30,6 +30,14 @@ type clientStatement struct {
 	Refusal       string
 	ReadOnly      bool
 	RollbackAfter bool
+	LockTargets   []relationReference
+	LockOperation string
+}
+
+type relationReference struct {
+	Catalog string
+	Schema  string
+	Name    string
 }
 
 // analyzeClientSQL uses PostgreSQL's own parser, embedded by libpg_query, as
@@ -91,6 +99,7 @@ func analyzeClientSQL(sql string) ([]clientStatement, error) {
 		}
 
 		statement.Irreversible = irreversibleReason(node)
+		statement.LockTargets, statement.LockOperation = maintenanceLockTargets(node)
 		statement.ReadOnly = readOnlySelect(node.GetSelectStmt())
 		if node.GetDiscardStmt() != nil &&
 			node.GetDiscardStmt().GetTarget() == pg_query.DiscardMode_DISCARD_ALL {
@@ -100,6 +109,83 @@ func analyzeClientSQL(sql string) ([]clientStatement, error) {
 		statements = append(statements, statement)
 	}
 	return statements, nil
+}
+
+func maintenanceLockTargets(node *pg_query.Node) ([]relationReference, string) {
+	if index := node.GetIndexStmt(); index != nil && index.GetConcurrent() {
+		return rangeVarReferences(index.GetRelation()), "CREATE INDEX CONCURRENTLY"
+	}
+	if vacuum := node.GetVacuumStmt(); vacuum != nil && vacuum.GetIsVacuumcmd() &&
+		hasDefinition(vacuum.GetOptions(), "full") {
+		var targets []relationReference
+		for _, raw := range vacuum.GetRels() {
+			targets = append(targets,
+				rangeVarReferences(raw.GetVacuumRelation().GetRelation())...)
+		}
+		return targets, "VACUUM FULL"
+	}
+	if cluster := node.GetClusterStmt(); cluster != nil && cluster.GetRelation() != nil {
+		return rangeVarReferences(cluster.GetRelation()), "CLUSTER"
+	}
+	if reindex := node.GetReindexStmt(); reindex != nil && reindex.GetRelation() != nil &&
+		reindexOutsideTransaction(reindex) {
+		return rangeVarReferences(reindex.GetRelation()), "REINDEX"
+	}
+	if drop := node.GetDropStmt(); drop != nil && drop.GetConcurrent() &&
+		drop.GetRemoveType() == pg_query.ObjectType_OBJECT_INDEX {
+		var targets []relationReference
+		for _, object := range drop.GetObjects() {
+			if target, ok := relationReferenceFromName(object); ok {
+				targets = append(targets, target)
+			}
+		}
+		return targets, "DROP INDEX CONCURRENTLY"
+	}
+	return nil, ""
+}
+
+func hasDefinition(options []*pg_query.Node, name string) bool {
+	for _, option := range options {
+		if definition := option.GetDefElem(); definition != nil &&
+			strings.EqualFold(definition.GetDefname(), name) {
+			return true
+		}
+	}
+	return false
+}
+
+func rangeVarReferences(relation *pg_query.RangeVar) []relationReference {
+	if relation == nil || relation.GetRelname() == "" {
+		return nil
+	}
+	return []relationReference{{
+		Catalog: relation.GetCatalogname(),
+		Schema:  relation.GetSchemaname(),
+		Name:    relation.GetRelname(),
+	}}
+}
+
+func relationReferenceFromName(node *pg_query.Node) (relationReference, bool) {
+	list := node.GetList()
+	if list == nil || len(list.GetItems()) == 0 || len(list.GetItems()) > 3 {
+		return relationReference{}, false
+	}
+	parts := make([]string, 0, len(list.GetItems()))
+	for _, item := range list.GetItems() {
+		value := item.GetString_()
+		if value == nil || value.GetSval() == "" {
+			return relationReference{}, false
+		}
+		parts = append(parts, value.GetSval())
+	}
+	target := relationReference{Name: parts[len(parts)-1]}
+	if len(parts) >= 2 {
+		target.Schema = parts[len(parts)-2]
+	}
+	if len(parts) == 3 {
+		target.Catalog = parts[0]
+	}
+	return target, true
 }
 
 func readOnlySelect(statement *pg_query.SelectStmt) bool {
