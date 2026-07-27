@@ -51,9 +51,9 @@ type IrreversibleAction struct {
 	Error       string
 }
 
-// RowChange reports physical tuple operations performed by the shared
-// transaction. PostgreSQL supplies these counters for the current transaction,
-// including writes performed by triggers.
+// RowChange reports physical tuple operations still staged by the shared
+// transaction. PostgreSQL supplies per-relation counters, including writes
+// performed by triggers; unring maintains the savepoint-aware staged view.
 type RowChange struct {
 	Table    string
 	Inserted int64
@@ -162,6 +162,9 @@ type Proxy struct {
 	changes             ChangeSummary
 	sealedSummary       bool
 	catalogInitial      catalogSnapshot
+	rowStats            rowStatsSnapshot
+	rowLedger           rowLedgerSnapshot
+	rowLedgerErr        error
 
 	finishMu sync.Mutex
 	finished bool
@@ -233,6 +236,13 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		_ = p.upstream.Close()
 		return nil, fmt.Errorf("capture initial postgres catalog: %w", err)
 	}
+	p.rowStats, err = p.captureRowStatsLocked()
+	if err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, fmt.Errorf("capture initial postgres row counters: %w", err)
+	}
+	p.rowLedger = make(rowLedgerSnapshot)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

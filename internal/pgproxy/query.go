@@ -42,12 +42,14 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 		statements = []clientStatement{{SQL: sql}}
 	}
 	batchSavepoint := ""
+	var batchRows rowLedgerSnapshot
 	if client.transactionSavepoint == "" && len(statements) > 1 && allRegularStatements(statements) {
 		batchSavepoint = client.nextObjectName(p.savepointPrefix, "b")
 		if _, err := p.internalQueryLocked("SAVEPOINT " + batchSavepoint); err != nil {
 			p.markFatal(fmt.Errorf("create simple-query batch savepoint: %w", err))
 			return
 		}
+		batchRows = cloneRowLedger(p.rowLedger)
 	}
 
 	record := QueryRecord{SQL: sql}
@@ -73,6 +75,10 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 		if _, err := p.internalQueryLocked(command); err != nil {
 			p.markFatal(fmt.Errorf("finish simple-query batch: %w", err))
 			return
+		}
+		if record.Failed {
+			p.restoreRowLedgerLocked(batchRows)
+			p.reconcileRowChangesLocked(false)
 		}
 	}
 	p.recordQuery(record)
@@ -212,6 +218,10 @@ func (p *Proxy) executeTransactionControlLocked(
 			p.markFatal(fmt.Errorf("finish client transaction: %w", err))
 			return nil, true
 		}
+		if client.transactionFailed {
+			p.restoreRowLedgerLocked(client.transactionRows)
+			p.reconcileRowChangesLocked(false)
+		}
 		p.clearClientTransaction(client)
 		if statement.Chain {
 			if err := p.beginClientTransactionLocked(client); err != nil {
@@ -233,6 +243,8 @@ func (p *Proxy) executeTransactionControlLocked(
 			p.markFatal(fmt.Errorf("roll back client transaction: %w", err))
 			return nil, true
 		}
+		p.restoreRowLedgerLocked(client.transactionRows)
+		p.reconcileRowChangesLocked(false)
 		p.clearClientTransaction(client)
 		if statement.Chain {
 			if err := p.beginClientTransactionLocked(client); err != nil {
@@ -254,6 +266,7 @@ func (p *Proxy) executeTransactionControlLocked(
 		}
 		client.savepoints = append(client.savepoints, clientSavepoint{
 			clientName: statement.Savepoint, backendName: backendName,
+			rows: cloneRowLedger(p.rowLedger),
 		})
 		client.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SAVEPOINT")})
 		return []string{"SAVEPOINT"}, false
@@ -276,6 +289,8 @@ func (p *Proxy) executeTransactionControlLocked(
 			p.markFatal(fmt.Errorf("roll back to client savepoint: %w", err))
 			return nil, true
 		}
+		p.restoreRowLedgerLocked(client.savepoints[index].rows)
+		p.reconcileRowChangesLocked(false)
 		client.savepoints = client.savepoints[:index+1]
 		client.transactionFailed = false
 		client.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")})
@@ -312,6 +327,7 @@ func (p *Proxy) beginClientTransactionLocked(client *clientState) error {
 		return fmt.Errorf("begin client transaction: %w", err)
 	}
 	client.transactionSavepoint = name
+	client.transactionRows = cloneRowLedger(p.rowLedger)
 	p.activeTransaction = client.id
 	client.transactionFailed = false
 	client.savepoints = nil
@@ -324,6 +340,7 @@ func (p *Proxy) clearClientTransaction(client *clientState) {
 	}
 	client.transactionSavepoint = ""
 	client.transactionFailed = false
+	client.transactionRows = nil
 	client.savepoints = nil
 }
 
@@ -442,6 +459,7 @@ complete:
 		p.markFatal(fmt.Errorf("restore shared transaction after client query: %w", err))
 		return tags, true
 	}
+	p.reconcileRowChangesLocked(!backendFailed && !statement.RollbackAfter)
 	if transactionBlockError != nil {
 		statement.Irreversible = transactionBlockError.Message
 		return p.executeIrreversibleLocked(client, statement)
@@ -624,7 +642,9 @@ func (p *Proxy) escapeSessionStateLocked() (escapeSessionState, error) {
 			"COALESCE(txid_current_if_assigned()::text, '') " +
 			"UNION ALL SELECT name, setting FROM pg_settings " +
 			"WHERE (source = 'session' OR name = 'search_path') " +
-			"AND name NOT IN ('role', 'session_authorization') ORDER BY 1",
+			"AND name NOT IN ('role', 'session_authorization', " +
+			"'transaction_isolation', 'transaction_read_only', " +
+			"'transaction_deferrable') ORDER BY 1",
 	)
 	if err != nil {
 		return escapeSessionState{}, err
@@ -643,7 +663,12 @@ func (p *Proxy) escapeSessionStateLocked() (escapeSessionState, error) {
 		case "__unring_transaction_id__":
 			state.hasUncommittedChanges = value != ""
 		default:
-			state.settings[name] = value
+			// Transaction characteristics are not session state. In
+			// particular, the escape connection intentionally has no
+			// transaction in which these settings could be applied.
+			if !transactionScopedSetting(name) {
+				state.settings[name] = value
+			}
 		}
 	}
 	if state.sessionAuthorization == "" || state.role == "" {
@@ -659,6 +684,9 @@ func applyEscapeSessionState(
 ) error {
 	names := make([]string, 0, len(state.settings))
 	for name := range state.settings {
+		if transactionScopedSetting(name) {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -687,6 +715,15 @@ func applyEscapeSessionState(
 		return fmt.Errorf("set escape lock timeout: %w", err)
 	}
 	return nil
+}
+
+func transactionScopedSetting(name string) bool {
+	switch strings.ToLower(name) {
+	case "transaction_isolation", "transaction_read_only", "transaction_deferrable":
+		return true
+	default:
+		return false
+	}
 }
 
 func quoteIdentifier(value string) string {

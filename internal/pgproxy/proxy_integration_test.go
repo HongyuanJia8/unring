@@ -255,7 +255,11 @@ func TestZeroRowUpdateIsReadOnlyIntegration(t *testing.T) {
 	table := "unring_zero_update_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	execTest(t, ctx, direct, fmt.Sprintf("CREATE TABLE %s (id integer PRIMARY KEY)", table))
 	t.Cleanup(func() {
-		execTest(t, context.Background(), direct, fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		cleanup := connectTest(t, cleanupContext, config)
+		defer cleanup.Close(cleanupContext)
+		execTest(t, cleanupContext, cleanup, fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
 	})
 
 	proxy, err := Start(ctx, config)
@@ -304,7 +308,11 @@ $$;
 CREATE TRIGGER write_audit AFTER INSERT ON %s
 FOR EACH ROW EXECUTE FUNCTION %s()`, source, audit, function, audit, source, function))
 	t.Cleanup(func() {
-		execTest(t, context.Background(), direct, fmt.Sprintf(
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		cleanup := connectTest(t, cleanupContext, config)
+		defer cleanup.Close(cleanupContext)
+		execTest(t, cleanupContext, cleanup, fmt.Sprintf(
 			"DROP TABLE IF EXISTS %s; DROP TABLE IF EXISTS %s; DROP FUNCTION IF EXISTS %s()",
 			source, audit, function))
 	})

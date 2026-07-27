@@ -10,6 +10,7 @@ import (
 type clientSavepoint struct {
 	clientName  string
 	backendName string
+	rows        rowLedgerSnapshot
 }
 
 type preparedStatement struct {
@@ -38,6 +39,7 @@ type clientState struct {
 
 	transactionSavepoint string
 	transactionFailed    bool
+	transactionRows      rowLedgerSnapshot
 	savepoints           []clientSavepoint
 
 	prepared map[string]*preparedStatement
@@ -119,6 +121,7 @@ func (p *Proxy) cleanupClient(client *clientState) {
 				"; RELEASE SAVEPOINT " + client.cycleSavepoint); err != nil {
 				p.markFatal(fmt.Errorf("recover abandoned extended query: %w", err))
 			}
+			p.reconcileRowChangesLocked(false)
 		}
 		client.extended = false
 		client.cycleSavepoint = ""
@@ -130,6 +133,8 @@ func (p *Proxy) cleanupClient(client *clientState) {
 				"; RELEASE SAVEPOINT " + client.transactionSavepoint); err != nil {
 				p.markFatal(fmt.Errorf("roll back disconnected client transaction: %w", err))
 			}
+			p.restoreRowLedgerLocked(client.transactionRows)
+			p.reconcileRowChangesLocked(false)
 		}
 		p.clearClientTransaction(client)
 	}

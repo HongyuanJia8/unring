@@ -305,9 +305,16 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 
 func (p *Proxy) rotateExtendedCycleSavepointLocked(client *clientState, create bool) error {
 	if client.cycleSavepoint != "" {
-		if _, err := p.internalQueryLocked("RELEASE SAVEPOINT " + client.cycleSavepoint); err != nil {
+		keep := !client.extendedFailed && !client.rollbackCycle
+		command := "RELEASE SAVEPOINT " + client.cycleSavepoint
+		if !keep {
+			command = "ROLLBACK TO SAVEPOINT " + client.cycleSavepoint +
+				"; RELEASE SAVEPOINT " + client.cycleSavepoint
+		}
+		if _, err := p.internalQueryLocked(command); err != nil {
 			return fmt.Errorf("release extended-query savepoint around transaction control: %w", err)
 		}
+		p.reconcileRowChangesLocked(keep)
 		client.cycleSavepoint = ""
 	}
 	if !create {
@@ -481,14 +488,16 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 	if err := p.synchronizeExtendedBackendLocked(client); err != nil {
 		return err
 	}
+	keepRows := !client.extendedFailed && !client.rollbackCycle
 	recovery := "RELEASE SAVEPOINT " + client.cycleSavepoint
-	if client.extendedFailed || client.rollbackCycle {
+	if !keepRows {
 		recovery = "ROLLBACK TO SAVEPOINT " + client.cycleSavepoint +
 			"; RELEASE SAVEPOINT " + client.cycleSavepoint
 	}
 	if _, err := p.internalQueryLocked(recovery); err != nil {
 		return fmt.Errorf("finish extended-query cycle: %w", err)
 	}
+	p.reconcileRowChangesLocked(keepRows)
 	if client.extendedFailed && client.pendingEscape == nil &&
 		client.transactionSavepoint != "" {
 		client.transactionFailed = true

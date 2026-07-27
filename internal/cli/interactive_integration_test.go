@@ -504,6 +504,13 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 				tag = "SET"
 			case strings.HasPrefix(query.String, "ROLLBACK TO SAVEPOINT "):
 				tag = "RELEASE"
+			case strings.Contains(query.String, "pg_stat_get_xact_tuples_inserted"):
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+					{Name: []byte("oid")}, {Name: []byte("name")},
+					{Name: []byte("inserted")}, {Name: []byte("updated")},
+					{Name: []byte("deleted")},
+				}})
+				tag = "SELECT 0"
 			case strings.Contains(query.String, "SELECT c.oid::text"):
 				catalogQueries++
 				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{

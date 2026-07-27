@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 )
 
 type catalogObject struct {
@@ -166,18 +165,18 @@ func (p *Proxy) captureCatalogLocked() (catalogSnapshot, error) {
 }
 
 func (p *Proxy) freezeChangeSummaryLocked() {
+	p.reconcileRowChangesLocked(true)
 	finalCatalog, err := p.captureCatalogLocked()
 	if err != nil {
 		p.setIncompleteSummary(fmt.Errorf("capture sealed postgres catalog: %w", err))
 		return
 	}
-	rowChanges, err := p.captureRowChangesLocked(p.catalogInitial, finalCatalog)
-	if err != nil {
-		p.setIncompleteSummary(fmt.Errorf("capture sealed postgres row counts: %w", err))
+	if p.rowLedgerErr != nil {
+		p.setIncompleteSummary(fmt.Errorf("capture sealed postgres row counts: %w", p.rowLedgerErr))
 		return
 	}
 	changes := ChangeSummary{
-		Rows: rowChanges, Schema: diffCatalog(p.catalogInitial, finalCatalog), Complete: true,
+		Rows: p.rowChangesLocked(), Schema: diffCatalog(p.catalogInitial, finalCatalog), Complete: true,
 	}
 	p.summaryMu.Lock()
 	p.changes = changes
@@ -195,60 +194,134 @@ func (p *Proxy) setIncompleteSummary(err error) {
 	p.summaryMu.Unlock()
 }
 
-func (p *Proxy) captureRowChangesLocked(initial, final catalogSnapshot) ([]RowChange, error) {
-	tables := make(map[uint32]string)
-	for _, snapshot := range []catalogSnapshot{initial, final} {
-		for _, object := range snapshot {
-			if object.Kind == "table" || object.Kind == "foreign table" ||
-				object.Kind == "materialized view" {
-				tables[object.OID] = object.Name
-			}
-		}
-	}
-	if len(tables) == 0 {
-		return nil, nil
-	}
-	oids := make([]uint32, 0, len(tables))
-	for oid := range tables {
-		oids = append(oids, oid)
-	}
-	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
-	values := make([]string, 0, len(oids))
-	for _, oid := range oids {
-		values = append(values, fmt.Sprintf("(%d::oid, %s::text)", oid, quoteLiteral(tables[oid])))
-	}
-	rows, err := p.internalRowsLocked(
-		"SELECT name, pg_stat_get_xact_tuples_inserted(oid)::text, " +
-			"pg_stat_get_xact_tuples_updated(oid)::text, " +
-			"pg_stat_get_xact_tuples_deleted(oid)::text FROM (VALUES " +
-			strings.Join(values, ",") + ") AS known(oid, name) ORDER BY name",
-	)
+type rowStat struct {
+	Table    string
+	Inserted int64
+	Updated  int64
+	Deleted  int64
+}
+
+type rowStatsSnapshot map[uint32]rowStat
+type rowLedgerSnapshot map[uint32]RowChange
+
+const rowStatsSQL = `
+SELECT c.oid::text, format('%I.%I', n.nspname, c.relname),
+       pg_stat_get_xact_tuples_inserted(c.oid)::text,
+       pg_stat_get_xact_tuples_updated(c.oid)::text,
+       pg_stat_get_xact_tuples_deleted(c.oid)::text
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind IN ('r', 'p', 'f', 'm')
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname !~ '^pg_toast'
+ ORDER BY c.oid`
+
+func (p *Proxy) captureRowStatsLocked() (rowStatsSnapshot, error) {
+	rows, err := p.internalRowsLocked(rowStatsSQL)
 	if err != nil {
 		return nil, err
 	}
-	var changes []RowChange
+	snapshot := make(rowStatsSnapshot, len(rows))
 	for _, row := range rows {
-		if len(row) != 4 || row[0] == nil {
-			return nil, fmt.Errorf("postgres returned malformed row-change summary")
+		if len(row) != 5 || row[0] == nil || row[1] == nil {
+			return nil, fmt.Errorf("postgres returned malformed row-counter snapshot")
+		}
+		oid, err := strconv.ParseUint(string(row[0]), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse row-counter relation OID %q: %w", row[0], err)
 		}
 		counts := [3]int64{}
 		for index := range counts {
-			if row[index+1] == nil {
+			if row[index+2] == nil {
 				continue
 			}
-			value, err := strconv.ParseInt(string(row[index+1]), 10, 64)
+			value, err := strconv.ParseInt(string(row[index+2]), 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("parse row-change count %q: %w", row[index+1], err)
+				return nil, fmt.Errorf("parse row-counter value %q: %w", row[index+2], err)
 			}
 			counts[index] = value
 		}
-		if counts[0] != 0 || counts[1] != 0 || counts[2] != 0 {
-			changes = append(changes, RowChange{
-				Table: string(row[0]), Inserted: counts[0], Updated: counts[1], Deleted: counts[2],
-			})
+		snapshot[uint32(oid)] = rowStat{
+			Table: string(row[1]), Inserted: counts[0], Updated: counts[1], Deleted: counts[2],
 		}
 	}
-	return changes, nil
+	return snapshot, nil
+}
+
+// reconcileRowChangesLocked samples PostgreSQL's backend-local relation
+// counters after a statement boundary. Those counters include trigger writes,
+// but PostgreSQL deliberately retains attempted writes after a subtransaction
+// abort. Keeping the deltas in our own ledger lets client savepoints restore
+// the staged view without guessing at SQL targets or misattributing triggers.
+func (p *Proxy) reconcileRowChangesLocked(keep bool) {
+	// Unit protocol harnesses that construct Proxy directly do not have a real
+	// catalog or stats baseline. Production proxies always initialize this in
+	// StartWithOptions.
+	if p.rowStats == nil {
+		return
+	}
+	current, err := p.captureRowStatsLocked()
+	if err != nil {
+		p.setRowLedgerError(err)
+		return
+	}
+	p.applyRowStatsLocked(current, keep)
+}
+
+func (p *Proxy) applyRowStatsLocked(current rowStatsSnapshot, keep bool) {
+	defer func() { p.rowStats = current }()
+	if !keep || p.rowLedgerErr != nil {
+		return
+	}
+	for oid, after := range current {
+		before := p.rowStats[oid]
+		if after.Inserted < before.Inserted ||
+			after.Updated < before.Updated ||
+			after.Deleted < before.Deleted {
+			p.setRowLedgerError(fmt.Errorf(
+				"PostgreSQL reset row counters for %s; exact staged row counts are unavailable",
+				after.Table,
+			))
+			return
+		}
+		change := p.rowLedger[oid]
+		change.Table = after.Table
+		change.Inserted += after.Inserted - before.Inserted
+		change.Updated += after.Updated - before.Updated
+		change.Deleted += after.Deleted - before.Deleted
+		if change.Inserted != 0 || change.Updated != 0 || change.Deleted != 0 {
+			p.rowLedger[oid] = change
+		}
+	}
+}
+
+func (p *Proxy) setRowLedgerError(err error) {
+	if p.rowLedgerErr == nil {
+		p.rowLedgerErr = err
+	}
+}
+
+func cloneRowLedger(source rowLedgerSnapshot) rowLedgerSnapshot {
+	clone := make(rowLedgerSnapshot, len(source))
+	for oid, change := range source {
+		clone[oid] = change
+	}
+	return clone
+}
+
+func (p *Proxy) restoreRowLedgerLocked(snapshot rowLedgerSnapshot) {
+	p.rowLedger = cloneRowLedger(snapshot)
+}
+
+func (p *Proxy) rowChangesLocked() []RowChange {
+	changes := make([]RowChange, 0, len(p.rowLedger))
+	for _, change := range p.rowLedger {
+		if change.Inserted != 0 || change.Updated != 0 || change.Deleted != 0 {
+			changes = append(changes, change)
+		}
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Table < changes[j].Table })
+	return changes
 }
 
 func diffCatalog(initial, final catalogSnapshot) []SchemaChange {
@@ -273,10 +346,6 @@ func diffCatalog(initial, final catalogSnapshot) []SchemaChange {
 		return left < right
 	})
 	return changes
-}
-
-func quoteLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func (p *Proxy) recordUnintercepted(statement, detail string) {

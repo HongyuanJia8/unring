@@ -99,6 +99,10 @@ ability to make any of it permanent without you saying so.
   transaction already has uncommitted database changes.
 - Client transaction control is mapped to private savepoints. One client-visible
   transaction may be open at a time; it does not pin the backend while idle.
+- The shared transaction uses `REPEATABLE READ` so concurrent DDL cannot be mistaken
+  for schema changes staged by the session. Consequently, a session does not see
+  commits made by other connections after its first snapshot, and PostgreSQL can
+  report serialization failures (`40001`) that would not occur at `READ COMMITTED`.
 - While that transaction is open, other clients may run read-only queries. Unring
   rolls those query cycles back internally so they cannot become part of the open
   client's savepoint. A concurrent write or second `BEGIN` fails immediately with
