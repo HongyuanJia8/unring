@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/HongyuanJia8/unring/internal/pgproxy"
 )
 
@@ -19,6 +21,53 @@ func TestMainHelp(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "unring run") {
 		t.Fatalf("help output did not mention run: %s", stdout.String())
+	}
+}
+
+func TestReviewModelExpandsStatementDetails(t *testing.T) {
+	t.Parallel()
+
+	model := newReviewModel(pgproxy.Summary{
+		Sealed:          true,
+		FullyReversible: true,
+		Changes:         pgproxy.ChangeSummary{Complete: true},
+		Queries: []pgproxy.QueryRecord{{
+			SQL: "UPDATE example\nSET value = 'changed'", CommandTags: []string{"UPDATE 2"},
+			Failed: true, Error: "constraint failed (SQLSTATE 23514)",
+		}},
+	})
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	view := updated.(reviewModel).View()
+	for _, want := range []string{
+		"Statement:", "UPDATE example", "SET value = 'changed'",
+		"Rows affected: update 2", "Error: constraint failed (SQLSTATE 23514)",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expanded review missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "\x1b") {
+		t.Fatalf("model emitted styling despite using plain terminal capabilities: %q", view)
+	}
+}
+
+func TestReviewModelSeparatesUninterceptedTraffic(t *testing.T) {
+	t.Parallel()
+
+	view := newReviewModel(pgproxy.Summary{
+		Sealed:          true,
+		FullyReversible: true,
+		Changes:         pgproxy.ChangeSummary{Complete: true},
+		Queries:         []pgproxy.QueryRecord{{SQL: "SELECT 1"}},
+		Unintercepted: []pgproxy.UninterceptedItem{{
+			Statement: "mystery", Detail: "could not classify this traffic",
+		}},
+	}).View()
+	statementSection := strings.Index(view, "STATEMENTS")
+	uninterceptedSection := strings.Index(view, "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!")
+	if statementSection < 0 || uninterceptedSection <= statementSection ||
+		!strings.Contains(view[uninterceptedSection:], "mystery") {
+		t.Fatalf("unintercepted traffic was not rendered in its own section:\n%s", view)
 	}
 }
 

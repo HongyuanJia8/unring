@@ -36,7 +36,7 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
       (`CREATE DATABASE`, `DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`,
       `ALTER SYSTEM`, `CHECKPOINT`) — classify as *needs approval*, run on a separate
       non-transactional connection, mark the session as no longer fully reversible
-- [ ] M1.7 Change summary — what the transaction actually did, for the review screen
+- [x] M1.7 Change summary — what the transaction actually did, for the review screen
 - [x] M1.8 Map client `BEGIN`/`COMMIT`/`ROLLBACK` and named savepoints onto private
       savepoints inside the shared transaction. This preserves the single-decision
       guarantee while letting transaction-managing clients and ORMs run
@@ -47,15 +47,15 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
       propagate exit code
 - [x] M2.2 Environment injection for the child only (`PGHOST`/`PGPORT`/`DATABASE_URL`;
       later `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`)
-- [ ] M2.3 `unring claude` and friends — thin aliases over `run`
-- [ ] M2.4 Read-only sessions exit silently: no prompt when nothing was written
+- [x] M2.3 `unring claude` and friends — thin aliases over `run`
+- [x] M2.4 Read-only sessions exit silently: no prompt when nothing was written
 
 ## M3 — Review interface
 
 - [x] M3.1 Non-interactive text summary + commit/discard prompt (unblocks end-to-end)
-- [ ] M3.2 Bubble Tea TUI: overall commit/discard, expandable per-item detail
+- [x] M3.2 Bubble Tea TUI: overall commit/discard, expandable per-item detail
       (diffs, affected rows, request bodies). **No partial commit** — by design
-- [ ] M3.3 Un-intercepted traffic gets its own, unmissable section
+- [x] M3.3 Un-intercepted traffic gets its own, unmissable section
 
 ## M4 — Audit log
 

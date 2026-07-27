@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/HongyuanJia8/unring/internal/pgproxy"
 	"github.com/HongyuanJia8/unring/internal/runner"
 	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/term"
 )
 
 const (
@@ -38,6 +41,10 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stdout)
 		return 0
 	default:
+		if isNamedAlias(args[0]) || resolvesOnPath(args[0]) {
+			runArgs := append([]string{"--", args[0]}, args[1:]...)
+			return runCommand(runArgs, stdin, stdout, stderr)
+		}
 		fmt.Fprintf(stderr, "unring: unknown command %q\n\n", args[0])
 		printUsage(stderr)
 		return usageExitCode
@@ -132,8 +139,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	sealContext, sealCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	sealErr := proxy.Seal(sealContext)
 	sealCancel()
-
-	printSummary(stdout, proxy.Summary())
+	summary := proxy.Summary()
 
 	interceptionErr := sealErr
 	if fatalErr := proxy.Err(); interceptionErr == nil && fatalErr != nil {
@@ -148,11 +154,34 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		)
 	}
 
+	if interceptionErr == nil && !summary.HasReviewableActivity() {
+		if result.Err != nil {
+			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
+		}
+		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		finalizeErr := proxy.Finalize(finalizeContext, pgproxy.DecisionRollback)
+		finalizeCancel()
+		if finalizeErr != nil {
+			fmt.Fprintf(stderr, "unring: session outcome not confirmed: %v\n", finalizeErr)
+			return internalErrorExitCode
+		}
+		return result.ExitCode
+	}
+
+	useTUI := interceptionErr == nil && !interrupted && result.Err == nil &&
+		summary.Changes.Complete && !*forceCommit && !*forceDiscard && shouldUseTUI(stdin, stdout)
+	if !useTUI {
+		printSummary(stdout, summary)
+	}
+
 	decision := pgproxy.DecisionRollback
 	switch {
 	case interceptionErr != nil:
 		// Rollback remains the only safe request, but Finalize will report
 		// that it cannot confirm the outcome.
+	case !summary.Changes.Complete:
+		fmt.Fprintln(stderr,
+			"unring: the sealed change summary is incomplete; discarding instead of offering commit")
 	case interrupted:
 		fmt.Fprintln(stdout, "Signal received: discarding the session.")
 	case result.Err != nil:
@@ -162,9 +191,20 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case *forceDiscard:
 		// Rollback is already the safe default.
 	default:
-		var promptInterrupted bool
-		decision, promptInterrupted = promptDecisionWithSignal(stdin, stdout, signalChannel)
-		interrupted = interrupted || promptInterrupted
+		if useTUI {
+			var reviewErr error
+			decision, interrupted, reviewErr = reviewDecisionWithSignal(
+				stdin, stdout, signalChannel, summary,
+			)
+			if reviewErr != nil {
+				fmt.Fprintf(stderr, "unring: %v; defaulting to discard\n", reviewErr)
+				decision = pgproxy.DecisionRollback
+			}
+		} else {
+			var promptInterrupted bool
+			decision, promptInterrupted = promptDecisionWithSignal(stdin, stdout, signalChannel)
+			interrupted = interrupted || promptInterrupted
+		}
 	}
 
 	if pendingSignal(signalChannel) {
@@ -187,6 +227,20 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return result.ExitCode
 	}
 	return result.ExitCode
+}
+
+func isNamedAlias(name string) bool {
+	switch name {
+	case "claude", "codex", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolvesOnPath(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 func parseBackendConfig() (*pgconn.Config, error) {
@@ -237,7 +291,7 @@ func promptIrreversibleApproval(
 	fmt.Fprintf(output, "  Reason: %s.\n", request.Reason)
 	fmt.Fprintln(output,
 		"  This will run now on a separate non-transactional connection and cannot be undone by discard.")
-	if !isTerminal(input) {
+	if !isTerminal(input) || !isTerminalWriter(output) {
 		fmt.Fprintln(output, "  No interactive terminal; declining the action.")
 		return false
 	}
@@ -261,8 +315,9 @@ func promptDecisionWithSignal(
 	output io.Writer,
 	signals <-chan os.Signal,
 ) (pgproxy.Decision, bool) {
-	if !isTerminal(input) {
-		return promptDecision(input, output), false
+	if !isTerminal(input) || !isTerminalWriter(output) {
+		fmt.Fprintln(output, "No interactive terminal; defaulting to discard. Use --commit to commit.")
+		return pgproxy.DecisionRollback, false
 	}
 
 	decision := make(chan pgproxy.Decision, 1)
@@ -295,7 +350,15 @@ func printSummary(output io.Writer, summary pgproxy.Summary) {
 		}
 	}
 
-	fmt.Fprintln(output, "\nPostgres session summary")
+	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
+	if !summary.FullyReversible {
+		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		fmt.Fprintln(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE")
+		fmt.Fprintln(output, "Irreversible actions were approved outside the shared transaction; discard cannot guarantee undo.")
+		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	}
+	writeChangeSummary(output, summary)
+	fmt.Fprintln(output, "\nSTATEMENTS")
 	fmt.Fprintf(output, "  Connections: %d (one shared backend transaction)\n", summary.Connections)
 	fmt.Fprintf(output, "  Query batches: %d", len(summary.Queries))
 	if failed > 0 {
@@ -313,17 +376,83 @@ func printSummary(output io.Writer, summary pgproxy.Summary) {
 			fmt.Fprintf(output, " -> %s", strings.Join(query.CommandTags, ", "))
 		}
 		fmt.Fprintln(output)
+		if query.Error != "" {
+			fmt.Fprintf(output, "    Error: %s\n", query.Error)
+		}
 	}
 	fmt.Fprintln(output, "  Note: PostgreSQL sequences do not roll back; discarded sessions can leave ID gaps.")
 	if !summary.FullyReversible {
-		fmt.Fprintln(output,
-			"  WARNING: This session is NOT FULLY REVERSIBLE. The following approved actions already ran")
-		fmt.Fprintln(output,
-			"  outside the shared transaction; commit or discard cannot undo them:")
+		fmt.Fprintln(output, "\nAPPROVED IRREVERSIBLE ACTIONS — DISCARD CANNOT UNDO THESE")
+		fmt.Fprintln(output, "  Successful actions ran outside the shared transaction; discard cannot undo them.")
 		for _, action := range summary.IrreversibleActions {
-			fmt.Fprintf(output, "  - %s\n", compactSQL(action.SQL))
+			fmt.Fprintf(output, "  - %s", compactSQL(action.SQL))
+			if len(action.CommandTags) > 0 {
+				fmt.Fprintf(output, " -> %s", strings.Join(action.CommandTags, ", "))
+			}
+			fmt.Fprintln(output)
+			if action.Error != "" {
+				fmt.Fprintf(output, "    Error: %s\n", action.Error)
+			}
 		}
 	}
+	if len(summary.Unintercepted) > 0 {
+		fmt.Fprintln(output, "\n================================================================")
+		fmt.Fprintln(output, "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!")
+		fmt.Fprintln(output, "Coverage is incomplete. These items are not part of the normal statement list.")
+		for _, item := range summary.Unintercepted {
+			if item.Statement != "" {
+				fmt.Fprintf(output, "  Statement: %s\n", item.Statement)
+			}
+			fmt.Fprintf(output, "  Detail: %s\n", item.Detail)
+		}
+		fmt.Fprintln(output, "================================================================")
+	}
+}
+
+func writeChangeSummary(output io.Writer, summary pgproxy.Summary) {
+	fmt.Fprintln(output, "\nDATA CHANGES (reported by PostgreSQL for the sealed transaction)")
+	if !summary.Changes.Complete {
+		fmt.Fprintf(output, "  UNKNOWN — the change summary is incomplete: %s\n", summary.Changes.Error)
+	} else if len(summary.Changes.Rows) == 0 {
+		fmt.Fprintln(output, "  No rows inserted, updated, or deleted.")
+	} else {
+		for _, change := range summary.Changes.Rows {
+			fmt.Fprintf(output, "  - %s: %d inserted, %d updated, %d deleted\n",
+				change.Table, change.Inserted, change.Updated, change.Deleted)
+		}
+	}
+	fmt.Fprintln(output, "\nSCHEMA CHANGES (sealed catalog comparison)")
+	if !summary.Changes.Complete {
+		fmt.Fprintln(output, "  UNKNOWN — catalog changes could not be determined safely.")
+	} else if len(summary.Changes.Schema) == 0 {
+		fmt.Fprintln(output, "  No schema changes.")
+	} else {
+		for _, change := range summary.Changes.Schema {
+			fmt.Fprintf(output, "  - %s %s %s\n", change.Action, change.Kind, change.Object)
+		}
+	}
+}
+
+func affectedRows(tags []string) string {
+	var affected []string
+	for _, tag := range tags {
+		fields := strings.Fields(tag)
+		if len(fields) < 2 {
+			continue
+		}
+		operation := strings.ToUpper(fields[0])
+		if operation != "INSERT" && operation != "UPDATE" && operation != "DELETE" &&
+			operation != "MERGE" && operation != "COPY" && operation != "MOVE" &&
+			operation != "FETCH" && operation != "SELECT" {
+			continue
+		}
+		countText := fields[len(fields)-1]
+		if _, err := strconv.ParseInt(countText, 10, 64); err != nil {
+			continue
+		}
+		affected = append(affected, strings.ToLower(operation)+" "+countText)
+	}
+	return strings.Join(affected, ", ")
 }
 
 func compactSQL(sql string) string {
@@ -337,11 +466,7 @@ func compactSQL(sql string) string {
 
 func isTerminal(reader io.Reader) bool {
 	file, ok := reader.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := file.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	return ok && term.IsTerminal(int(file.Fd()))
 }
 
 func pastTense(decision pgproxy.Decision) string {
@@ -354,6 +479,8 @@ func pastTense(decision pgproxy.Decision) string {
 func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  unring run [--commit | --discard] -- <command> [args...]")
+	fmt.Fprintln(output, "  unring <command-on-PATH> [--] [args...]")
+	fmt.Fprintln(output, "  unring claude|codex|opencode [--] [args...]")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "The child inherits PostgreSQL connection settings that point only it at")
 	fmt.Fprintln(output, "unring's loopback proxy. Without a terminal, the safe default is discard.")

@@ -34,6 +34,7 @@ type clientState struct {
 	cycleSavepoint string
 	pendingEscape  *clientStatement
 	rollbackCycle  bool
+	lastError      string
 
 	transactionSavepoint string
 	transactionFailed    bool

@@ -59,6 +59,7 @@ func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
 		text := "cannot insert multiple commands into a prepared statement"
 		if err != nil {
 			text = err.Error()
+			p.recordUnintercepted(message.Query, text)
 		}
 		p.extendedLocalError(client, "42601", text)
 		return
@@ -225,6 +226,7 @@ func (p *Proxy) extendedDescribe(client *clientState, message *pgproto3.Describe
 }
 
 func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) {
+	client.lastError = ""
 	portal := client.portals[message.Portal]
 	if portal == nil {
 		p.extendedLocalError(client, "34000", fmt.Sprintf("portal %q does not exist", message.Portal))
@@ -260,7 +262,11 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 				return
 			}
 		}
-		p.recordQuery(QueryRecord{SQL: portal.statement.query, CommandTags: tags, Failed: failed})
+		record := QueryRecord{SQL: portal.statement.query, CommandTags: tags, Failed: failed}
+		if failed {
+			record.Error = client.lastError
+		}
+		p.recordQuery(record)
 		if failed {
 			client.extendedFailed = true
 		}
@@ -290,6 +296,9 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 			return
 		}
 		_, record.Failed = response.(*pgproto3.ErrorResponse)
+		if responseError, failed := response.(*pgproto3.ErrorResponse); failed {
+			record.Error = postgresErrorText(responseError)
+		}
 		p.recordQuery(record)
 	}
 }
@@ -434,6 +443,7 @@ func (p *Proxy) exchangeExtendedLocked(
 			}
 			continue
 		case *pgproto3.CopyBothResponse:
+			p.recordUnintercepted("", "PostgreSQL copy-both traffic is unsupported")
 			p.sendStatementError(client, "0A000",
 				"unring does not support PostgreSQL copy-both mode", true)
 			_ = client.backend.Flush()

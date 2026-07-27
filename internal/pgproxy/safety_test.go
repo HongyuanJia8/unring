@@ -82,8 +82,9 @@ func TestRelayQueryDetectsLostTransaction(t *testing.T) {
 	}
 
 	summary := proxy.Summary()
-	if len(summary.Queries) != 1 || !summary.Queries[0].Failed {
-		t.Fatalf("lost transaction summary = %#v, want one failed query", summary)
+	if len(summary.Queries) != 0 || len(summary.Unintercepted) == 0 ||
+		summary.Unintercepted[0].Statement != "SELECT 1" {
+		t.Fatalf("lost transaction summary = %#v, want query only in un-intercepted section", summary)
 	}
 
 	clientMessages := pgproto3.NewFrontend(&clientOutput, io.Discard)

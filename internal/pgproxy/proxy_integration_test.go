@@ -162,6 +162,185 @@ func TestSharedTransactionIntegration(t *testing.T) {
 	}
 }
 
+func TestSealedChangeSummaryIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	direct := connectTest(t, ctx, config)
+	defer direct.Close(ctx)
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	firstTable := "unring_summary_first_" + suffix
+	secondTable := "unring_summary_second_" + suffix
+	createdTable := "unring_summary_created_" + suffix
+	createdIndex := createdTable + "_idx"
+	execTest(t, ctx, direct, fmt.Sprintf(
+		"CREATE TABLE %s (id integer PRIMARY KEY, value text); "+
+			"CREATE TABLE %s (id integer PRIMARY KEY, value text); "+
+			"INSERT INTO %s VALUES (1, 'one'), (2, 'two'); "+
+			"INSERT INTO %s VALUES (1, 'one')",
+		firstTable, secondTable, firstTable, secondTable,
+	))
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		cleanup := connectTest(t, cleanupContext, config)
+		defer cleanup.Close(cleanupContext)
+		execTest(t, cleanupContext, cleanup, fmt.Sprintf(
+			"DROP TABLE IF EXISTS %s; DROP TABLE IF EXISTS %s; DROP TABLE IF EXISTS %s",
+			createdTable, firstTable, secondTable))
+	})
+
+	proxy, err := Start(ctx, config)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	defer proxy.Close()
+	client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+	execTest(t, ctx, client, fmt.Sprintf(
+		"INSERT INTO %s VALUES (3, 'three'), (4, 'four'); "+
+			"UPDATE %s SET value = 'changed' WHERE id IN (1, 2); "+
+			"DELETE FROM %s WHERE id = 1; "+
+			"INSERT INTO %s VALUES (2, 'two'), (3, 'three'), (4, 'four'); "+
+			"UPDATE %s SET value = 'changed' WHERE id = 2; "+
+			"DELETE FROM %s WHERE id IN (1, 3)",
+		firstTable, firstTable, firstTable, secondTable, secondTable, secondTable,
+	))
+	execTest(t, ctx, client, fmt.Sprintf(
+		"CREATE TABLE %s (id integer); CREATE INDEX %s ON %s (id)",
+		createdTable, createdIndex, createdTable))
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	if err := proxy.Seal(ctx); err != nil {
+		t.Fatalf("Seal(): %v", err)
+	}
+
+	summary := proxy.Summary()
+	if !summary.Sealed || !summary.Changes.Complete || summary.Changes.Error != "" {
+		t.Fatalf("sealed change summary is incomplete: %#v", summary.Changes)
+	}
+	wantRows := map[string]RowChange{
+		"public." + firstTable:  {Table: "public." + firstTable, Inserted: 2, Updated: 2, Deleted: 1},
+		"public." + secondTable: {Table: "public." + secondTable, Inserted: 3, Updated: 1, Deleted: 2},
+	}
+	if len(summary.Changes.Rows) != len(wantRows) {
+		t.Fatalf("row changes = %#v, want %#v", summary.Changes.Rows, wantRows)
+	}
+	for _, change := range summary.Changes.Rows {
+		if want, ok := wantRows[change.Table]; !ok || change != want {
+			t.Fatalf("row change = %#v, want one of %#v", change, wantRows)
+		}
+	}
+	wantSchema := map[string]bool{
+		"created table public." + createdTable: true,
+		"created index public." + createdIndex: true,
+	}
+	for _, change := range summary.Changes.Schema {
+		delete(wantSchema, change.Action+" "+change.Kind+" "+change.Object)
+	}
+	if len(wantSchema) != 0 {
+		t.Fatalf("schema changes %#v omitted %#v", summary.Changes.Schema, wantSchema)
+	}
+}
+
+func TestZeroRowUpdateIsReadOnlyIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	direct := connectTest(t, ctx, config)
+	defer direct.Close(ctx)
+	table := "unring_zero_update_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	execTest(t, ctx, direct, fmt.Sprintf("CREATE TABLE %s (id integer PRIMARY KEY)", table))
+	t.Cleanup(func() {
+		execTest(t, context.Background(), direct, fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+	})
+
+	proxy, err := Start(ctx, config)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	defer proxy.Close()
+	client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+	execTest(t, ctx, client, fmt.Sprintf("UPDATE %s SET id = id WHERE id = -1", table))
+	execTest(t, ctx, client, "SET search_path = pg_catalog")
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	if err := proxy.Seal(ctx); err != nil {
+		t.Fatalf("Seal(): %v", err)
+	}
+	summary := proxy.Summary()
+	if len(summary.Changes.Rows) != 0 || len(summary.Changes.Schema) != 0 {
+		t.Fatalf("zero-row update reported changes: %#v", summary.Changes)
+	}
+	if summary.HasReviewableActivity() {
+		t.Fatalf("zero-row update requires review: %#v", summary)
+	}
+}
+
+func TestRowSummaryIncludesTriggerWritesAndExcludesRolledBackSavepointIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	direct := connectTest(t, ctx, config)
+	defer direct.Close(ctx)
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	source := "unring_trigger_source_" + suffix
+	audit := "unring_trigger_audit_" + suffix
+	function := "unring_trigger_fn_" + suffix
+	execTest(t, ctx, direct, fmt.Sprintf(`
+CREATE TABLE %s (id integer PRIMARY KEY);
+CREATE TABLE %s (source_id integer);
+CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO %s VALUES (NEW.id);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER write_audit AFTER INSERT ON %s
+FOR EACH ROW EXECUTE FUNCTION %s()`, source, audit, function, audit, source, function))
+	t.Cleanup(func() {
+		execTest(t, context.Background(), direct, fmt.Sprintf(
+			"DROP TABLE IF EXISTS %s; DROP TABLE IF EXISTS %s; DROP FUNCTION IF EXISTS %s()",
+			source, audit, function))
+	})
+
+	proxy, err := Start(ctx, config)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	defer proxy.Close()
+	client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+	execTest(t, ctx, client, fmt.Sprintf("INSERT INTO %s VALUES (1)", source))
+	execTest(t, ctx, client, "BEGIN")
+	execTest(t, ctx, client, fmt.Sprintf("INSERT INTO %s VALUES (2)", source))
+	execTest(t, ctx, client, "ROLLBACK")
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	if err := proxy.Seal(ctx); err != nil {
+		t.Fatalf("Seal(): %v", err)
+	}
+
+	want := map[string]RowChange{
+		"public." + source: {Table: "public." + source, Inserted: 1},
+		"public." + audit:  {Table: "public." + audit, Inserted: 1},
+	}
+	summary := proxy.Summary()
+	if len(summary.Changes.Rows) != len(want) {
+		t.Fatalf("trigger/savepoint row changes = %#v, want %#v", summary.Changes.Rows, want)
+	}
+	for _, change := range summary.Changes.Rows {
+		if expected, ok := want[change.Table]; !ok || change != expected {
+			t.Fatalf("trigger/savepoint row change = %#v, want one of %#v", change, want)
+		}
+	}
+}
+
 func assertConcurrentClients(t *testing.T, ctx context.Context, config *pgconn.Config) {
 	t.Helper()
 	const clients = 2

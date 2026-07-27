@@ -35,7 +35,7 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 			client.transactionFailed = true
 		}
 		p.finishSimpleQuery(client)
-		p.recordQuery(QueryRecord{SQL: sql, Failed: true})
+		p.recordUnintercepted(sql, err.Error())
 		return
 	}
 	if len(statements) == 0 {
@@ -52,12 +52,17 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 
 	record := QueryRecord{SQL: sql}
 	for _, statement := range statements {
+		client.lastError = ""
 		tags, failed := p.executeStatementLocked(client, statement)
 		record.CommandTags = append(record.CommandTags, tags...)
 		if failed {
 			record.Failed = true
+			record.Error = client.lastError
 			break
 		}
+	}
+	if p.Err() != nil {
+		return
 	}
 	if batchSavepoint != "" {
 		command := "RELEASE SAVEPOINT " + batchSavepoint
@@ -386,7 +391,7 @@ func (p *Proxy) executeRegularLocked(
 		switch message := message.(type) {
 		case *pgproto3.ReadyForQuery:
 			if message.TxStatus == 'I' {
-				p.loseTransaction(client, "client query")
+				p.loseTransaction(client, statement.SQL, "client query")
 				return tags, true
 			}
 			if message.TxStatus != 'T' && message.TxStatus != 'E' {
@@ -397,6 +402,7 @@ func (p *Proxy) executeRegularLocked(
 			goto complete
 		case *pgproto3.ErrorResponse:
 			backendFailed = true
+			client.lastError = postgresErrorText(message)
 			if message.Code == "25001" {
 				transactionBlockError = message
 				continue
@@ -415,6 +421,7 @@ func (p *Proxy) executeRegularLocked(
 			}
 			continue
 		case *pgproto3.CopyBothResponse:
+			p.recordUnintercepted(statement.SQL, "PostgreSQL copy-both traffic is unsupported")
 			p.sendStatementError(client, "0A000",
 				"unring does not support PostgreSQL copy-both mode", true)
 			p.markFatal(errors.New("real postgres entered unsupported copy-both mode"))
@@ -483,6 +490,7 @@ func (p *Proxy) executeIrreversibleLocked(
 		}
 		return nil, true
 	}
+	actionIndex := p.beginIrreversibleAction(statement.SQL)
 
 	p.acquireClient(client)
 	sessionState, stateErr := p.escapeSessionStateLocked()
@@ -491,6 +499,7 @@ func (p *Proxy) executeIrreversibleLocked(
 	}
 	p.releaseClient(client)
 	if stateErr != nil {
+		p.finishIrreversibleAction(actionIndex, nil, stateErr)
 		p.sendStatementError(client, "58000",
 			fmt.Sprintf("unring could not capture session state for the irreversible statement: %v",
 				stateErr), true)
@@ -500,6 +509,8 @@ func (p *Proxy) executeIrreversibleLocked(
 		return nil, true
 	}
 	if sessionState.hasUncommittedChanges {
+		err := errors.New("shared transaction contains uncommitted database changes")
+		p.finishIrreversibleAction(actionIndex, nil, err)
 		p.sendStatementError(client, "25001",
 			"unring cannot safely run this irreversible statement while the shared transaction "+
 				"contains uncommitted database changes", true)
@@ -511,6 +522,7 @@ func (p *Proxy) executeIrreversibleLocked(
 
 	connection, err := pgconn.ConnectConfig(client.ctx, p.config.Copy())
 	if err != nil {
+		p.finishIrreversibleAction(actionIndex, nil, err)
 		p.sendStatementError(client, "08001",
 			fmt.Sprintf("unring could not open the non-transactional connection: %v", err), true)
 		if client.transactionSavepoint != "" {
@@ -524,6 +536,7 @@ func (p *Proxy) executeIrreversibleLocked(
 		_ = connection.Close(closeContext)
 	}()
 	if err := applyEscapeSessionState(client.ctx, connection, sessionState); err != nil {
+		p.finishIrreversibleAction(actionIndex, nil, err)
 		p.sendStatementError(client, "08001",
 			fmt.Sprintf("unring could not mirror session state on the non-transactional connection: %v",
 				err), true)
@@ -532,11 +545,9 @@ func (p *Proxy) executeIrreversibleLocked(
 		}
 		return nil, true
 	}
-	p.summaryMu.Lock()
-	p.irreversibleActions = append(p.irreversibleActions, IrreversibleAction{SQL: statement.SQL})
-	p.summaryMu.Unlock()
 	results, execErr := connection.Exec(client.ctx, statement.SQL).ReadAll()
 	if execErr != nil {
+		p.finishIrreversibleAction(actionIndex, nil, execErr)
 		p.sendPgError(client, execErr)
 		if client.transactionSavepoint != "" {
 			client.transactionFailed = true
@@ -552,7 +563,29 @@ func (p *Proxy) executeIrreversibleLocked(
 			tags = append(tags, tag)
 		}
 	}
+	p.finishIrreversibleAction(actionIndex, tags, nil)
 	return tags, false
+}
+
+func (p *Proxy) beginIrreversibleAction(sql string) int {
+	p.summaryMu.Lock()
+	defer p.summaryMu.Unlock()
+	p.irreversibleActions = append(p.irreversibleActions, IrreversibleAction{SQL: sql})
+	return len(p.irreversibleActions) - 1
+}
+
+func (p *Proxy) finishIrreversibleAction(index int, tags []string, err error) {
+	p.summaryMu.Lock()
+	defer p.summaryMu.Unlock()
+	if index < 0 || index >= len(p.irreversibleActions) {
+		return
+	}
+	action := &p.irreversibleActions[index]
+	action.CommandTags = append([]string(nil), tags...)
+	if err != nil {
+		action.Failed = true
+		action.Error = err.Error()
+	}
 }
 
 func (p *Proxy) requestApproval(
@@ -680,8 +713,10 @@ func (p *Proxy) sendExternalResult(client *clientState, result *pgconn.Result) {
 }
 
 func (p *Proxy) sendPgError(client *clientState, err error) {
+	client.lastError = err.Error()
 	var postgresError *pgconn.PgError
 	if errors.As(err, &postgresError) {
+		client.lastError = fmt.Sprintf("%s (SQLSTATE %s)", postgresError.Message, postgresError.Code)
 		client.backend.Send(&pgproto3.ErrorResponse{
 			Severity: postgresError.Severity, Code: postgresError.Code,
 			Message: postgresError.Message, Detail: postgresError.Detail,
@@ -700,12 +735,13 @@ func (p *Proxy) sendStatementError(
 	if includePrefix && !strings.HasPrefix(message, "unring") {
 		message = "unring: " + message
 	}
+	client.lastError = fmt.Sprintf("%s (SQLSTATE %s)", message, code)
 	client.backend.Send(&pgproto3.ErrorResponse{
 		Severity: "ERROR", Code: code, Message: message,
 	})
 }
 
-func (p *Proxy) loseTransaction(client *clientState, operation string) {
+func (p *Proxy) loseTransaction(client *clientState, statement, operation string) {
 	client.backend.Send(&pgproto3.ErrorResponse{
 		Severity: "FATAL", Code: "XX000", Message: ErrTransactionLost.Error(),
 		Detail: "The real PostgreSQL backend reported idle state after a " + operation +
@@ -713,6 +749,18 @@ func (p *Proxy) loseTransaction(client *clientState, operation string) {
 	})
 	_ = client.backend.Flush()
 	p.markFatal(ErrTransactionLost)
+	p.summaryMu.Lock()
+	if count := len(p.unintercepted); count > 0 && p.unintercepted[count-1].Statement == "" {
+		p.unintercepted[count-1].Statement = statement
+	}
+	p.summaryMu.Unlock()
+}
+
+func postgresErrorText(message *pgproto3.ErrorResponse) string {
+	if message == nil {
+		return "PostgreSQL statement failed"
+	}
+	return fmt.Sprintf("%s (SQLSTATE %s)", message.Message, message.Code)
 }
 
 func (p *Proxy) updateParameter(message *pgproto3.ParameterStatus) {

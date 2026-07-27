@@ -38,12 +38,52 @@ type QueryRecord struct {
 	SQL         string
 	CommandTags []string
 	Failed      bool
+	Error       string
 }
 
-// IrreversibleAction records a statement that was approved and executed on a
-// separate autocommit connection. It cannot be affected by the final decision.
+// IrreversibleAction records a statement approved for execution on a separate
+// autocommit connection. Failed records retain the execution error; approval
+// alone is enough to require explicit review.
 type IrreversibleAction struct {
-	SQL string
+	SQL         string
+	CommandTags []string
+	Failed      bool
+	Error       string
+}
+
+// RowChange reports physical tuple operations performed by the shared
+// transaction. PostgreSQL supplies these counters for the current transaction,
+// including writes performed by triggers.
+type RowChange struct {
+	Table    string
+	Inserted int64
+	Updated  int64
+	Deleted  int64
+}
+
+// SchemaChange is one catalog change staged in the shared transaction.
+type SchemaChange struct {
+	Action string
+	Kind   string
+	Object string
+}
+
+// ChangeSummary is frozen by Seal after all client traffic has stopped.
+// Complete is false when PostgreSQL could not provide an authoritative view;
+// callers must surface Error rather than treating an empty summary as no work.
+type ChangeSummary struct {
+	Rows     []RowChange
+	Schema   []SchemaChange
+	Complete bool
+	Error    string
+}
+
+// UninterceptedItem describes traffic unring could not classify or intercept.
+// It is deliberately separate from QueryRecord so review UIs cannot blend it
+// into the ordinary statement list.
+type UninterceptedItem struct {
+	Statement string
+	Detail    string
 }
 
 // ApprovalRequest describes an action that cannot be included in unring's
@@ -68,6 +108,24 @@ type Summary struct {
 	Queries             []QueryRecord
 	FullyReversible     bool
 	IrreversibleActions []IrreversibleAction
+	Changes             ChangeSummary
+	Unintercepted       []UninterceptedItem
+	Sealed              bool
+}
+
+// HasReviewableActivity reports whether the sealed session needs a decision.
+// An incomplete or unclassified session is never silently treated as read-only.
+func (summary Summary) HasReviewableActivity() bool {
+	if !summary.Sealed || !summary.Changes.Complete ||
+		len(summary.IrreversibleActions) > 0 || len(summary.Unintercepted) > 0 {
+		return true
+	}
+	for _, change := range summary.Changes.Rows {
+		if change.Inserted != 0 || change.Updated != 0 || change.Deleted != 0 {
+			return true
+		}
+	}
+	return len(summary.Changes.Schema) > 0
 }
 
 // Proxy owns one real PostgreSQL backend connection and transaction.
@@ -100,6 +158,10 @@ type Proxy struct {
 	connections         int
 	queries             []QueryRecord
 	irreversibleActions []IrreversibleAction
+	unintercepted       []UninterceptedItem
+	changes             ChangeSummary
+	sealedSummary       bool
+	catalogInitial      catalogSnapshot
 
 	finishMu sync.Mutex
 	finished bool
@@ -157,9 +219,19 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		cancel:          cancel,
 	}
 
-	if _, err := p.internalQueryLocked("BEGIN"); err != nil {
+	// A stable snapshot makes the before/after catalog comparison attributable
+	// to this session: concurrent DDL committed by another connection cannot be
+	// mistaken for an unring-staged schema change. PostgreSQL still exposes this
+	// transaction's own catalog changes within the snapshot.
+	if _, err := p.internalQueryLocked("BEGIN ISOLATION LEVEL REPEATABLE READ"); err != nil {
 		_ = p.upstream.Close()
 		return nil, fmt.Errorf("begin shared postgres transaction: %w", err)
+	}
+	p.catalogInitial, err = p.captureCatalogLocked()
+	if err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, fmt.Errorf("capture initial postgres catalog: %w", err)
 	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -205,14 +277,27 @@ func (p *Proxy) Summary() Summary {
 			SQL:         record.SQL,
 			CommandTags: append([]string(nil), record.CommandTags...),
 			Failed:      record.Failed,
+			Error:       record.Error,
 		}
 	}
-	actions := append([]IrreversibleAction(nil), p.irreversibleActions...)
+	actions := make([]IrreversibleAction, len(p.irreversibleActions))
+	for i, action := range p.irreversibleActions {
+		actions[i] = action
+		actions[i].CommandTags = append([]string(nil), action.CommandTags...)
+	}
+	rows := append([]RowChange(nil), p.changes.Rows...)
+	schema := append([]SchemaChange(nil), p.changes.Schema...)
+	unintercepted := append([]UninterceptedItem(nil), p.unintercepted...)
 	return Summary{
 		Connections:         p.connections,
 		Queries:             queries,
 		FullyReversible:     len(actions) == 0,
 		IrreversibleActions: actions,
+		Changes: ChangeSummary{
+			Rows: rows, Schema: schema, Complete: p.changes.Complete, Error: p.changes.Error,
+		},
+		Unintercepted: unintercepted,
+		Sealed:        p.sealedSummary,
 	}
 }
 
@@ -231,6 +316,9 @@ func (p *Proxy) Seal(ctx context.Context) error {
 		// stopClients waits for handlers, but taking the lock also documents and
 		// enforces the invariant that no backend exchange remains in flight.
 		p.queryMu.Lock()
+		if p.Err() == nil {
+			p.freezeChangeSummaryLocked()
+		}
 		p.queryMu.Unlock()
 
 		if fatalErr := p.Err(); fatalErr != nil {
@@ -351,6 +439,7 @@ func (p *Proxy) handleClient(conn net.Conn) {
 
 	backend := pgproto3.NewBackend(conn, conn)
 	if err := p.handshake(conn, backend); err != nil {
+		p.recordUnintercepted("", "PostgreSQL startup traffic was not intercepted: "+err.Error())
 		p.sendFatal(backend, fmt.Sprintf("unring postgres handshake failed: %v", err))
 		return
 	}
@@ -395,6 +484,9 @@ func (p *Proxy) handleClient(conn net.Conn) {
 		case *pgproto3.Terminate:
 			return
 		default:
+			p.recordUnintercepted("", fmt.Sprintf(
+				"unsupported PostgreSQL frontend message %T", message,
+			))
 			p.sendFatal(backend, fmt.Sprintf(
 				"unring does not support PostgreSQL frontend message %T",
 				message,
@@ -493,6 +585,7 @@ func (p *Proxy) context() context.Context {
 
 func (p *Proxy) markFatal(err error) {
 	p.fatalOnce.Do(func() {
+		p.recordUnintercepted("", "PostgreSQL interception failed: "+err.Error())
 		p.fatalMu.Lock()
 		p.fatalErr = err
 		p.fatalMu.Unlock()
