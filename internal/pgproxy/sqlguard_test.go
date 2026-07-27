@@ -140,6 +140,8 @@ func TestAnalyzeClientSQLClassifiesIrreversibleStatements(t *testing.T) {
 		"CLUSTER",
 		"REINDEX DATABASE example",
 		"ALTER DATABASE example SET TABLESPACE example_space",
+		"COPY (SELECT 1) TO '/tmp/unring-copy-test'",
+		"COPY (SELECT 1) TO PROGRAM 'true'",
 	} {
 		statements, err := analyzeClientSQL(sql)
 		if err != nil {
@@ -147,6 +149,36 @@ func TestAnalyzeClientSQLClassifiesIrreversibleStatements(t *testing.T) {
 		}
 		if len(statements) != 1 || statements[0].Irreversible == "" {
 			t.Fatalf("analyzeClientSQL(%q) = %#v, want irreversible", sql, statements)
+		}
+	}
+}
+
+func TestAnalyzeClientSQLLeavesClientCopyStreamsTransactional(t *testing.T) {
+	t.Parallel()
+	for _, sql := range []string{"COPY example FROM STDIN", "COPY example TO STDOUT"} {
+		statements, err := analyzeClientSQL(sql)
+		if err != nil {
+			t.Fatalf("analyzeClientSQL(%q): %v", sql, err)
+		}
+		if len(statements) != 1 || statements[0].Irreversible != "" {
+			t.Fatalf("client-stream COPY classification = %#v, want transactional", statements)
+		}
+	}
+}
+
+func TestAnalyzeClientSQLMarksUncountableEffects(t *testing.T) {
+	t.Parallel()
+	for _, sql := range []string{
+		"TRUNCATE orders",
+		"REFRESH MATERIALIZED VIEW totals",
+		"SELECT lo_from_bytea(0, 'abc'::bytea)",
+	} {
+		statements, err := analyzeClientSQL(sql)
+		if err != nil {
+			t.Fatalf("analyzeClientSQL(%q): %v", sql, err)
+		}
+		if len(statements) != 1 || statements[0].SummaryRisk == "" {
+			t.Fatalf("analyzeClientSQL(%q) = %#v, want an explicit summary risk", sql, statements)
 		}
 	}
 }
@@ -194,6 +226,21 @@ func TestAnalyzeClientSQLFindsLockWaitingMaintenanceTargets(t *testing.T) {
 			len(statements[0].LockTargets) != 1 || statements[0].LockTargets[0] != test.target {
 			t.Errorf("lock classification for %q = %#v, want %s on %#v",
 				test.sql, statements, test.operation, test.target)
+		}
+	}
+}
+
+func TestAnalyzeClientSQLPreflightsClusterWideMaintenance(t *testing.T) {
+	t.Parallel()
+	for _, sql := range []string{
+		"VACUUM (FULL)", "CLUSTER", "REINDEX DATABASE example", "REINDEX SCHEMA public",
+	} {
+		statements, err := analyzeClientSQL(sql)
+		if err != nil {
+			t.Fatalf("analyzeClientSQL(%q): %v", sql, err)
+		}
+		if len(statements) != 1 || statements[0].LockOperation == "" {
+			t.Fatalf("broad maintenance %q has no preflight scope: %#v", sql, statements)
 		}
 	}
 }

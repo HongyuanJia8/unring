@@ -21,17 +21,20 @@ const (
 )
 
 type clientStatement struct {
-	SQL           string
-	Kind          statementKind
-	Savepoint     string
-	Chain         bool
-	Options       bool
-	Irreversible  string
-	Refusal       string
-	ReadOnly      bool
-	RollbackAfter bool
-	LockTargets   []relationReference
-	LockOperation string
+	SQL              string
+	Kind             statementKind
+	Savepoint        string
+	Chain            bool
+	Options          bool
+	Irreversible     string
+	Refusal          string
+	ReadOnly         bool
+	RollbackAfter    bool
+	LockTargets      []relationReference
+	LockOperation    string
+	SummaryRisk      string
+	SummaryTarget    *relationReference
+	RiskRequiresRows bool
 }
 
 type relationReference struct {
@@ -100,6 +103,7 @@ func analyzeClientSQL(sql string) ([]clientStatement, error) {
 
 		statement.Irreversible = irreversibleReason(node)
 		statement.LockTargets, statement.LockOperation = maintenanceLockTargets(node)
+		statement.SummaryRisk, statement.SummaryTarget = summaryRisk(node, statement.SQL)
 		statement.ReadOnly = readOnlySelect(node.GetSelectStmt())
 		if node.GetDiscardStmt() != nil &&
 			node.GetDiscardStmt().GetTarget() == pg_query.DiscardMode_DISCARD_ALL {
@@ -124,11 +128,10 @@ func maintenanceLockTargets(node *pg_query.Node) ([]relationReference, string) {
 		}
 		return targets, "VACUUM FULL"
 	}
-	if cluster := node.GetClusterStmt(); cluster != nil && cluster.GetRelation() != nil {
+	if cluster := node.GetClusterStmt(); cluster != nil {
 		return rangeVarReferences(cluster.GetRelation()), "CLUSTER"
 	}
-	if reindex := node.GetReindexStmt(); reindex != nil && reindex.GetRelation() != nil &&
-		reindexOutsideTransaction(reindex) {
+	if reindex := node.GetReindexStmt(); reindex != nil && reindexOutsideTransaction(reindex) {
 		return rangeVarReferences(reindex.GetRelation()), "REINDEX"
 	}
 	if drop := node.GetDropStmt(); drop != nil && drop.GetConcurrent() &&
@@ -142,6 +145,48 @@ func maintenanceLockTargets(node *pg_query.Node) ([]relationReference, string) {
 		return targets, "DROP INDEX CONCURRENTLY"
 	}
 	return nil, ""
+}
+
+func summaryRisk(node *pg_query.Node, sql string) (string, *relationReference) {
+	switch {
+	case node.GetTruncateStmt() != nil:
+		return "TRUNCATE resets PostgreSQL's transaction row counters; exact affected-row counts are unavailable", nil
+	case node.GetRefreshMatViewStmt() != nil:
+		return "REFRESH MATERIALIZED VIEW rewrites through a transient relation; exact affected-row counts are unavailable", nil
+	case containsLargeObjectMutation(sql):
+		return "large-object data changed outside the relations covered by PostgreSQL's per-table transaction counters", nil
+	}
+	var relation *pg_query.RangeVar
+	switch {
+	case node.GetInsertStmt() != nil:
+		relation = node.GetInsertStmt().GetRelation()
+	case node.GetUpdateStmt() != nil:
+		relation = node.GetUpdateStmt().GetRelation()
+	case node.GetDeleteStmt() != nil:
+		relation = node.GetDeleteStmt().GetRelation()
+	case node.GetMergeStmt() != nil:
+		relation = node.GetMergeStmt().GetRelation()
+	}
+	refs := rangeVarReferences(relation)
+	if len(refs) == 1 {
+		return "", &refs[0]
+	}
+	return "", nil
+}
+
+func containsLargeObjectMutation(sql string) bool {
+	json, err := pg_query.ParseToJSON(sql)
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(json)
+	for _, function := range []string{"lo_create", "lo_from_bytea", "lo_import", "lo_put", "lo_unlink"} {
+		if strings.Contains(lower, `"sval":"`+function+`"`) ||
+			strings.Contains(lower, `"sval": "`+function+`"`) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasDefinition(options []*pg_query.Node, name string) bool {
@@ -215,6 +260,8 @@ func errorsInternalStatementBounds(sql string, start, end int) error {
 
 func irreversibleReason(node *pg_query.Node) string {
 	switch {
+	case serverSideCopyDestination(node.GetCopyStmt()):
+		return "server-side COPY writes a file or runs a program outside the shared transaction"
 	case node.GetCreatedbStmt() != nil:
 		return "CREATE DATABASE cannot run inside a transaction block"
 	case node.GetDropdbStmt() != nil:
@@ -242,6 +289,10 @@ func irreversibleReason(node *pg_query.Node) string {
 	default:
 		return ""
 	}
+}
+
+func serverSideCopyDestination(statement *pg_query.CopyStmt) bool {
+	return statement != nil && !statement.GetIsFrom() && statement.GetFilename() != ""
 }
 
 func clusterAll(statement *pg_query.ClusterStmt) bool {

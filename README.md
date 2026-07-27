@@ -99,15 +99,16 @@ ability to make any of it permanent without you saying so.
   transaction already has uncommitted database changes.
 - Lock-waiting maintenance commands cannot run against a table while the shared
   transaction holds locks on it. This includes concurrent index builds, `VACUUM FULL`,
-  `CLUSTER`, and `REINDEX`. Unring detects concrete target conflicts before execution;
-  commit or discard the session first, then run the maintenance command separately.
-  A short lock timeout remains as a backstop for conflicts that cannot be predicted.
+  `CLUSTER`, and `REINDEX`, including their database-wide or schema-wide forms. Unring
+  checks both concrete and broad targets before execution and reserves the shared
+  backend through the escape operation; commit or discard the session first, then run
+  the maintenance command separately. A short lock timeout remains as a backstop for
+  conflicts outside the session that cannot be predicted.
 - Client transaction control is mapped to private savepoints. One client-visible
   transaction may be open at a time; it does not pin the backend while idle.
-- The shared transaction uses `REPEATABLE READ` so concurrent DDL cannot be mistaken
-  for schema changes staged by the session. Consequently, a session does not see
-  commits made by other connections after its first snapshot, and PostgreSQL can
-  report serialization failures (`40001`) that would not occur at `READ COMMITTED`.
+- The shared transaction uses PostgreSQL's default `READ COMMITTED` isolation. Its
+  catalog baseline is captured explicitly; this also lets review see approved DDL
+  committed on the non-transactional connection.
 - While that transaction is open, other clients may run read-only queries. Unring
   rolls those query cycles back internally so they cannot become part of the open
   client's savepoint. A concurrent write or second `BEGIN` fails immediately with

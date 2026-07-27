@@ -37,7 +37,8 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
       `ALTER SYSTEM`, `CHECKPOINT`) — classify as *needs approval*, run on a separate
       non-transactional connection, mark the session as no longer fully reversible.
       Lock-waiting maintenance against relations locked by the shared transaction is
-      refused up front; commit or discard first, then run it outside unring
+      refused up front, including broad `VACUUM FULL`, `CLUSTER`, and `REINDEX`
+      operations; commit or discard first, then run it outside unring
 - [x] M1.7 Change summary — what the transaction actually did, for the review screen
 - [x] M1.8 Map client `BEGIN`/`COMMIT`/`ROLLBACK` and named savepoints onto private
       savepoints inside the shared transaction. This preserves the single-decision

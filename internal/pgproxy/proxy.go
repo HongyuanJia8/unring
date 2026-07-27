@@ -78,6 +78,12 @@ type ChangeSummary struct {
 	Error    string
 }
 
+// NonTransactionalEffect records backend-observed state that PostgreSQL does
+// not roll back with the shared transaction (currently sequence advancement).
+type NonTransactionalEffect struct {
+	Detail string
+}
+
 // UninterceptedItem describes traffic unring could not classify or intercept.
 // It is deliberately separate from QueryRecord so review UIs cannot blend it
 // into the ordinary statement list.
@@ -110,6 +116,7 @@ type Summary struct {
 	IrreversibleActions []IrreversibleAction
 	Changes             ChangeSummary
 	Unintercepted       []UninterceptedItem
+	NonTransactional    []NonTransactionalEffect
 	Sealed              bool
 }
 
@@ -117,7 +124,8 @@ type Summary struct {
 // An incomplete or unclassified session is never silently treated as read-only.
 func (summary Summary) HasReviewableActivity() bool {
 	if !summary.Sealed || !summary.Changes.Complete ||
-		len(summary.IrreversibleActions) > 0 || len(summary.Unintercepted) > 0 {
+		len(summary.IrreversibleActions) > 0 || len(summary.Unintercepted) > 0 ||
+		len(summary.NonTransactional) > 0 {
 		return true
 	}
 	for _, change := range summary.Changes.Rows {
@@ -165,6 +173,8 @@ type Proxy struct {
 	rowStats            rowStatsSnapshot
 	rowLedger           rowLedgerSnapshot
 	rowLedgerErr        error
+	uncertainEffects    []string
+	sequenceEffects     map[string]struct{}
 
 	finishMu sync.Mutex
 	finished bool
@@ -222,11 +232,11 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		cancel:          cancel,
 	}
 
-	// A stable snapshot makes the before/after catalog comparison attributable
-	// to this session: concurrent DDL committed by another connection cannot be
-	// mistaken for an unring-staged schema change. PostgreSQL still exposes this
-	// transaction's own catalog changes within the snapshot.
-	if _, err := p.internalQueryLocked("BEGIN ISOLATION LEVEL REPEATABLE READ"); err != nil {
+	// READ COMMITTED is deliberate. The baseline is captured explicitly below,
+	// while later catalog queries must see approved DDL committed by the escape
+	// connection. A transaction-wide snapshot would hide that DDL and pin xmin,
+	// preventing CREATE INDEX CONCURRENTLY from completing.
+	if _, err := p.internalQueryLocked("BEGIN"); err != nil {
 		_ = p.upstream.Close()
 		return nil, fmt.Errorf("begin shared postgres transaction: %w", err)
 	}
@@ -243,6 +253,7 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		return nil, fmt.Errorf("capture initial postgres row counters: %w", err)
 	}
 	p.rowLedger = make(rowLedgerSnapshot)
+	p.sequenceEffects = make(map[string]struct{})
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -298,16 +309,27 @@ func (p *Proxy) Summary() Summary {
 	rows := append([]RowChange(nil), p.changes.Rows...)
 	schema := append([]SchemaChange(nil), p.changes.Schema...)
 	unintercepted := append([]UninterceptedItem(nil), p.unintercepted...)
+	nonTransactional := make([]NonTransactionalEffect, 0, len(p.sequenceEffects))
+	for name := range p.sequenceEffects {
+		nonTransactional = append(nonTransactional, NonTransactionalEffect{
+			Detail: "PostgreSQL sequence " + name + " advanced; sequence values do not roll back.",
+		})
+	}
+	sort.Slice(nonTransactional, func(i, j int) bool {
+		return nonTransactional[i].Detail < nonTransactional[j].Detail
+	})
 	return Summary{
-		Connections:         p.connections,
-		Queries:             queries,
-		FullyReversible:     len(actions) == 0,
+		Connections: p.connections,
+		Queries:     queries,
+		FullyReversible: len(actions) == 0 && len(nonTransactional) == 0 &&
+			p.changes.Complete && len(unintercepted) == 0,
 		IrreversibleActions: actions,
 		Changes: ChangeSummary{
 			Rows: rows, Schema: schema, Complete: p.changes.Complete, Error: p.changes.Error,
 		},
-		Unintercepted: unintercepted,
-		Sealed:        p.sealedSummary,
+		Unintercepted:    unintercepted,
+		NonTransactional: nonTransactional,
+		Sealed:           p.sealedSummary,
 	}
 }
 
@@ -378,8 +400,15 @@ func (p *Proxy) Finalize(ctx context.Context, decision Decision) error {
 	}
 
 	command := "ROLLBACK"
+	var forcedRollback error
 	if decision == DecisionCommit {
-		command = "COMMIT"
+		if p.Summary().Changes.Complete {
+			command = "COMMIT"
+		} else {
+			forcedRollback = errors.New(
+				"unring refused to commit an incomplete change summary and rolled the session back",
+			)
+		}
 	}
 	if _, err := p.internalQueryLocked(command); err != nil {
 		_ = p.upstream.Close()
@@ -387,6 +416,9 @@ func (p *Proxy) Finalize(ctx context.Context, decision Decision) error {
 	}
 	if err := p.upstream.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("close postgres backend: %w", err)
+	}
+	if forcedRollback != nil {
+		return forcedRollback
 	}
 	return nil
 }

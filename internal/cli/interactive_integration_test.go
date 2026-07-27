@@ -495,7 +495,7 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 			status := byte('T')
 			tag := query.String
 			switch {
-			case query.String == "BEGIN ISOLATION LEVEL REPEATABLE READ":
+			case query.String == "BEGIN":
 				tag = "BEGIN"
 			case query.String == "ROLLBACK":
 				status = 'I'
@@ -509,6 +509,11 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 					{Name: []byte("oid")}, {Name: []byte("name")},
 					{Name: []byte("inserted")}, {Name: []byte("updated")},
 					{Name: []byte("deleted")},
+				}})
+				tag = "SELECT 0"
+			case strings.Contains(query.String, "FROM pg_locks l"):
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+					{Name: []byte("sequence")},
 				}})
 				tag = "SELECT 0"
 			case strings.Contains(query.String, "SELECT c.oid::text"):

@@ -1,6 +1,27 @@
 package pgproxy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	pg_query "github.com/pganalyze/pg_query_go/v6"
+)
+
+func TestCatalogSnapshotCoversReviewableDDLClasses(t *testing.T) {
+	t.Parallel()
+	if _, err := pg_query.Parse(catalogSnapshotSQL); err != nil {
+		t.Fatalf("catalog snapshot SQL does not parse: %v", err)
+	}
+	for _, catalog := range []string{
+		"pg_rewrite", "pg_statistic_ext", "pg_event_trigger", "pg_publication",
+		"pg_subscription", "pg_description", "pg_cast", "pg_operator", "pg_collation",
+		"pg_shdescription",
+	} {
+		if !strings.Contains(catalogSnapshotSQL, catalog) {
+			t.Errorf("catalog snapshot omits %s", catalog)
+		}
+	}
+}
 
 func TestRowLedgerAttributesTriggersAndRestoresSavepoints(t *testing.T) {
 	const (

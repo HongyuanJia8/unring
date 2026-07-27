@@ -43,6 +43,7 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 	}
 	batchSavepoint := ""
 	var batchRows rowLedgerSnapshot
+	batchUncertain := 0
 	if client.transactionSavepoint == "" && len(statements) > 1 && allRegularStatements(statements) {
 		batchSavepoint = client.nextObjectName(p.savepointPrefix, "b")
 		if _, err := p.internalQueryLocked("SAVEPOINT " + batchSavepoint); err != nil {
@@ -50,6 +51,7 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 			return
 		}
 		batchRows = cloneRowLedger(p.rowLedger)
+		batchUncertain = len(p.uncertainEffects)
 	}
 
 	record := QueryRecord{SQL: sql}
@@ -78,6 +80,7 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 		}
 		if record.Failed {
 			p.restoreRowLedgerLocked(batchRows)
+			p.restoreUncertainEffectsLocked(batchUncertain)
 			p.reconcileRowChangesLocked(false)
 		}
 	}
@@ -152,6 +155,12 @@ func (p *Proxy) executeStatementLocked(
 	if statement.Kind != statementRegular {
 		return p.executeTransactionControlLocked(client, statement)
 	}
+	if p.escapeLeaseHeldByOther(client) {
+		p.sendStatementError(client, "55P03",
+			"another client is running an approved non-transactional statement; unring cannot safely interleave this statement",
+			true)
+		return nil, true
+	}
 	if p.sharedLeaseHeldByOther(client) {
 		if !statement.ReadOnly {
 			p.sendStatementError(client, "55P03",
@@ -161,6 +170,7 @@ func (p *Proxy) executeStatementLocked(
 		}
 		statement.RollbackAfter = true
 	}
+	p.prepareStatementRiskLocked(&statement)
 	if statement.Irreversible != "" {
 		return p.executeIrreversibleLocked(client, statement)
 	}
@@ -220,6 +230,7 @@ func (p *Proxy) executeTransactionControlLocked(
 		}
 		if client.transactionFailed {
 			p.restoreRowLedgerLocked(client.transactionRows)
+			p.restoreUncertainEffectsLocked(client.transactionUncertain)
 			p.reconcileRowChangesLocked(false)
 		}
 		p.clearClientTransaction(client)
@@ -244,6 +255,7 @@ func (p *Proxy) executeTransactionControlLocked(
 			return nil, true
 		}
 		p.restoreRowLedgerLocked(client.transactionRows)
+		p.restoreUncertainEffectsLocked(client.transactionUncertain)
 		p.reconcileRowChangesLocked(false)
 		p.clearClientTransaction(client)
 		if statement.Chain {
@@ -266,7 +278,8 @@ func (p *Proxy) executeTransactionControlLocked(
 		}
 		client.savepoints = append(client.savepoints, clientSavepoint{
 			clientName: statement.Savepoint, backendName: backendName,
-			rows: cloneRowLedger(p.rowLedger),
+			rows:      cloneRowLedger(p.rowLedger),
+			uncertain: len(p.uncertainEffects),
 		})
 		client.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SAVEPOINT")})
 		return []string{"SAVEPOINT"}, false
@@ -290,6 +303,7 @@ func (p *Proxy) executeTransactionControlLocked(
 			return nil, true
 		}
 		p.restoreRowLedgerLocked(client.savepoints[index].rows)
+		p.restoreUncertainEffectsLocked(client.savepoints[index].uncertain)
 		p.reconcileRowChangesLocked(false)
 		client.savepoints = client.savepoints[:index+1]
 		client.transactionFailed = false
@@ -328,6 +342,7 @@ func (p *Proxy) beginClientTransactionLocked(client *clientState) error {
 	}
 	client.transactionSavepoint = name
 	client.transactionRows = cloneRowLedger(p.rowLedger)
+	client.transactionUncertain = len(p.uncertainEffects)
 	p.activeTransaction = client.id
 	client.transactionFailed = false
 	client.savepoints = nil
@@ -341,6 +356,7 @@ func (p *Proxy) clearClientTransaction(client *clientState) {
 	client.transactionSavepoint = ""
 	client.transactionFailed = false
 	client.transactionRows = nil
+	client.transactionUncertain = 0
 	client.savepoints = nil
 }
 
@@ -376,7 +392,11 @@ func (p *Proxy) noTransactionNotice(client *clientState) {
 
 func (p *Proxy) sharedLeaseHeldByOther(client *clientState) bool {
 	return (p.activeTransaction != 0 && p.activeTransaction != client.id) ||
-		(p.escapeClient != 0 && p.escapeClient != client.id)
+		p.escapeLeaseHeldByOther(client)
+}
+
+func (p *Proxy) escapeLeaseHeldByOther(client *clientState) bool {
+	return p.escapeClient != 0 && p.escapeClient != client.id
 }
 
 func (p *Proxy) executeRegularLocked(
@@ -459,7 +479,12 @@ complete:
 		p.markFatal(fmt.Errorf("restore shared transaction after client query: %w", err))
 		return tags, true
 	}
-	p.reconcileRowChangesLocked(!backendFailed && !statement.RollbackAfter)
+	keep := !backendFailed && !statement.RollbackAfter
+	riskApplies := keep && summaryRiskApplies(statement, tags)
+	if riskApplies {
+		p.addUncertainEffectLocked(statement.SummaryRisk)
+	}
+	p.reconcileRowChangesLocked(keep && !riskApplies)
 	if transactionBlockError != nil {
 		statement.Irreversible = transactionBlockError.Message
 		return p.executeIrreversibleLocked(client, statement)
@@ -675,7 +700,7 @@ type escapeLockConflict struct {
 func (p *Proxy) escapeLockConflictLocked(
 	statement clientStatement,
 ) (*escapeLockConflict, error) {
-	if len(statement.LockTargets) == 0 {
+	if len(statement.LockTargets) == 0 && statement.LockOperation == "" {
 		return nil, nil
 	}
 	// These maintenance operations can wait for a transaction after their
@@ -683,12 +708,16 @@ func (p *Proxy) escapeLockConflictLocked(
 	// lockers and snapshots). For unring's long-lived transaction, any granted
 	// relation lock on the concrete target is therefore a self-conflict signal,
 	// not just modes that conflict in PostgreSQL's table-lock matrix.
-	values := make([]string, 0, len(statement.LockTargets))
-	for _, target := range statement.LockTargets {
-		values = append(values, "(to_regclass("+quoteSQLLiteral(target.regclassName())+")::oid)")
+	requested := `SELECT c.oid FROM pg_class c WHERE c.relkind IN ('r','p','f','m','i','I','t','S')`
+	if len(statement.LockTargets) > 0 {
+		values := make([]string, 0, len(statement.LockTargets))
+		for _, target := range statement.LockTargets {
+			values = append(values, "(to_regclass("+quoteSQLLiteral(target.regclassName())+")::oid)")
+		}
+		requested = "VALUES " + strings.Join(values, ",")
 	}
 	rows, err := p.internalRowsLocked(`WITH RECURSIVE
-requested(oid) AS (VALUES ` + strings.Join(values, ",") + `),
+requested(oid) AS (` + requested + `),
 seed(oid) AS (
   SELECT oid FROM requested WHERE oid IS NOT NULL
   UNION
@@ -707,7 +736,9 @@ SELECT format('%I.%I', n.nspname, c.relname), c.relkind::text,
   JOIN pg_locks l ON l.locktype = 'relation' AND l.relation = t.oid
  WHERE l.pid = pg_backend_pid() AND l.granted
  GROUP BY n.nspname, c.relname, c.relkind
- ORDER BY CASE WHEN c.relkind IN ('r', 'p', 'f', 'm') THEN 0 ELSE 1 END,
+ ORDER BY CASE WHEN n.nspname IN ('pg_catalog', 'information_schema') OR
+                         n.nspname ~ '^pg_toast' THEN 1 ELSE 0 END,
+          CASE WHEN c.relkind IN ('r', 'p', 'f', 'm') THEN 0 ELSE 1 END,
           n.nspname, c.relname
  LIMIT 1`)
 	if err != nil {

@@ -354,7 +354,7 @@ func printSummary(output io.Writer, summary pgproxy.Summary) {
 	if !summary.FullyReversible {
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		fmt.Fprintln(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE")
-		fmt.Fprintln(output, "Irreversible actions were approved outside the shared transaction; discard cannot guarantee undo.")
+		fmt.Fprintln(output, "Unring cannot guarantee every recorded effect can be undone by discarding.")
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 	}
 	writeChangeSummary(output, summary)
@@ -380,8 +380,13 @@ func printSummary(output io.Writer, summary pgproxy.Summary) {
 			fmt.Fprintf(output, "    Error: %s\n", query.Error)
 		}
 	}
-	fmt.Fprintln(output, "  Note: PostgreSQL sequences do not roll back; discarded sessions can leave ID gaps.")
-	if !summary.FullyReversible {
+	if len(summary.NonTransactional) > 0 {
+		fmt.Fprintln(output, "\nNON-TRANSACTIONAL EFFECTS — DISCARD CANNOT UNDO THESE")
+		for _, effect := range summary.NonTransactional {
+			fmt.Fprintf(output, "  - %s\n", effect.Detail)
+		}
+	}
+	if len(summary.IrreversibleActions) > 0 {
 		fmt.Fprintln(output, "\nAPPROVED IRREVERSIBLE ACTIONS — DISCARD CANNOT UNDO THESE")
 		fmt.Fprintln(output, "  Successful actions ran outside the shared transaction; discard cannot undo them.")
 		for _, action := range summary.IrreversibleActions {
@@ -421,6 +426,7 @@ func writeChangeSummary(output io.Writer, summary pgproxy.Summary) {
 				change.Table, change.Inserted, change.Updated, change.Deleted)
 		}
 	}
+	fmt.Fprintln(output, "  Note: PostgreSQL sequences do not roll back; discarded sessions can leave ID gaps.")
 	fmt.Fprintln(output, "\nSCHEMA CHANGES (sealed catalog comparison)")
 	if !summary.Changes.Complete {
 		fmt.Fprintln(output, "  UNKNOWN — catalog changes could not be determined safely.")

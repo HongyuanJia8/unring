@@ -38,6 +38,22 @@ func newReviewModel(summary pgproxy.Summary) reviewModel {
 		summary: summary, expanded: make(map[int]bool), height: 24,
 		decision: pgproxy.DecisionRollback,
 	}
+	for _, item := range summary.Unintercepted {
+		title := item.Detail
+		if item.Statement != "" {
+			title = compactSQL(item.Statement)
+		}
+		model.items = append(model.items, reviewItem{
+			section: "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!",
+			title:   title, SQL: item.Statement, detail: item.Detail,
+		})
+	}
+	for _, effect := range summary.NonTransactional {
+		model.items = append(model.items, reviewItem{
+			section: "NON-TRANSACTIONAL EFFECTS — DISCARD CANNOT UNDO THESE",
+			title:   effect.Detail, detail: effect.Detail,
+		})
+	}
 	for _, query := range summary.Queries {
 		status := "ok"
 		if query.Failed {
@@ -60,16 +76,6 @@ func newReviewModel(summary pgproxy.Summary) reviewModel {
 			title:   fmt.Sprintf("[%s] %s", status, compactSQL(action.SQL)),
 			SQL:     action.SQL, affected: affectedRows(action.CommandTags), err: action.Error,
 			detail: detail,
-		})
-	}
-	for _, item := range summary.Unintercepted {
-		title := item.Detail
-		if item.Statement != "" {
-			title = compactSQL(item.Statement)
-		}
-		model.items = append(model.items, reviewItem{
-			section: "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!",
-			title:   title, SQL: item.Statement, detail: item.Detail,
 		})
 	}
 	return model
@@ -144,8 +150,15 @@ func (model reviewModel) View() string {
 	if !model.summary.FullyReversible {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
-		output.WriteString("Irreversible actions were approved outside the shared transaction.\n")
+		output.WriteString("Unring cannot guarantee every recorded effect can be undone by discarding.\n")
 		output.WriteString("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+	}
+	if len(model.summary.Unintercepted) > 0 {
+		output.WriteString("\n================================================================\n")
+		fmt.Fprintf(&output, "!!! INTERCEPTION/COVERAGE WARNING: %d UNCLASSIFIED ITEM(S) !!!\n",
+			len(model.summary.Unintercepted))
+		output.WriteString("Coverage is incomplete. Review these items before making any decision.\n")
+		output.WriteString("================================================================\n")
 	}
 	writeChangeSummary(&output, model.summary)
 

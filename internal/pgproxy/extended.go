@@ -68,6 +68,12 @@ func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
 	if len(statements) == 1 {
 		statement = statements[0]
 	}
+	if p.escapeLeaseHeldByOther(client) {
+		p.extendedLocalError(client, "55P03",
+			"another client is running an approved non-transactional statement; unring cannot safely interleave this statement")
+		return
+	}
+	p.prepareStatementRiskLocked(&statement)
 	if statement.Kind == statementForbidden {
 		p.extendedLocalError(client, "0A000",
 			"unring cannot allow prepared-transaction control in the shared transaction")
@@ -233,6 +239,11 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 		return
 	}
 	statement := portal.statement.statement
+	if statement.Kind == statementRegular && p.escapeLeaseHeldByOther(client) {
+		p.extendedLocalError(client, "55P03",
+			"another client is running an approved non-transactional statement; unring cannot safely interleave this statement")
+		return
+	}
 	if statement.Kind == statementRegular &&
 		p.sharedLeaseHeldByOther(client) {
 		if !statement.ReadOnly {
@@ -300,6 +311,9 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 			record.Error = postgresErrorText(responseError)
 		}
 		p.recordQuery(record)
+		if !record.Failed && summaryRiskApplies(statement, record.CommandTags) {
+			client.cycleUncertain = append(client.cycleUncertain, statement.SummaryRisk)
+		}
 	}
 }
 
@@ -314,7 +328,13 @@ func (p *Proxy) rotateExtendedCycleSavepointLocked(client *clientState, create b
 		if _, err := p.internalQueryLocked(command); err != nil {
 			return fmt.Errorf("release extended-query savepoint around transaction control: %w", err)
 		}
-		p.reconcileRowChangesLocked(keep)
+		if keep {
+			for _, detail := range client.cycleUncertain {
+				p.addUncertainEffectLocked(detail)
+			}
+		}
+		p.reconcileRowChangesLocked(keep && len(client.cycleUncertain) == 0)
+		client.cycleUncertain = nil
 		client.cycleSavepoint = ""
 	}
 	if !create {
@@ -497,7 +517,12 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 	if _, err := p.internalQueryLocked(recovery); err != nil {
 		return fmt.Errorf("finish extended-query cycle: %w", err)
 	}
-	p.reconcileRowChangesLocked(keepRows)
+	if keepRows {
+		for _, detail := range client.cycleUncertain {
+			p.addUncertainEffectLocked(detail)
+		}
+	}
+	p.reconcileRowChangesLocked(keepRows && len(client.cycleUncertain) == 0)
 	if client.extendedFailed && client.pendingEscape == nil &&
 		client.transactionSavepoint != "" {
 		client.transactionFailed = true
@@ -506,6 +531,7 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 	client.extendedFailed = false
 	client.rollbackCycle = false
 	client.cycleSavepoint = ""
+	client.cycleUncertain = nil
 
 	if client.pendingEscape != nil {
 		statement := *client.pendingEscape

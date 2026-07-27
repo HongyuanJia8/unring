@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 type catalogObject struct {
@@ -122,6 +123,100 @@ UNION ALL
 SELECT e.oid::text, 'extension', format('%I', e.extname),
        concat_ws(E'\x1f', e.extversion, e.extrelocatable::text, e.extnamespace::text)
   FROM pg_extension e
+UNION ALL
+SELECT r.oid::text, 'rule',
+       format('%I.%I.%I', n.nspname, c.relname, r.rulename),
+       pg_get_ruledef(r.oid, true)
+  FROM pg_rewrite r
+  JOIN pg_class c ON c.oid = r.ev_class
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE r.rulename <> '_RETURN'
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname !~ '^pg_toast'
+UNION ALL
+SELECT s.oid::text, 'extended statistic', format('%I.%I', n.nspname, s.stxname),
+       concat_ws(E'\x1f', pg_get_statisticsobjdef(s.oid), s.stxstattarget::text)
+  FROM pg_statistic_ext s
+  JOIN pg_namespace n ON n.oid = s.stxnamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname !~ '^pg_toast'
+UNION ALL
+SELECT e.oid::text, 'event trigger', format('%I', e.evtname),
+       concat_ws(E'\x1f', e.evtevent, e.evtenabled::text,
+         e.evtfoid::regprocedure::text,
+         COALESCE(array_to_string(e.evttags, E'\x1e'), ''))
+  FROM pg_event_trigger e
+UNION ALL
+SELECT p.oid::text, 'publication', format('%I', p.pubname),
+       concat_ws(E'\x1f', p.pubowner::text, p.puballtables::text,
+         p.pubinsert::text, p.pubupdate::text, p.pubdelete::text,
+         p.pubtruncate::text, p.pubviaroot::text,
+         COALESCE((
+           SELECT string_agg(concat_ws(E'\x1d', pr.prrelid::regclass::text,
+                    COALESCE(array_to_string(pr.prattrs, ','), ''),
+                    COALESCE(pg_get_expr(pr.prqual, pr.prrelid), '')),
+                    E'\x1c' ORDER BY pr.prrelid)
+             FROM pg_publication_rel pr WHERE pr.prpubid = p.oid
+         ), ''),
+         COALESCE((
+           SELECT string_agg(pn.pnnspid::regnamespace::text, E'\x1c' ORDER BY pn.pnnspid)
+             FROM pg_publication_namespace pn WHERE pn.pnpubid = p.oid
+         ), ''))
+  FROM pg_publication p
+UNION ALL
+SELECT s.oid::text, 'subscription', format('%I.%I', d.datname, s.subname),
+       concat_ws(E'\x1f', s.subdbid::text, s.subskiplsn::text,
+         s.subowner::text, s.subenabled::text,
+         s.subbinary::text, s.substream::text, s.subtwophasestate::text,
+         s.subdisableonerr::text, s.subpasswordrequired::text,
+         s.subrunasowner::text, s.subfailover::text,
+         md5(s.subconninfo), COALESCE(s.subslotname, ''), s.subsynccommit,
+         COALESCE(array_to_string(s.subpublications, E'\x1e'), ''), s.suborigin)
+  FROM pg_subscription s
+  JOIN pg_database d ON d.oid = s.subdbid
+UNION ALL
+SELECT d.objoid::text, 'comment', pg_describe_object(d.classoid, d.objoid, d.objsubid),
+       d.description
+  FROM pg_description d
+ WHERE d.description IS NOT NULL
+UNION ALL
+SELECT d.objoid::text, 'comment', pg_describe_object(d.classoid, d.objoid, 0),
+       d.description
+  FROM pg_shdescription d
+ WHERE d.description IS NOT NULL
+UNION ALL
+SELECT c.oid::text, 'cast',
+       format('%s AS %s', c.castsource::regtype, c.casttarget::regtype),
+       concat_ws(E'\x1f', c.castcontext::text, c.castmethod::text,
+         c.castfunc::regprocedure::text)
+  FROM pg_cast c
+  JOIN pg_type s ON s.oid = c.castsource
+  JOIN pg_namespace sn ON sn.oid = s.typnamespace
+  JOIN pg_type t ON t.oid = c.casttarget
+  JOIN pg_namespace tn ON tn.oid = t.typnamespace
+ WHERE sn.nspname NOT IN ('pg_catalog', 'information_schema')
+    OR tn.nspname NOT IN ('pg_catalog', 'information_schema')
+UNION ALL
+SELECT o.oid::text, 'operator',
+       format('%I.%I(%s,%s)', n.nspname, o.oprname,
+         o.oprleft::regtype, o.oprright::regtype),
+       concat_ws(E'\x1f', o.oprkind::text, o.oprcanmerge::text,
+         o.oprcanhash::text, o.oprcode::regprocedure::text,
+         o.oprcom::text, o.oprnegate::text)
+  FROM pg_operator o
+  JOIN pg_namespace n ON n.oid = o.oprnamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname !~ '^pg_toast'
+UNION ALL
+SELECT c.oid::text, 'collation', format('%I.%I', n.nspname, c.collname),
+       concat_ws(E'\x1f', c.collowner::text, c.collprovider::text, c.collisdeterministic::text,
+         c.collencoding::text, COALESCE(c.collcollate, ''),
+         COALESCE(c.collctype, ''), COALESCE(c.colllocale, ''),
+         COALESCE(c.collicurules, ''), COALESCE(c.collversion, ''))
+  FROM pg_collation c
+  JOIN pg_namespace n ON n.oid = c.collnamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname !~ '^pg_toast'
 ORDER BY 2, 3`
 
 func (p *Proxy) captureCatalogLocked() (catalogSnapshot, error) {
@@ -175,6 +270,11 @@ func (p *Proxy) freezeChangeSummaryLocked() {
 		p.setIncompleteSummary(fmt.Errorf("capture sealed postgres row counts: %w", p.rowLedgerErr))
 		return
 	}
+	if len(p.uncertainEffects) > 0 {
+		p.setIncompleteSummary(fmt.Errorf("exact effects could not be determined: %s",
+			strings.Join(p.uncertainEffects, "; ")))
+		return
+	}
 	changes := ChangeSummary{
 		Rows: p.rowChangesLocked(), Schema: diffCatalog(p.catalogInitial, finalCatalog), Complete: true,
 	}
@@ -188,9 +288,6 @@ func (p *Proxy) setIncompleteSummary(err error) {
 	p.summaryMu.Lock()
 	p.changes = ChangeSummary{Complete: false, Error: err.Error()}
 	p.sealedSummary = true
-	p.unintercepted = append(p.unintercepted, UninterceptedItem{
-		Detail: "PostgreSQL change summary is incomplete: " + err.Error(),
-	})
 	p.summaryMu.Unlock()
 }
 
@@ -266,6 +363,106 @@ func (p *Proxy) reconcileRowChangesLocked(keep bool) {
 		return
 	}
 	p.applyRowStatsLocked(current, keep)
+	if err := p.captureSequenceUsageLocked(); err != nil {
+		p.setRowLedgerError(fmt.Errorf("capture non-transactional sequence use: %w", err))
+	}
+}
+
+func (p *Proxy) prepareStatementRiskLocked(statement *clientStatement) {
+	if statement == nil || statement.SummaryRisk != "" || statement.SummaryTarget == nil {
+		return
+	}
+	rows, err := p.internalRowsLocked(`
+SELECT c.relkind::text,
+       EXISTS (
+         SELECT 1 FROM pg_trigger t
+          WHERE t.tgrelid = c.oid AND t.tgdeferrable
+       )::text
+  FROM pg_class c
+ WHERE c.oid = to_regclass(` + quoteSQLLiteral(statement.SummaryTarget.regclassName()) + `)`)
+	if err != nil {
+		statement.SummaryRisk = "unring could not classify the statement's target for change accounting: " + err.Error()
+		return
+	}
+	if len(rows) == 0 || len(rows[0]) != 2 || rows[0][0] == nil || rows[0][1] == nil {
+		return
+	}
+	switch string(rows[0][0]) {
+	case "f":
+		statement.SummaryRisk = "the foreign table write is not included in PostgreSQL's local transaction row counters"
+		statement.RiskRequiresRows = true
+	}
+	if string(rows[0][1]) == "true" {
+		statement.SummaryRisk = "deferrable constraint triggers may perform additional writes at COMMIT, after the review decision"
+		statement.RiskRequiresRows = true
+	}
+}
+
+func summaryRiskApplies(statement clientStatement, tags []string) bool {
+	if statement.SummaryRisk == "" {
+		return false
+	}
+	if !statement.RiskRequiresRows {
+		return true
+	}
+	for _, tag := range tags {
+		fields := strings.Fields(tag)
+		if len(fields) < 2 {
+			continue
+		}
+		count, err := strconv.ParseInt(fields[len(fields)-1], 10, 64)
+		if err == nil && count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Proxy) addUncertainEffectLocked(detail string) {
+	if detail == "" {
+		return
+	}
+	for _, existing := range p.uncertainEffects {
+		if existing == detail {
+			return
+		}
+	}
+	p.uncertainEffects = append(p.uncertainEffects, detail)
+}
+
+func (p *Proxy) restoreUncertainEffectsLocked(length int) {
+	if length < 0 {
+		length = 0
+	}
+	if length < len(p.uncertainEffects) {
+		p.uncertainEffects = p.uncertainEffects[:length]
+	}
+}
+
+func (p *Proxy) captureSequenceUsageLocked() error {
+	rows, err := p.internalRowsLocked(`
+SELECT format('%I.%I', n.nspname, c.relname)
+  FROM pg_locks l
+  JOIN pg_class c ON c.oid = l.relation AND c.relkind = 'S'
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE l.pid = pg_backend_pid() AND l.granted
+   AND l.locktype = 'relation' AND l.mode = 'RowExclusiveLock'
+ ORDER BY 1`)
+	if err != nil {
+		return err
+	}
+	p.summaryMu.Lock()
+	defer p.summaryMu.Unlock()
+	for _, row := range rows {
+		if len(row) != 1 || row[0] == nil {
+			return fmt.Errorf("postgres returned malformed sequence-lock information")
+		}
+		name := string(row[0])
+		if _, existedAtStart := p.catalogInitial["sequence\x00"+name]; existedAtStart {
+			p.sequenceEffects[name] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func (p *Proxy) applyRowStatsLocked(current rowStatsSnapshot, keep bool) {

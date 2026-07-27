@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -65,9 +66,30 @@ func TestReviewModelSeparatesUninterceptedTraffic(t *testing.T) {
 	}).View()
 	statementSection := strings.Index(view, "STATEMENTS")
 	uninterceptedSection := strings.Index(view, "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!")
-	if statementSection < 0 || uninterceptedSection <= statementSection ||
-		!strings.Contains(view[uninterceptedSection:], "mystery") {
+	warning := strings.Index(view, "INTERCEPTION/COVERAGE WARNING")
+	if statementSection < 0 || uninterceptedSection < 0 || warning < 0 ||
+		warning > statementSection || !strings.Contains(view, "mystery") {
 		t.Fatalf("unintercepted traffic was not rendered in its own section:\n%s", view)
+	}
+}
+
+func TestReviewModelKeepsUninterceptedWarningVisibleWhenSectionIsOffscreen(t *testing.T) {
+	t.Parallel()
+
+	queries := make([]pgproxy.QueryRecord, 40)
+	for index := range queries {
+		queries[index] = pgproxy.QueryRecord{SQL: fmt.Sprintf("SELECT %d", index)}
+	}
+	model := newReviewModel(pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true}, Queries: queries,
+		Unintercepted: []pgproxy.UninterceptedItem{{Detail: "could not classify one batch"}},
+	})
+	model.offset = 20
+	view := model.View()
+	if !strings.Contains(view, "INTERCEPTION/COVERAGE WARNING") ||
+		!strings.Contains(view, "1 UNCLASSIFIED ITEM") {
+		t.Fatalf("off-screen unclassified traffic lost its persistent warning:\n%s", view)
 	}
 }
 
