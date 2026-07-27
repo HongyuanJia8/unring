@@ -28,6 +28,10 @@ Building requires cgo and a working C compiler because unring uses
 statements. The standard Go toolchain plus Clang on macOS or GCC/Clang on Linux is
 sufficient.
 
+PostgreSQL 14 is the minimum supported version. Older servers are rejected at startup
+with an explicit version error before any client traffic is accepted; CI exercises
+the integration suite against PostgreSQL 14 and 17 explicitly.
+
 `unring` opens one real transaction on the configured database, binds a proxy to an
 ephemeral loopback port, and injects `DATABASE_URL` plus the standard `PG*` connection
 variables into the child process only. Every client connection opened by that child
@@ -90,6 +94,9 @@ ability to make any of it permanent without you saying so.
 ## Honest limits
 
 - Sequences do not roll back — discarded runs still leave gaps in auto-increment IDs.
+- PostgreSQL does not expose authoritative per-table row counts for `TRUNCATE`.
+  unring reports that summary as `UNKNOWN` and forces the session to discard, so a
+  session containing a successful `TRUNCATE` cannot currently be committed.
 - Postgres only. MySQL commits DDL implicitly, which breaks the core guarantee.
 - Both PostgreSQL's simple and extended query protocols are supported. Prepared
   statement and portal names are isolated per client on the shared backend.
@@ -97,8 +104,18 @@ ability to make any of it permanent without you saying so.
   `CREATE INDEX CONCURRENTLY`, `ALTER SYSTEM`, `CHECKPOINT`, and similar) require
   approval and make the session not fully reversible. They are refused if the shared
   transaction already has uncommitted database changes.
+- Lock-waiting maintenance commands cannot run against a table while the shared
+  transaction holds locks on it. This includes concurrent index builds, `VACUUM FULL`,
+  `CLUSTER`, and `REINDEX`, including their database-wide or schema-wide forms. Unring
+  checks both concrete and broad targets before execution and reserves the shared
+  backend through the escape operation; commit or discard the session first, then run
+  the maintenance command separately. A short lock timeout remains as a backstop for
+  conflicts outside the session that cannot be predicted.
 - Client transaction control is mapped to private savepoints. One client-visible
   transaction may be open at a time; it does not pin the backend while idle.
+- The shared transaction uses PostgreSQL's default `READ COMMITTED` isolation. Its
+  catalog baseline is captured explicitly; this also lets review see approved DDL
+  committed on the non-transactional connection.
 - While that transaction is open, other clients may run read-only queries. Unring
   rolls those query cycles back internally so they cannot become part of the open
   client's savepoint. A concurrent write or second `BEGIN` fails immediately with

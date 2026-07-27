@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,17 +34,69 @@ var ErrTransactionLost = errors.New(
 	"postgres backend left unring's shared transaction; interception was lost",
 )
 
+const (
+	minimumPostgresMajor   = 14
+	minimumPostgresVersion = minimumPostgresMajor * 10000
+)
+
 // QueryRecord is a compact account of one client query batch.
 type QueryRecord struct {
 	SQL         string
 	CommandTags []string
 	Failed      bool
+	Error       string
 }
 
-// IrreversibleAction records a statement that was approved and executed on a
-// separate autocommit connection. It cannot be affected by the final decision.
+// IrreversibleAction records a statement dispatched on a separate autocommit
+// connection. Failed records retain the execution error because a dispatched
+// statement may have produced external or partially committed effects. A
+// decline or pre-execution refusal never creates this record.
 type IrreversibleAction struct {
-	SQL string
+	SQL         string
+	CommandTags []string
+	Failed      bool
+	Error       string
+}
+
+// RowChange reports physical tuple operations still staged by the shared
+// transaction. PostgreSQL supplies per-relation counters, including writes
+// performed by triggers; unring maintains the savepoint-aware staged view.
+type RowChange struct {
+	Table    string
+	Inserted int64
+	Updated  int64
+	Deleted  int64
+}
+
+// SchemaChange is one catalog change staged in the shared transaction.
+type SchemaChange struct {
+	Action string
+	Kind   string
+	Object string
+}
+
+// ChangeSummary is frozen by Seal after all client traffic has stopped.
+// Complete is false when PostgreSQL could not provide an authoritative view;
+// callers must surface Error rather than treating an empty summary as no work.
+type ChangeSummary struct {
+	Rows     []RowChange
+	Schema   []SchemaChange
+	Complete bool
+	Error    string
+}
+
+// NonTransactionalEffect records backend-observed state that PostgreSQL does
+// not roll back with the shared transaction (currently sequence advancement).
+type NonTransactionalEffect struct {
+	Detail string
+}
+
+// UninterceptedItem describes traffic unring could not classify or intercept.
+// It is deliberately separate from QueryRecord so review UIs cannot blend it
+// into the ordinary statement list.
+type UninterceptedItem struct {
+	Statement string
+	Detail    string
 }
 
 // ApprovalRequest describes an action that cannot be included in unring's
@@ -64,10 +117,32 @@ type Options struct {
 
 // Summary is a point-in-time copy of the session activity.
 type Summary struct {
-	Connections         int
-	Queries             []QueryRecord
+	Connections int
+	Queries     []QueryRecord
+	// FullyReversible is false exactly when IrreversibleActions is non-empty.
+	// Other coverage and accounting warnings are represented separately.
 	FullyReversible     bool
 	IrreversibleActions []IrreversibleAction
+	Changes             ChangeSummary
+	Unintercepted       []UninterceptedItem
+	NonTransactional    []NonTransactionalEffect
+	Sealed              bool
+}
+
+// HasReviewableActivity reports whether the sealed session needs a decision.
+// An incomplete or unclassified session is never silently treated as read-only.
+func (summary Summary) HasReviewableActivity() bool {
+	if !summary.Sealed || !summary.Changes.Complete ||
+		len(summary.IrreversibleActions) > 0 || len(summary.Unintercepted) > 0 ||
+		len(summary.NonTransactional) > 0 {
+		return true
+	}
+	for _, change := range summary.Changes.Rows {
+		if change.Inserted != 0 || change.Updated != 0 || change.Deleted != 0 {
+			return true
+		}
+	}
+	return len(summary.Changes.Schema) > 0
 }
 
 // Proxy owns one real PostgreSQL backend connection and transaction.
@@ -100,6 +175,16 @@ type Proxy struct {
 	connections         int
 	queries             []QueryRecord
 	irreversibleActions []IrreversibleAction
+	unintercepted       []UninterceptedItem
+	changes             ChangeSummary
+	sealedSummary       bool
+	catalogInitial      catalogSnapshot
+	rowStats            rowStatsSnapshot
+	rowLedger           rowLedgerSnapshot
+	rowLedgerErr        error
+	uncertainEffects    []string
+	sequenceEffects     map[string]struct{}
+	serverVersion       int
 
 	finishMu sync.Mutex
 	finished bool
@@ -157,10 +242,39 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		cancel:          cancel,
 	}
 
+	// READ COMMITTED is deliberate. The baseline is captured explicitly below,
+	// while later catalog queries must see approved DDL committed by the escape
+	// connection. A transaction-wide snapshot would hide that DDL and pin xmin,
+	// preventing CREATE INDEX CONCURRENTLY from completing.
 	if _, err := p.internalQueryLocked("BEGIN"); err != nil {
 		_ = p.upstream.Close()
 		return nil, fmt.Errorf("begin shared postgres transaction: %w", err)
 	}
+	p.serverVersion, err = p.captureServerVersionLocked()
+	if err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, fmt.Errorf("determine PostgreSQL server version: %w", err)
+	}
+	if err := validatePostgresVersion(p.serverVersion, p.params["server_version"]); err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, err
+	}
+	p.catalogInitial, err = p.captureCatalogLocked()
+	if err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, fmt.Errorf("capture initial postgres catalog: %w", err)
+	}
+	p.rowStats, err = p.captureRowStatsLocked()
+	if err != nil {
+		_, _ = p.internalQueryLocked("ROLLBACK")
+		_ = p.upstream.Close()
+		return nil, fmt.Errorf("capture initial postgres row counters: %w", err)
+	}
+	p.rowLedger = make(rowLedgerSnapshot)
+	p.sequenceEffects = make(map[string]struct{})
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -175,6 +289,19 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 	go p.acceptLoop()
 
 	return p, nil
+}
+
+func validatePostgresVersion(versionNumber int, versionLabel string) error {
+	if versionNumber >= minimumPostgresVersion {
+		return nil
+	}
+	if versionLabel == "" {
+		versionLabel = strconv.Itoa(versionNumber)
+	}
+	return fmt.Errorf(
+		"unring requires PostgreSQL %d or newer; connected server is PostgreSQL %s",
+		minimumPostgresMajor, versionLabel,
+	)
 }
 
 // Address returns the loopback host and ephemeral port used by the proxy.
@@ -205,14 +332,42 @@ func (p *Proxy) Summary() Summary {
 			SQL:         record.SQL,
 			CommandTags: append([]string(nil), record.CommandTags...),
 			Failed:      record.Failed,
+			Error:       record.Error,
 		}
 	}
-	actions := append([]IrreversibleAction(nil), p.irreversibleActions...)
+	actions := make([]IrreversibleAction, len(p.irreversibleActions))
+	for i, action := range p.irreversibleActions {
+		actions[i] = action
+		actions[i].CommandTags = append([]string(nil), action.CommandTags...)
+	}
+	rows := append([]RowChange(nil), p.changes.Rows...)
+	schema := append([]SchemaChange(nil), p.changes.Schema...)
+	unintercepted := append([]UninterceptedItem(nil), p.unintercepted...)
+	nonTransactional := make([]NonTransactionalEffect, 0, len(p.sequenceEffects))
+	for name := range p.sequenceEffects {
+		nonTransactional = append(nonTransactional, NonTransactionalEffect{
+			Detail: "PostgreSQL sequence " + name + " advanced; sequence values do not roll back.",
+		})
+	}
+	sort.Slice(nonTransactional, func(i, j int) bool {
+		return nonTransactional[i].Detail < nonTransactional[j].Detail
+	})
+	// This flag has one deliberately narrow meaning: at least one statement
+	// was dispatched on the non-transactional escape connection. Coverage
+	// warnings, incomplete staged summaries, sequence effects, declines, and
+	// local refusals have their own fields and must not counterfeit this stamp.
+	fullyReversible := len(actions) == 0
 	return Summary{
 		Connections:         p.connections,
 		Queries:             queries,
-		FullyReversible:     len(actions) == 0,
+		FullyReversible:     fullyReversible,
 		IrreversibleActions: actions,
+		Changes: ChangeSummary{
+			Rows: rows, Schema: schema, Complete: p.changes.Complete, Error: p.changes.Error,
+		},
+		Unintercepted:    unintercepted,
+		NonTransactional: nonTransactional,
+		Sealed:           p.sealedSummary,
 	}
 }
 
@@ -231,6 +386,9 @@ func (p *Proxy) Seal(ctx context.Context) error {
 		// stopClients waits for handlers, but taking the lock also documents and
 		// enforces the invariant that no backend exchange remains in flight.
 		p.queryMu.Lock()
+		if p.Err() == nil {
+			p.freezeChangeSummaryLocked()
+		}
 		p.queryMu.Unlock()
 
 		if fatalErr := p.Err(); fatalErr != nil {
@@ -280,8 +438,15 @@ func (p *Proxy) Finalize(ctx context.Context, decision Decision) error {
 	}
 
 	command := "ROLLBACK"
+	var forcedRollback error
 	if decision == DecisionCommit {
-		command = "COMMIT"
+		if p.Summary().Changes.Complete {
+			command = "COMMIT"
+		} else {
+			forcedRollback = errors.New(
+				"unring refused to commit an incomplete change summary and rolled the session back",
+			)
+		}
 	}
 	if _, err := p.internalQueryLocked(command); err != nil {
 		_ = p.upstream.Close()
@@ -289,6 +454,9 @@ func (p *Proxy) Finalize(ctx context.Context, decision Decision) error {
 	}
 	if err := p.upstream.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("close postgres backend: %w", err)
+	}
+	if forcedRollback != nil {
+		return forcedRollback
 	}
 	return nil
 }
@@ -351,6 +519,7 @@ func (p *Proxy) handleClient(conn net.Conn) {
 
 	backend := pgproto3.NewBackend(conn, conn)
 	if err := p.handshake(conn, backend); err != nil {
+		p.recordUnintercepted("", "PostgreSQL startup traffic was not intercepted: "+err.Error())
 		p.sendFatal(backend, fmt.Sprintf("unring postgres handshake failed: %v", err))
 		return
 	}
@@ -395,6 +564,9 @@ func (p *Proxy) handleClient(conn net.Conn) {
 		case *pgproto3.Terminate:
 			return
 		default:
+			p.recordUnintercepted("", fmt.Sprintf(
+				"unsupported PostgreSQL frontend message %T", message,
+			))
 			p.sendFatal(backend, fmt.Sprintf(
 				"unring does not support PostgreSQL frontend message %T",
 				message,
@@ -493,6 +665,7 @@ func (p *Proxy) context() context.Context {
 
 func (p *Proxy) markFatal(err error) {
 	p.fatalOnce.Do(func() {
+		p.recordUnintercepted("", "PostgreSQL interception failed: "+err.Error())
 		p.fatalMu.Lock()
 		p.fatalErr = err
 		p.fatalMu.Unlock()

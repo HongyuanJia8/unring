@@ -35,11 +35,16 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 - [x] M1.6 Escape hatch for statements that cannot run in a transaction block
       (`CREATE DATABASE`, `DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`,
       `ALTER SYSTEM`, `CHECKPOINT`) — classify as *needs approval*, run on a separate
-      non-transactional connection, mark the session as no longer fully reversible
-- [ ] M1.7 Change summary — what the transaction actually did, for the review screen
+      non-transactional connection, mark the session as no longer fully reversible.
+      Lock-waiting maintenance against relations locked by the shared transaction is
+      refused up front, including broad `VACUUM FULL`, `CLUSTER`, and `REINDEX`
+      operations; commit or discard first, then run it outside unring
+- [x] M1.7 Change summary — what the transaction actually did, for the review screen
 - [x] M1.8 Map client `BEGIN`/`COMMIT`/`ROLLBACK` and named savepoints onto private
       savepoints inside the shared transaction. This preserves the single-decision
       guarantee while letting transaction-managing clients and ORMs run
+- [ ] M1.9 Count `TRUNCATE` effects authoritatively so sessions containing it can be
+      reviewed and committed instead of being forced to discard
 
 ## M2 — Wrapper CLI
 
@@ -47,15 +52,15 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
       propagate exit code
 - [x] M2.2 Environment injection for the child only (`PGHOST`/`PGPORT`/`DATABASE_URL`;
       later `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`)
-- [ ] M2.3 `unring claude` and friends — thin aliases over `run`
-- [ ] M2.4 Read-only sessions exit silently: no prompt when nothing was written
+- [x] M2.3 `unring claude` and friends — thin aliases over `run`
+- [x] M2.4 Read-only sessions exit silently: no prompt when nothing was written
 
 ## M3 — Review interface
 
 - [x] M3.1 Non-interactive text summary + commit/discard prompt (unblocks end-to-end)
-- [ ] M3.2 Bubble Tea TUI: overall commit/discard, expandable per-item detail
+- [x] M3.2 Bubble Tea TUI: overall commit/discard, expandable per-item detail
       (diffs, affected rows, request bodies). **No partial commit** — by design
-- [ ] M3.3 Un-intercepted traffic gets its own, unmissable section
+- [x] M3.3 Un-intercepted traffic gets its own, unmissable section
 
 ## M4 — Audit log
 
@@ -99,3 +104,6 @@ multi-user · multi-agent concurrency control · web UI.
 
 - Whether `discard` should hand feedback back to the agent for a retry
   (not in v1, but do not architect it out)
+- Whether approved lock-conflicting maintenance should be deferred until the final
+  decision, so discard omits it entirely; this better fits the promise but changes
+  what the agent observes during the session

@@ -59,6 +59,7 @@ func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
 		text := "cannot insert multiple commands into a prepared statement"
 		if err != nil {
 			text = err.Error()
+			p.recordUnintercepted(message.Query, text)
 		}
 		p.extendedLocalError(client, "42601", text)
 		return
@@ -67,6 +68,12 @@ func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
 	if len(statements) == 1 {
 		statement = statements[0]
 	}
+	if p.escapeLeaseHeldByOther(client) {
+		p.extendedLocalError(client, "55P03",
+			"another client is running an approved non-transactional statement; unring cannot safely interleave this statement")
+		return
+	}
+	p.prepareStatementRiskLocked(&statement)
 	if statement.Kind == statementForbidden {
 		p.extendedLocalError(client, "0A000",
 			"unring cannot allow prepared-transaction control in the shared transaction")
@@ -225,12 +232,18 @@ func (p *Proxy) extendedDescribe(client *clientState, message *pgproto3.Describe
 }
 
 func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) {
+	client.lastError = ""
 	portal := client.portals[message.Portal]
 	if portal == nil {
 		p.extendedLocalError(client, "34000", fmt.Sprintf("portal %q does not exist", message.Portal))
 		return
 	}
 	statement := portal.statement.statement
+	if statement.Kind == statementRegular && p.escapeLeaseHeldByOther(client) {
+		p.extendedLocalError(client, "55P03",
+			"another client is running an approved non-transactional statement; unring cannot safely interleave this statement")
+		return
+	}
 	if statement.Kind == statementRegular &&
 		p.sharedLeaseHeldByOther(client) {
 		if !statement.ReadOnly {
@@ -260,7 +273,11 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 				return
 			}
 		}
-		p.recordQuery(QueryRecord{SQL: portal.statement.query, CommandTags: tags, Failed: failed})
+		record := QueryRecord{SQL: portal.statement.query, CommandTags: tags, Failed: failed}
+		if failed {
+			record.Error = client.lastError
+		}
+		p.recordQuery(record)
 		if failed {
 			client.extendedFailed = true
 		}
@@ -290,15 +307,34 @@ func (p *Proxy) extendedExecute(client *clientState, message *pgproto3.Execute) 
 			return
 		}
 		_, record.Failed = response.(*pgproto3.ErrorResponse)
+		if responseError, failed := response.(*pgproto3.ErrorResponse); failed {
+			record.Error = postgresErrorText(responseError)
+		}
 		p.recordQuery(record)
+		if !record.Failed && summaryRiskApplies(statement, record.CommandTags) {
+			client.cycleUncertain = append(client.cycleUncertain, statement.SummaryRisk)
+		}
 	}
 }
 
 func (p *Proxy) rotateExtendedCycleSavepointLocked(client *clientState, create bool) error {
 	if client.cycleSavepoint != "" {
-		if _, err := p.internalQueryLocked("RELEASE SAVEPOINT " + client.cycleSavepoint); err != nil {
+		keep := !client.extendedFailed && !client.rollbackCycle
+		command := "RELEASE SAVEPOINT " + client.cycleSavepoint
+		if !keep {
+			command = "ROLLBACK TO SAVEPOINT " + client.cycleSavepoint +
+				"; RELEASE SAVEPOINT " + client.cycleSavepoint
+		}
+		if _, err := p.internalQueryLocked(command); err != nil {
 			return fmt.Errorf("release extended-query savepoint around transaction control: %w", err)
 		}
+		if keep {
+			for _, detail := range client.cycleUncertain {
+				p.addUncertainEffectLocked(detail)
+			}
+		}
+		p.reconcileRowChangesLocked(keep && len(client.cycleUncertain) == 0)
+		client.cycleUncertain = nil
 		client.cycleSavepoint = ""
 	}
 	if !create {
@@ -434,6 +470,7 @@ func (p *Proxy) exchangeExtendedLocked(
 			}
 			continue
 		case *pgproto3.CopyBothResponse:
+			p.recordUnintercepted("", "PostgreSQL copy-both traffic is unsupported")
 			p.sendStatementError(client, "0A000",
 				"unring does not support PostgreSQL copy-both mode", true)
 			_ = client.backend.Flush()
@@ -471,14 +508,21 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 	if err := p.synchronizeExtendedBackendLocked(client); err != nil {
 		return err
 	}
+	keepRows := !client.extendedFailed && !client.rollbackCycle
 	recovery := "RELEASE SAVEPOINT " + client.cycleSavepoint
-	if client.extendedFailed || client.rollbackCycle {
+	if !keepRows {
 		recovery = "ROLLBACK TO SAVEPOINT " + client.cycleSavepoint +
 			"; RELEASE SAVEPOINT " + client.cycleSavepoint
 	}
 	if _, err := p.internalQueryLocked(recovery); err != nil {
 		return fmt.Errorf("finish extended-query cycle: %w", err)
 	}
+	if keepRows {
+		for _, detail := range client.cycleUncertain {
+			p.addUncertainEffectLocked(detail)
+		}
+	}
+	p.reconcileRowChangesLocked(keepRows && len(client.cycleUncertain) == 0)
 	if client.extendedFailed && client.pendingEscape == nil &&
 		client.transactionSavepoint != "" {
 		client.transactionFailed = true
@@ -487,6 +531,7 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 	client.extendedFailed = false
 	client.rollbackCycle = false
 	client.cycleSavepoint = ""
+	client.cycleUncertain = nil
 
 	if client.pendingEscape != nil {
 		statement := *client.pendingEscape

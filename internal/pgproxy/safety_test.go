@@ -82,8 +82,9 @@ func TestRelayQueryDetectsLostTransaction(t *testing.T) {
 	}
 
 	summary := proxy.Summary()
-	if len(summary.Queries) != 1 || !summary.Queries[0].Failed {
-		t.Fatalf("lost transaction summary = %#v, want one failed query", summary)
+	if len(summary.Queries) != 0 || len(summary.Unintercepted) == 0 ||
+		summary.Unintercepted[0].Statement != "SELECT 1" {
+		t.Fatalf("lost transaction summary = %#v, want query only in un-intercepted section", summary)
 	}
 
 	clientMessages := pgproto3.NewFrontend(&clientOutput, io.Discard)
@@ -237,10 +238,13 @@ func TestEscapeSessionStateAcceptsEmptyTransactionIDAndGUC(t *testing.T) {
 			{[]byte("__unring_role__"), []byte("postgres")},
 			{[]byte("__unring_transaction_id__"), {}},
 			{[]byte("search_path"), {}},
+			{[]byte("transaction_isolation"), []byte("repeatable read")},
+			{[]byte("transaction_read_only"), []byte("off")},
+			{[]byte("transaction_deferrable"), []byte("off")},
 		} {
 			backend.Send(&pgproto3.DataRow{Values: values})
 		}
-		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 4")})
+		backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 7")})
 		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'T'})
 		if err := backend.Flush(); err != nil {
 			serverErrors <- err
@@ -256,6 +260,13 @@ func TestEscapeSessionStateAcceptsEmptyTransactionIDAndGUC(t *testing.T) {
 	}
 	if value, ok := state.settings["search_path"]; !ok || value != "" {
 		t.Fatalf("empty search_path = %q, present=%v", value, ok)
+	}
+	for _, name := range []string{
+		"transaction_isolation", "transaction_read_only", "transaction_deferrable",
+	} {
+		if _, ok := state.settings[name]; ok {
+			t.Errorf("transaction-scoped setting %q was retained for mirroring", name)
+		}
 	}
 	if err := <-serverErrors; err != nil {
 		t.Fatalf("fake postgres server: %v", err)

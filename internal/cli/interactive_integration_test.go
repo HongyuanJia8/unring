@@ -93,6 +93,91 @@ func TestCommitFlagCannotOverrideSignaledChild(t *testing.T) {
 	}
 }
 
+func TestReadOnlySessionExitsSilently(t *testing.T) {
+	connectionString, backendDone := startReviewTestBackend(t, false)
+	t.Setenv("DATABASE_URL", connectionString)
+
+	binary := buildTestBinary(t)
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatalf("find true command: %v", err)
+	}
+	command := exec.Command(binary, "run", "--", truePath)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read-only unring run failed: %v\n%s", err, output)
+	}
+	if len(output) != 0 {
+		t.Fatalf("read-only unring run emitted output: %q", output)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
+func TestNonTerminalReviewUsesPlainTextWithoutANSI(t *testing.T) {
+	connectionString, backendDone := startReviewTestBackend(t, true)
+	t.Setenv("DATABASE_URL", connectionString)
+
+	binary := buildTestBinary(t)
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatalf("find true command: %v", err)
+	}
+	command := exec.Command(binary, "run", "--", truePath)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("non-terminal unring run failed: %v\n%s", err, output)
+	}
+	text := string(output)
+	if !strings.Contains(text, "SCHEMA CHANGES") ||
+		!strings.Contains(text, "No interactive terminal; defaulting to discard") {
+		t.Fatalf("plain-text fallback review missing:\n%s", text)
+	}
+	if strings.Contains(text, "\x1b[") || strings.Contains(text, "\x1b]") {
+		t.Fatalf("plain-text fallback contained ANSI escapes: %q", text)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
+func TestNamedAliasRunsCommand(t *testing.T) {
+	testCommandAlias(t, "claude")
+}
+
+func TestArbitraryPathAliasRunsCommand(t *testing.T) {
+	testCommandAlias(t, "unring-path-command")
+}
+
+func testCommandAlias(t *testing.T, name string) {
+	t.Helper()
+	connectionString, backendDone := startReviewTestBackend(t, true)
+	t.Setenv("DATABASE_URL", connectionString)
+	directory := t.TempDir()
+	child := filepath.Join(directory, name)
+	if err := os.WriteFile(child, []byte("#!/bin/sh\nprintf 'alias:%s:%s\\n' \"$1\" \"$2\"\n"), 0o755); err != nil {
+		t.Fatalf("write alias child: %v", err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, name, "--", "marker")
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("unring %s failed: %v\n%s", name, err, output)
+	}
+	if !strings.Contains(string(output), "alias:--:marker") {
+		t.Fatalf("unring %s did not run PATH command with alias arguments:\n%s", name, output)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
 func TestBuiltBinaryDiscardsStoppedInteractiveChild(t *testing.T) {
 	connectionString, backendDone := startInteractiveTestBackend(t)
 	t.Setenv("DATABASE_URL", connectionString)
@@ -251,6 +336,37 @@ func TestBuiltBinaryRunsInteractivePsql(t *testing.T) {
 	}
 }
 
+func TestApprovedIrreversibleActionAlwaysGetsReview(t *testing.T) {
+	psqlPath, err := exec.LookPath("psql")
+	if err != nil {
+		if os.Getenv("UNRING_REQUIRE_POSTGRES") == "1" {
+			t.Fatalf("irreversible review integration test requires psql: %v", err)
+		}
+		t.Skipf("irreversible review integration test skipped: psql is not available: %v", err)
+	}
+	connectionString := testpostgres.Start(t)
+	t.Setenv("DATABASE_URL", connectionString)
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--", psqlPath, "-X", "-P", "pager=off")
+	command.Env = os.Environ()
+	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 30, Cols: 120})
+	if err != nil {
+		t.Fatalf("start irreversible psql review under PTY: %v", err)
+	}
+	defer terminal.Close()
+
+	if _, err := terminal.Write([]byte("VACUUM;\ny\n\\q\nd\n")); err != nil {
+		t.Fatalf("write irreversible psql interaction: %v", err)
+	}
+	output := readInteractiveOutput(t, terminal, command)
+	if !strings.Contains(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") ||
+		!strings.Contains(output, "APPROVED IRREVERSIBLE ACTIONS") ||
+		!strings.Contains(output, "Session discarded.") {
+		t.Fatalf("approved irreversible action was not prominently reviewed:\n%s", output)
+	}
+}
+
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
 
@@ -321,6 +437,10 @@ func (buffer *synchronizedBuffer) String() string {
 }
 
 func startInteractiveTestBackend(t *testing.T) (string, <-chan error) {
+	return startReviewTestBackend(t, true)
+}
+
+func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-chan error) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -360,27 +480,71 @@ func startInteractiveTestBackend(t *testing.T) (string, <-chan error) {
 			return
 		}
 
-		for _, expected := range []struct {
-			sql    string
-			status byte
-		}{
-			{sql: "BEGIN", status: 'T'},
-			{sql: "ROLLBACK", status: 'I'},
-		} {
+		catalogQueries := 0
+		for {
 			message, err := backend.Receive()
 			if err != nil {
-				done <- fmt.Errorf("receive %s: %w", expected.sql, err)
+				done <- fmt.Errorf("receive backend query: %w", err)
 				return
 			}
 			query, ok := message.(*pgproto3.Query)
-			if !ok || query.String != expected.sql {
-				done <- fmt.Errorf("got backend message %#v, want query %s", message, expected.sql)
+			if !ok {
+				done <- fmt.Errorf("got backend message %T, want Query", message)
 				return
 			}
-			backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(expected.sql)})
-			backend.Send(&pgproto3.ReadyForQuery{TxStatus: expected.status})
+			status := byte('T')
+			tag := query.String
+			switch {
+			case query.String == "BEGIN":
+				tag = "BEGIN"
+			case query.String == "SHOW server_version_num":
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+					{Name: []byte("server_version_num")},
+				}})
+				backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("170000")}})
+				tag = "SHOW"
+			case query.String == "ROLLBACK":
+				status = 'I'
+			case strings.HasPrefix(query.String, "SAVEPOINT ") &&
+				strings.Contains(query.String, "SET LOCAL search_path = pg_catalog"):
+				tag = "SET"
+			case strings.HasPrefix(query.String, "ROLLBACK TO SAVEPOINT "):
+				tag = "RELEASE"
+			case strings.Contains(query.String, "pg_stat_get_xact_tuples_inserted"):
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+					{Name: []byte("oid")}, {Name: []byte("name")},
+					{Name: []byte("inserted")}, {Name: []byte("updated")},
+					{Name: []byte("deleted")},
+				}})
+				tag = "SELECT 0"
+			case strings.Contains(query.String, "FROM pg_locks l"):
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+					{Name: []byte("sequence")},
+				}})
+				tag = "SELECT 0"
+			case strings.Contains(query.String, "SELECT c.oid::text"):
+				catalogQueries++
+				backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+					{Name: []byte("oid")}, {Name: []byte("kind")},
+					{Name: []byte("name")}, {Name: []byte("fingerprint")},
+				}})
+				if reportSchemaChange && catalogQueries == 2 {
+					backend.Send(&pgproto3.DataRow{Values: [][]byte{
+						[]byte("12345"), []byte("schema"), []byte("review_change"), []byte("owner"),
+					}})
+				}
+				tag = "SELECT 0"
+			default:
+				done <- fmt.Errorf("unexpected backend query %q", query.String)
+				return
+			}
+			backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+			backend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
 			if err := backend.Flush(); err != nil {
-				done <- fmt.Errorf("send %s response: %w", expected.sql, err)
+				done <- fmt.Errorf("send response for %q: %w", query.String, err)
+				return
+			}
+			if query.String == "ROLLBACK" {
 				return
 			}
 		}

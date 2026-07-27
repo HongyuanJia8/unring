@@ -28,21 +28,6 @@ jobs:
           go-version: "1.26.x"
           cache: true
 
-      - name: Ensure PostgreSQL tools
-        shell: bash
-        run: |
-          if ! command -v initdb >/dev/null 2>&1 || ! command -v pg_ctl >/dev/null 2>&1; then
-            if [[ "$RUNNER_OS" == "Linux" ]]; then
-              sudo apt-get update
-              sudo apt-get install --yes postgresql
-              postgres_bin="$(find /usr/lib/postgresql -type f -name initdb -print -quit)"
-              echo "$(dirname "$postgres_bin")" >> "$GITHUB_PATH"
-            else
-              brew install postgresql@17
-              echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
-            fi
-          fi
-
       - name: Check formatting
         run: make fmt
 
@@ -53,4 +38,69 @@ jobs:
         run: make build
 
       - name: Test
+        run: make test
+
+  integration-linux:
+    env:
+      CGO_ENABLED: "1"
+      UNRING_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres:
+          - "14"
+          - "17"
+
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+
+      - name: Test against PostgreSQL ${{ matrix.postgres }}
+        run: make test-integration
+
+  integration-macos:
+    env:
+      CGO_ENABLED: "1"
+
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Install PostgreSQL 17
+        run: |
+          brew install postgresql@17
+          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+
+      - name: Test against PostgreSQL 17
         run: make test-integration
