@@ -62,6 +62,35 @@ func TestProxyInterceptsRecordsAndForwardsHTTPS(t *testing.T) {
 	}
 }
 
+func TestPrepareClientResponseAddsHTTP11Framing(t *testing.T) {
+	t.Parallel()
+
+	request := &http.Request{Method: http.MethodGet, ProtoMajor: 1, ProtoMinor: 1}
+	response := &http.Response{
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/2.0",
+		ProtoMajor:    2,
+		ContentLength: -1,
+		Body:          io.NopCloser(strings.NewReader("body")),
+		Uncompressed:  true,
+	}
+	if closeClient := prepareClientResponse(response, request); closeClient {
+		t.Fatal("keep-alive response unexpectedly requires a client close")
+	}
+	if response.Proto != "HTTP/1.1" ||
+		len(response.TransferEncoding) != 1 ||
+		response.TransferEncoding[0] != "chunked" ||
+		response.Uncompressed {
+		t.Fatalf("unknown-length response was not re-framed for HTTP/1.1: %#v", response)
+	}
+
+	request.Close = true
+	response.TransferEncoding = nil
+	if closeClient := prepareClientResponse(response, request); !closeClient || !response.Close {
+		t.Fatalf("connection-close response was not marked for closure: %#v", response)
+	}
+}
+
 func TestProxyReportsClientThatDoesNotTrustCA(t *testing.T) {
 	authority, err := EnsureAuthority(t.TempDir())
 	if err != nil {

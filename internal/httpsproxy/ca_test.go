@@ -2,6 +2,7 @@ package httpsproxy
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -21,6 +22,13 @@ func TestEnsureAuthorityCreatesPrivateReusableCA(t *testing.T) {
 	}
 	if got := keyInfo.Mode().Perm(); got != 0o600 {
 		t.Fatalf("private key mode = %04o, want 0600", got)
+	}
+	directoryInfo, err := os.Stat(filepath.Dir(first.PrivateKeyPath))
+	if err != nil {
+		t.Fatalf("stat CA directory: %v", err)
+	}
+	if got := directoryInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("CA directory mode = %04o, want 0700", got)
 	}
 
 	second, err := EnsureAuthority(stateDir)

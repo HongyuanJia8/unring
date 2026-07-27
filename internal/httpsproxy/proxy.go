@@ -301,8 +301,8 @@ func (proxy *Proxy) intercept(response http.ResponseWriter, hostport string) {
 			}
 			return
 		}
-		closeConnection := request.Close
-		if err := proxy.forward(tlsClient, request, hostport); err != nil {
+		closeConnection, err := proxy.forward(tlsClient, request, hostport)
+		if err != nil {
 			return
 		}
 		if closeConnection {
@@ -311,7 +311,11 @@ func (proxy *Proxy) intercept(response http.ResponseWriter, hostport string) {
 	}
 }
 
-func (proxy *Proxy) forward(client io.Writer, request *http.Request, hostport string) error {
+func (proxy *Proxy) forward(
+	client io.Writer,
+	request *http.Request,
+	hostport string,
+) (bool, error) {
 	started := time.Now().UTC()
 	record := RequestRecord{Method: request.Method, StartedAt: started}
 	request.RequestURI = ""
@@ -323,6 +327,9 @@ func (proxy *Proxy) forward(client io.Writer, request *http.Request, hostport st
 	}
 	record.URL = request.URL.String()
 	removeHopByHopHeaders(request.Header)
+	if request.Body != nil {
+		defer request.Body.Close()
+	}
 	response, err := proxy.transport.RoundTrip(request)
 	if err != nil {
 		record.Error = err.Error()
@@ -330,20 +337,60 @@ func (proxy *Proxy) forward(client io.Writer, request *http.Request, hostport st
 		proxy.recordRequest(record)
 		_, _ = io.WriteString(client,
 			"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-		return err
+		return true, err
 	}
 	defer response.Body.Close()
 	record.StatusCode = response.StatusCode
 	removeHopByHopHeaders(response.Header)
+	closeClient := prepareClientResponse(response, request)
 	if err := response.Write(client); err != nil {
 		record.Error = err.Error()
 		record.EndedAt = time.Now().UTC()
 		proxy.recordRequest(record)
-		return err
+		return true, err
 	}
 	record.EndedAt = time.Now().UTC()
 	proxy.recordRequest(record)
-	return nil
+	return closeClient, nil
+}
+
+// prepareClientResponse translates the upstream response into the HTTP/1.1
+// protocol negotiated inside the CONNECT tunnel. In particular, Go exposes
+// decompressed HTTP/2 responses with neither Content-Length nor a transfer
+// encoding. Response.Write would emit such a body without any delimiter, so
+// the client would wait forever for bytes that will never arrive.
+func prepareClientResponse(response *http.Response, request *http.Request) bool {
+	closeClient := request.Close || response.Close
+	response.Request = request
+	response.Proto = "HTTP/1.1"
+	response.ProtoMajor = 1
+	response.ProtoMinor = 1
+	response.Close = closeClient
+	response.Uncompressed = false
+
+	bodyExpected := request.Method != http.MethodHead &&
+		response.StatusCode >= 200 &&
+		response.StatusCode != http.StatusNoContent &&
+		response.StatusCode != http.StatusNotModified
+	switch {
+	case !bodyExpected:
+		response.TransferEncoding = nil
+	case len(response.Trailer) > 0:
+		response.ContentLength = -1
+		response.TransferEncoding = []string{"chunked"}
+	case response.ContentLength >= 0:
+		response.TransferEncoding = nil
+	case !closeClient:
+		// Re-frame the already decoded upstream body for HTTP/1.1. The
+		// terminating zero-size chunk tells a keep-alive client the response
+		// is complete without buffering the body to discover its length.
+		response.TransferEncoding = []string{"chunked"}
+	default:
+		// Response.Write emits Connection: close; intercept must honor that
+		// choice by returning closeClient to its caller.
+		response.TransferEncoding = nil
+	}
+	return closeClient
 }
 
 func removeHopByHopHeaders(header http.Header) {
