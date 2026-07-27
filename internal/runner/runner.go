@@ -118,6 +118,12 @@ func Run(options Options) Result {
 				Err:         errors.Join(childWaitError(err), supervisionErr),
 			}
 		case <-childChanges:
+			// handleApproval deliberately stops the child before reclaiming the
+			// terminal. Do not let the job-control watcher consume that stop
+			// notification and mistake it for a user-initiated Ctrl-Z.
+			if activeApproval != nil {
+				continue
+			}
 			stopped, err := childStopped(command.Process.Pid)
 			if err != nil && !errors.Is(err, syscall.ECHILD) {
 				supervisionErr = errors.Join(
