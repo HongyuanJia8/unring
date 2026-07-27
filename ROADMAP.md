@@ -50,8 +50,9 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 
 - [x] M2.1 `unring run -- <cmd>` — start proxies, spawn child, forward signals,
       propagate exit code
-- [x] M2.2 Environment injection for the child only (`PGHOST`/`PGPORT`/`DATABASE_URL`;
-      later `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`)
+- [x] M2.2 Environment injection for the child only (`PGHOST`/`PGPORT`/`DATABASE_URL`,
+      upper/lower-case HTTP and HTTPS proxy variables, `ALL_PROXY`, `FTP_PROXY`,
+      `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`)
 - [x] M2.3 `unring claude` and friends — thin aliases over `run`
 - [x] M2.4 Read-only sessions exit silently: no prompt when nothing was written
 
@@ -64,14 +65,16 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 
 ## M4 — Audit log
 
-- [ ] M4.1 Structured per-session log of what really happened
-- [ ] M4.2 `unring log` to inspect past sessions
+- [x] M4.1 Structured per-session log of what really happened
+- [x] M4.2 `unring log` to inspect past sessions
 
 ## M5 — HTTPS proxy
 
-- [ ] M5.1 Local CA generation, stored per-user, injected into the child process only
-- [ ] M5.2 MITM proxy: intercept, classify, stage or forward
-- [ ] M5.3 CONNECT passthrough for hosts we cannot MITM, reported as un-intercepted
+- [x] M5.1 Local CA generation, stored per-user, injected into the child process only
+- [~] M5.2 MITM proxy: interception, recording, and forwarding are implemented;
+      proxy-aware plain HTTP fails closed and protocol upgrades are explicitly
+      tunneled and reported; classification and staging remain for M6
+- [x] M5.3 CONNECT passthrough for hosts we cannot MITM, reported as un-intercepted
 
 ## M6 — Adapters
 

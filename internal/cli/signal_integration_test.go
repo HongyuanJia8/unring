@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/HongyuanJia8/unring/internal/audit"
 	testpostgres "github.com/HongyuanJia8/unring/internal/testsupport/postgres"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -23,6 +24,7 @@ func TestSignalForcesRollback(t *testing.T) {
 	t.Setenv("UNRING_SIGNAL_HELPER", "1")
 	t.Setenv("UNRING_SIGNAL_TABLE", table)
 	t.Setenv("UNRING_SIGNAL_MARKER", marker)
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -75,6 +77,18 @@ func TestSignalForcesRollback(t *testing.T) {
 	if got := signalScalar(t, ctx, direct,
 		fmt.Sprintf("SELECT to_regclass('public.%s') IS NULL", table)); got != "t" {
 		t.Fatalf("signal path committed instead of rolling back: %s", got)
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatalf("open signal audit store: %v", err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("signal audit records = %#v, %v", records, err)
+	}
+	if records[0].Outcome != "discarded" || records[0].EndedAt.IsZero() ||
+		len(records[0].Postgres.Changes.Schema) == 0 {
+		t.Fatalf("signal audit record is incomplete: %#v", records[0])
 	}
 
 	exitCode := Main([]string{
