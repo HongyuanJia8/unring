@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
 
+	"github.com/HongyuanJia8/unring/internal/httpsproxy"
 	"github.com/HongyuanJia8/unring/internal/pgproxy"
 )
 
@@ -24,6 +25,7 @@ type reviewItem struct {
 
 type reviewModel struct {
 	summary  pgproxy.Summary
+	https    httpsproxy.Summary
 	items    []reviewItem
 	expanded map[int]bool
 	cursor   int
@@ -34,8 +36,12 @@ type reviewModel struct {
 }
 
 func newReviewModel(summary pgproxy.Summary) reviewModel {
+	return newReviewModelWithHTTPS(summary, httpsproxy.Summary{Sealed: true})
+}
+
+func newReviewModelWithHTTPS(summary pgproxy.Summary, httpsSummary httpsproxy.Summary) reviewModel {
 	model := reviewModel{
-		summary: summary, expanded: make(map[int]bool), height: 24,
+		summary: summary, https: httpsSummary, expanded: make(map[int]bool), height: 24,
 		decision: pgproxy.DecisionRollback,
 	}
 	for _, item := range summary.Unintercepted {
@@ -46,6 +52,13 @@ func newReviewModel(summary pgproxy.Summary) reviewModel {
 		model.items = append(model.items, reviewItem{
 			section: "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!",
 			title:   title, SQL: item.Statement, detail: item.Detail,
+		})
+	}
+	for _, item := range httpsSummary.Unintercepted {
+		model.items = append(model.items, reviewItem{
+			section: "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!",
+			title:   item.Host,
+			detail:  item.Detail,
 		})
 	}
 	for _, effect := range summary.NonTransactional {
@@ -76,6 +89,22 @@ func newReviewModel(summary pgproxy.Summary) reviewModel {
 			title:   fmt.Sprintf("[%s] %s", status, compactSQL(action.SQL)),
 			SQL:     action.SQL, affected: affectedRows(action.CommandTags), err: action.Error,
 			detail: detail,
+		})
+	}
+	for _, request := range httpsSummary.Requests {
+		status := "forwarded"
+		if request.StatusCode != 0 {
+			status = fmt.Sprintf("forwarded: HTTP %d", request.StatusCode)
+		}
+		if request.Error != "" {
+			status = "forwarding failed"
+		}
+		model.items = append(model.items, reviewItem{
+			section: "HTTPS REQUESTS — ALREADY FORWARDED",
+			title:   fmt.Sprintf("[%s] %s %s", status, request.Method, request.URL),
+			err:     request.Error,
+			detail: "This request was intercepted and forwarded. " +
+				"The final commit/discard decision cannot undo an external effect.",
 		})
 	}
 	return model
@@ -147,16 +176,17 @@ func (model reviewModel) View() string {
 	var output strings.Builder
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
-	if !model.summary.FullyReversible {
+	if !model.summary.FullyReversible || len(model.https.Requests) > 0 {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
 		output.WriteString("Unring cannot guarantee every recorded effect can be undone by discarding.\n")
 		output.WriteString("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 	}
-	if len(model.summary.Unintercepted) > 0 {
+	uninterceptedCount := len(model.summary.Unintercepted) + len(model.https.Unintercepted)
+	if uninterceptedCount > 0 {
 		output.WriteString("\n================================================================\n")
 		fmt.Fprintf(&output, "!!! INTERCEPTION/COVERAGE WARNING: %d UNCLASSIFIED ITEM(S) !!!\n",
-			len(model.summary.Unintercepted))
+			uninterceptedCount)
 		output.WriteString("Coverage is incomplete. Review these items before making any decision.\n")
 		output.WriteString("================================================================\n")
 	}
@@ -226,6 +256,7 @@ func reviewDecisionWithSignal(
 	output io.Writer,
 	signals <-chan os.Signal,
 	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
 ) (pgproxy.Decision, bool, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -241,7 +272,8 @@ func reviewDecisionWithSignal(
 	}()
 
 	program := tea.NewProgram(
-		newReviewModel(summary), tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output),
+		newReviewModelWithHTTPS(summary, httpsSummary),
+		tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output),
 	)
 	final, err := program.Run()
 	close(done)

@@ -6,9 +6,12 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/HongyuanJia8/unring/internal/audit"
+	"github.com/HongyuanJia8/unring/internal/httpsproxy"
 	"github.com/HongyuanJia8/unring/internal/pgproxy"
 )
 
@@ -91,6 +94,96 @@ func TestReviewModelKeepsUninterceptedWarningVisibleWhenSectionIsOffscreen(t *te
 	if !strings.Contains(view, "INTERCEPTION/COVERAGE WARNING") ||
 		!strings.Contains(view, "1 UNCLASSIFIED ITEM") {
 		t.Fatalf("off-screen unclassified traffic lost its persistent warning:\n%s", view)
+	}
+}
+
+func TestReviewReportsForwardedAndUninterceptedHTTPSSeparately(t *testing.T) {
+	t.Parallel()
+	model := newReviewModelWithHTTPS(pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}, httpsproxy.Summary{
+		Sealed: true,
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "POST", URL: "https://api.example.test/messages", StatusCode: 201,
+		}},
+		Unintercepted: []httpsproxy.UninterceptedItem{{
+			Host:   "api.passthrough.test:443",
+			Detail: "CONNECT tunnel was passed through without TLS interception",
+		}},
+	})
+	view := model.View()
+	for _, want := range []string{
+		"WARNING: THIS SESSION IS NOT FULLY REVERSIBLE",
+		"HTTPS REQUESTS — ALREADY FORWARDED",
+		"POST https://api.example.test/messages",
+		"INTERCEPTION/COVERAGE WARNING",
+		"api.passthrough.test:443",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("HTTPS review missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestLogCommandListsAndShowsStructuredSession(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatalf("OpenStore() error: %v", err)
+	}
+	session, err := store.Begin([]string{"agent", "--fix"}, time.Now())
+	if err != nil {
+		t.Fatalf("Begin() error: %v", err)
+	}
+	err = session.Update(func(record *audit.Record) {
+		record.EndedAt = time.Now().UTC()
+		record.Decision = "discard"
+		record.Outcome = "discarded"
+		record.Postgres = pgproxy.Summary{
+			Sealed: true, FullyReversible: true,
+			Changes: pgproxy.ChangeSummary{
+				Complete: true,
+				Rows:     []pgproxy.RowChange{{Table: "public.items", Updated: 3}},
+			},
+		}
+		record.HTTPS = httpsproxy.Summary{
+			Sealed: true,
+			Requests: []httpsproxy.RequestRecord{{
+				Method: "POST", URL: "https://api.example.test/events", StatusCode: 202,
+			}},
+			Unintercepted: []httpsproxy.UninterceptedItem{{
+				Host:   "go-client.example.test:443",
+				Detail: "TLS handshake failed; the client may not trust unring's per-process CA",
+			}},
+		}
+	})
+	if err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	id := session.Snapshot().ID
+
+	var list bytes.Buffer
+	var stderr bytes.Buffer
+	if exitCode := Main([]string{"log"}, strings.NewReader(""), &list, &stderr); exitCode != 0 {
+		t.Fatalf("log list exit = %d; stderr: %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(list.String(), id) || !strings.Contains(list.String(), "agent --fix") {
+		t.Fatalf("log list omitted session:\n%s", list.String())
+	}
+
+	var detail bytes.Buffer
+	if exitCode := Main(
+		[]string{"log", id[:20]}, strings.NewReader(""), &detail, &stderr,
+	); exitCode != 0 {
+		t.Fatalf("log detail exit = %d; stderr: %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(detail.String(), "public.items: 0 inserted, 3 updated") ||
+		!strings.Contains(detail.String(), "Outcome:  discarded") ||
+		!strings.Contains(detail.String(), "POST https://api.example.test/events") ||
+		!strings.Contains(detail.String(), "go-client.example.test:443") {
+		t.Fatalf("log detail omitted structured changes:\n%s", detail.String())
 	}
 }
 

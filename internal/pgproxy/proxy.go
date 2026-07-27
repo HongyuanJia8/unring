@@ -41,10 +41,10 @@ const (
 
 // QueryRecord is a compact account of one client query batch.
 type QueryRecord struct {
-	SQL         string
-	CommandTags []string
-	Failed      bool
-	Error       string
+	SQL         string   `json:"sql"`
+	CommandTags []string `json:"command_tags,omitempty"`
+	Failed      bool     `json:"failed"`
+	Error       string   `json:"error,omitempty"`
 }
 
 // IrreversibleAction records a statement dispatched on a separate autocommit
@@ -52,51 +52,51 @@ type QueryRecord struct {
 // statement may have produced external or partially committed effects. A
 // decline or pre-execution refusal never creates this record.
 type IrreversibleAction struct {
-	SQL         string
-	CommandTags []string
-	Failed      bool
-	Error       string
+	SQL         string   `json:"sql"`
+	CommandTags []string `json:"command_tags,omitempty"`
+	Failed      bool     `json:"failed"`
+	Error       string   `json:"error,omitempty"`
 }
 
 // RowChange reports physical tuple operations still staged by the shared
 // transaction. PostgreSQL supplies per-relation counters, including writes
 // performed by triggers; unring maintains the savepoint-aware staged view.
 type RowChange struct {
-	Table    string
-	Inserted int64
-	Updated  int64
-	Deleted  int64
+	Table    string `json:"table"`
+	Inserted int64  `json:"inserted"`
+	Updated  int64  `json:"updated"`
+	Deleted  int64  `json:"deleted"`
 }
 
 // SchemaChange is one catalog change staged in the shared transaction.
 type SchemaChange struct {
-	Action string
-	Kind   string
-	Object string
+	Action string `json:"action"`
+	Kind   string `json:"kind"`
+	Object string `json:"object"`
 }
 
 // ChangeSummary is frozen by Seal after all client traffic has stopped.
 // Complete is false when PostgreSQL could not provide an authoritative view;
 // callers must surface Error rather than treating an empty summary as no work.
 type ChangeSummary struct {
-	Rows     []RowChange
-	Schema   []SchemaChange
-	Complete bool
-	Error    string
+	Rows     []RowChange    `json:"rows"`
+	Schema   []SchemaChange `json:"schema"`
+	Complete bool           `json:"complete"`
+	Error    string         `json:"error,omitempty"`
 }
 
 // NonTransactionalEffect records backend-observed state that PostgreSQL does
 // not roll back with the shared transaction (currently sequence advancement).
 type NonTransactionalEffect struct {
-	Detail string
+	Detail string `json:"detail"`
 }
 
 // UninterceptedItem describes traffic unring could not classify or intercept.
 // It is deliberately separate from QueryRecord so review UIs cannot blend it
 // into the ordinary statement list.
 type UninterceptedItem struct {
-	Statement string
-	Detail    string
+	Statement string `json:"statement,omitempty"`
+	Detail    string `json:"detail"`
 }
 
 // ApprovalRequest describes an action that cannot be included in unring's
@@ -117,16 +117,16 @@ type Options struct {
 
 // Summary is a point-in-time copy of the session activity.
 type Summary struct {
-	Connections int
-	Queries     []QueryRecord
+	Connections int           `json:"connections"`
+	Queries     []QueryRecord `json:"queries"`
 	// FullyReversible is false exactly when IrreversibleActions is non-empty.
 	// Other coverage and accounting warnings are represented separately.
-	FullyReversible     bool
-	IrreversibleActions []IrreversibleAction
-	Changes             ChangeSummary
-	Unintercepted       []UninterceptedItem
-	NonTransactional    []NonTransactionalEffect
-	Sealed              bool
+	FullyReversible     bool                     `json:"fully_reversible"`
+	IrreversibleActions []IrreversibleAction     `json:"irreversible_actions"`
+	Changes             ChangeSummary            `json:"changes"`
+	Unintercepted       []UninterceptedItem      `json:"unintercepted"`
+	NonTransactional    []NonTransactionalEffect `json:"non_transactional_effects"`
+	Sealed              bool                     `json:"sealed"`
 }
 
 // HasReviewableActivity reports whether the sealed session needs a decision.

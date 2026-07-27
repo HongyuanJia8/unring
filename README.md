@@ -8,10 +8,10 @@ what it did and what it is about to do, then you decide: **commit** or **discard
 
 The name comes from *you can't unring a bell*. That is the whole point: now you can.
 
-> **Status: first Postgres vertical slice.** The shared-transaction `run` command
-> works with PostgreSQL's simple query protocol. Extended-query clients and other
-> side-effect types are not supported yet. See [ROADMAP.md](ROADMAP.md) for what is
-> built and what is next.
+> **Status: Postgres transactions plus HTTPS interception and audit.** Database
+> activity is transactional. HTTPS requests are intercepted, recorded, and forwarded
+> immediately in this slice; classification, staging, and undo are not implemented
+> yet. See [ROADMAP.md](ROADMAP.md) for what is built and what is next.
 
 ## Try the Postgres slice
 
@@ -32,12 +32,19 @@ PostgreSQL 14 is the minimum supported version. Older servers are rejected at st
 with an explicit version error before any client traffic is accepted; CI exercises
 the integration suite against PostgreSQL 14 and 17 explicitly.
 
-`unring` opens one real transaction on the configured database, binds a proxy to an
-ephemeral loopback port, and injects `DATABASE_URL` plus the standard `PG*` connection
-variables into the child process only. Every client connection opened by that child
-uses the same backend transaction; individual protocol exchanges are serialized
+`unring` opens one real transaction on the configured database and binds both the
+Postgres and HTTPS proxies to ephemeral loopback ports. It injects the connection
+variables into the child process only. Every Postgres client connection opened by that
+child uses the same backend transaction; individual protocol exchanges are serialized
 because PostgreSQL has only one backend connection. Closing one client connection
 does not close the transaction.
+
+For HTTPS, the child receives `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`,
+and `CURL_CA_BUNDLE`. Node.js, curl, and Python's standard library therefore trust
+unring's local CA without changing trust for the user's shell or any other process.
+Every successfully intercepted HTTPS request is forwarded in this slice and is shown
+under **HTTPS REQUESTS — INTERCEPTED AND ALREADY FORWARDED** in the review. A final
+discard cannot undo such a request; the warning is deliberate.
 
 After the child exits, `unring` prints the simple-query batches and asks whether to
 commit or discard. Automation must choose explicitly:
@@ -61,6 +68,35 @@ real server and fail instead of skipping:
 ```sh
 make test-integration
 ```
+
+## Audit log
+
+Every run creates a structured JSON audit record before the child starts and updates
+it atomically as the session progresses. It includes start and end times, the requested
+decision and confirmed outcome, per-table row changes, schema changes, irreversible
+actions approved or declined, intercepted HTTPS requests, and anything unring saw but
+could not intercept. Signal termination, a recoverable unring panic, and backend loss
+all retain a record; an unknown database outcome is recorded as `unknown`, never as a
+successful discard.
+
+```sh
+unring log                    # list past sessions, newest first
+unring log <session-id>       # human-readable detail; an unambiguous prefix works
+unring log --json <session-id>
+```
+
+The per-user state root is `$XDG_STATE_HOME/unring` when `XDG_STATE_HOME` is set,
+otherwise the platform user-config directory plus `unring` (on macOS,
+`~/Library/Application Support/unring`). `UNRING_STATE_DIR` is an explicit override
+for isolated installations and tests.
+
+The CA certificate is stored at `<state-root>/ca/ca.pem`; its private key is
+`<state-root>/ca/ca-key.pem`, inside a mode-`0700` directory with mode-`0600`
+permissions. The CA is generated once and reused. The private key is never injected or
+logged—only the certificate path is passed to the child. Unring never installs the CA
+in the system trust store or macOS keychain and never modifies a shell profile.
+Keeping it in private per-user state gives wrapped children a stable CA across runs
+without broadening trust for any process unring did not start.
 
 ## How it works
 
@@ -93,6 +129,22 @@ ability to make any of it permanent without you saying so.
 
 ## Honest limits
 
+- HTTPS classification, staging, and compensation are not implemented yet. Every
+  HTTPS request that unring successfully intercepts is forwarded immediately, so an
+  external effect may already have happened when the review appears.
+- Go binaries on macOS, including `gh`, do not honor `SSL_CERT_FILE`; Go's
+  `crypto/x509` uses the system keychain. Unring deliberately does not install its CA
+  there. Such a client normally fails the MITM TLS handshake, and unring reports the
+  host in the un-intercepted section and audit log. This is not silent coverage.
+  The planned `gh` PATH shim is M7.
+- A host can be deliberately passed through with
+  `UNRING_HTTPS_PASSTHROUGH=host1,host2`. The CONNECT tunnel still uses the loopback
+  proxy, but unring cannot see its requests or bodies; the host is therefore shown
+  prominently as un-intercepted in both review and audit.
+- Only HTTPS proxy traffic is covered. A child that overrides proxy settings, uses a
+  tool-specific bypass, or opens a direct connection can evade interception. Unring
+  clears inherited `NO_PROXY` for the child to avoid an invisible exclusion list, but
+  it is an accident guard, not a hostile-process sandbox.
 - Sequences do not roll back — discarded runs still leave gaps in auto-increment IDs.
 - PostgreSQL does not expose authoritative per-table row counts for `TRUNCATE`.
   unring reports that summary as `UNKNOWN` and forces the session to discard, so a
