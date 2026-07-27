@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +186,40 @@ func TestLogCommandListsAndShowsStructuredSession(t *testing.T) {
 		!strings.Contains(detail.String(), "POST https://api.example.test/events") ||
 		!strings.Contains(detail.String(), "go-client.example.test:443") {
 		t.Fatalf("log detail omitted structured changes:\n%s", detail.String())
+	}
+}
+
+func TestLogCommandListsGoodSessionsAlongsideCorruptRecordWarning(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatalf("OpenStore() error: %v", err)
+	}
+	session, err := store.Begin([]string{"agent", "--recover-history"}, time.Now())
+	if err != nil {
+		t.Fatalf("Begin() error: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(stateDir, "logs", "copied-from-the-future.json"),
+		[]byte(`{"version":999,"id":"future"}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write incompatible audit record: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := Main([]string{"log"}, strings.NewReader(""), &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("log list exit = %d, want 0; stderr: %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), session.Snapshot().ID) {
+		t.Fatalf("log list lost readable history:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "warning") ||
+		!strings.Contains(stderr.String(), "copied-from-the-future.json") {
+		t.Fatalf("log list did not report skipped record:\n%s", stderr.String())
 	}
 }
 

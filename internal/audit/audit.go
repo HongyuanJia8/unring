@@ -180,27 +180,30 @@ func (s *Store) Save(record Record) error {
 	return nil
 }
 
-// List returns all readable records, newest first.
+// List returns all readable records, newest first. Its error joins warnings for
+// records that were skipped; callers can still use the non-nil result.
 func (s *Store) List() ([]Record, error) {
 	entries, err := os.ReadDir(s.logDir)
 	if err != nil {
 		return nil, fmt.Errorf("list audit records: %w", err)
 	}
 	records := make([]Record, 0, len(entries))
+	var unreadable []error
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		record, err := s.loadPath(filepath.Join(s.logDir, entry.Name()))
 		if err != nil {
-			return nil, err
+			unreadable = append(unreadable, err)
+			continue
 		}
 		records = append(records, record)
 	}
 	sort.Slice(records, func(i, j int) bool {
 		return records[i].StartedAt.After(records[j].StartedAt)
 	})
-	return records, nil
+	return records, errors.Join(unreadable...)
 }
 
 // Load finds an exact session id or an unambiguous id prefix.
@@ -240,6 +243,12 @@ func (s *Store) loadPath(path string) (Record, error) {
 	var record Record
 	if err := json.Unmarshal(data, &record); err != nil {
 		return Record{}, fmt.Errorf("decode audit record %s: %w", filepath.Base(path), err)
+	}
+	if record.Version != recordVersion {
+		return Record{}, fmt.Errorf(
+			"decode audit record %s: unsupported version %d (want %d)",
+			filepath.Base(path), record.Version, recordVersion,
+		)
 	}
 	return record, nil
 }

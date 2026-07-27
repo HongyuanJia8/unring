@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,7 @@ type Proxy struct {
 	connectionsMu sync.Mutex
 	connections   map[net.Conn]struct{}
 	connectionWG  sync.WaitGroup
+	handlerWG     sync.WaitGroup
 	sealing       bool
 
 	summaryMu sync.Mutex
@@ -87,7 +89,7 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 	transport := options.Transport
 	if transport == nil {
 		transport = &http.Transport{
-			Proxy:                 nil,
+			Proxy:                 http.ProxyFromEnvironment,
 			ForceAttemptHTTP2:     false,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
@@ -144,6 +146,7 @@ func (proxy *Proxy) Seal(ctx context.Context) error {
 
 		done := make(chan struct{})
 		go func() {
+			proxy.handlerWG.Wait()
 			proxy.connectionWG.Wait()
 			close(done)
 		}()
@@ -173,10 +176,17 @@ func (proxy *Proxy) Close() error {
 }
 
 func (proxy *Proxy) serveHTTP(response http.ResponseWriter, request *http.Request) {
+	finish, accepted := proxy.beginHandler()
+	if !accepted {
+		return
+	}
+	defer finish()
 	if request.Method != http.MethodConnect {
-		http.Error(response, "unring HTTPS proxy accepts CONNECT tunnels only", http.StatusBadRequest)
 		proxy.recordUnintercepted(request.Host,
-			"non-CONNECT traffic reached the HTTPS-only proxy and was not intercepted")
+			"plain HTTP reached unring and was blocked; it was not forwarded or intercepted")
+		http.Error(response,
+			"unring blocked plain HTTP because this slice cannot safely intercept it",
+			http.StatusBadRequest)
 		return
 	}
 	hostport := request.Host
@@ -193,6 +203,16 @@ func (proxy *Proxy) serveHTTP(response http.ResponseWriter, request *http.Reques
 	proxy.intercept(response, hostport)
 }
 
+func (proxy *Proxy) beginHandler() (func(), bool) {
+	proxy.connectionsMu.Lock()
+	defer proxy.connectionsMu.Unlock()
+	if proxy.sealing {
+		return func() {}, false
+	}
+	proxy.handlerWG.Add(1)
+	return proxy.handlerWG.Done, true
+}
+
 func (proxy *Proxy) track(connection net.Conn) (func(), bool) {
 	proxy.connectionsMu.Lock()
 	if proxy.sealing {
@@ -201,8 +221,8 @@ func (proxy *Proxy) track(connection net.Conn) (func(), bool) {
 		return func() {}, false
 	}
 	proxy.connections[connection] = struct{}{}
-	proxy.connectionsMu.Unlock()
 	proxy.connectionWG.Add(1)
+	proxy.connectionsMu.Unlock()
 	return func() {
 		proxy.connectionsMu.Lock()
 		delete(proxy.connections, connection)
@@ -225,8 +245,7 @@ func (proxy *Proxy) tunnel(response http.ResponseWriter, hostport string) {
 	defer cleanup()
 	dialContext, cancel := context.WithTimeout(proxy.runCtx, 10*time.Second)
 	defer cancel()
-	var dialer net.Dialer
-	upstream, err := dialer.DialContext(dialContext, "tcp", hostport)
+	upstream, err := dialCONNECTTarget(dialContext, hostport)
 	if err != nil {
 		proxy.recordUnintercepted(hostport, "CONNECT tunnel was passed through but dialing failed: "+err.Error())
 		_, _ = buffered.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -245,13 +264,105 @@ func (proxy *Proxy) tunnel(response http.ResponseWriter, hostport string) {
 	copyDone := make(chan struct{}, 1)
 	go func() {
 		_, _ = io.Copy(upstream, client)
-		if tcp, ok := upstream.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
+		if closeWriter, ok := upstream.(interface{ CloseWrite() error }); ok {
+			_ = closeWriter.CloseWrite()
 		}
 		copyDone <- struct{}{}
 	}()
 	_, _ = io.Copy(client, upstream)
 	<-copyDone
+}
+
+func dialCONNECTTarget(ctx context.Context, hostport string) (net.Conn, error) {
+	target := &http.Request{URL: &url.URL{Scheme: "https", Host: hostport}}
+	upstreamProxy, err := http.ProxyFromEnvironment(target)
+	if err != nil {
+		return nil, fmt.Errorf("resolve inherited upstream proxy: %w", err)
+	}
+	if upstreamProxy == nil {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", hostport)
+	}
+	if upstreamProxy.Scheme != "http" && upstreamProxy.Scheme != "https" {
+		return nil, fmt.Errorf(
+			"inherited upstream proxy scheme %q is unsupported for CONNECT passthrough",
+			upstreamProxy.Scheme,
+		)
+	}
+	proxyAddress := upstreamProxy.Host
+	if _, _, err := net.SplitHostPort(proxyAddress); err != nil {
+		defaultPort := "80"
+		if upstreamProxy.Scheme == "https" {
+			defaultPort = "443"
+		}
+		proxyAddress = net.JoinHostPort(upstreamProxy.Hostname(), defaultPort)
+	}
+	var dialer net.Dialer
+	connection, err := dialer.DialContext(ctx, "tcp", proxyAddress)
+	if err != nil {
+		return nil, fmt.Errorf("dial inherited upstream proxy: %w", err)
+	}
+	closeConnection := true
+	defer func() {
+		if closeConnection {
+			_ = connection.Close()
+		}
+	}()
+	if upstreamProxy.Scheme == "https" {
+		secure := tls.Client(connection, &tls.Config{
+			ServerName: upstreamProxy.Hostname(), MinVersion: tls.VersionTLS12,
+		})
+		if err := secure.HandshakeContext(ctx); err != nil {
+			return nil, fmt.Errorf("handshake with inherited upstream proxy: %w", err)
+		}
+		connection = secure
+	}
+	connectRequest := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: hostport},
+		Host:   hostport,
+		Header: make(http.Header),
+	}
+	if upstreamProxy.User != nil {
+		password, _ := upstreamProxy.User.Password()
+		connectRequest.SetBasicAuth(upstreamProxy.User.Username(), password)
+		connectRequest.Header.Set(
+			"Proxy-Authorization", connectRequest.Header.Get("Authorization"),
+		)
+		connectRequest.Header.Del("Authorization")
+	}
+	if err := connectRequest.Write(connection); err != nil {
+		return nil, fmt.Errorf("write CONNECT to inherited upstream proxy: %w", err)
+	}
+	reader := bufio.NewReader(connection)
+	response, err := http.ReadResponse(reader, connectRequest)
+	if err != nil {
+		return nil, fmt.Errorf("read CONNECT from inherited upstream proxy: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(
+			"inherited upstream proxy refused CONNECT with HTTP %d",
+			response.StatusCode,
+		)
+	}
+	closeConnection = false
+	return &bufferedConn{Conn: connection, reader: reader}, nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (connection *bufferedConn) Read(buffer []byte) (int, error) {
+	return connection.reader.Read(buffer)
+}
+
+func (connection *bufferedConn) CloseWrite() error {
+	if closeWriter, ok := connection.Conn.(interface{ CloseWrite() error }); ok {
+		return closeWriter.CloseWrite()
+	}
+	return nil
 }
 
 func (proxy *Proxy) intercept(response http.ResponseWriter, hostport string) {
@@ -301,7 +412,7 @@ func (proxy *Proxy) intercept(response http.ResponseWriter, hostport string) {
 			}
 			return
 		}
-		closeConnection, err := proxy.forward(tlsClient, request, hostport)
+		closeConnection, err := proxy.forward(tlsClient, reader, request, hostport)
 		if err != nil {
 			return
 		}
@@ -312,7 +423,8 @@ func (proxy *Proxy) intercept(response http.ResponseWriter, hostport string) {
 }
 
 func (proxy *Proxy) forward(
-	client io.Writer,
+	client io.ReadWriteCloser,
+	clientReader io.Reader,
 	request *http.Request,
 	hostport string,
 ) (bool, error) {
@@ -326,7 +438,12 @@ func (proxy *Proxy) forward(
 		request.Host = hostport
 	}
 	record.URL = request.URL.String()
-	removeHopByHopHeaders(request.Header)
+	requestedUpgrade := protocolUpgrade(request.Header)
+	if requestedUpgrade == "" {
+		removeHopByHopHeaders(request.Header)
+	} else {
+		prepareUpgradeHeaders(request.Header, requestedUpgrade)
+	}
 	if request.Body != nil {
 		defer request.Body.Close()
 	}
@@ -340,6 +457,17 @@ func (proxy *Proxy) forward(
 		return true, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusSwitchingProtocols {
+		return proxy.forwardUpgrade(
+			client, clientReader, request, response, hostport, requestedUpgrade,
+		)
+	}
+	if requestedUpgrade != "" {
+		// A proper upgrade client will not send frames after a non-101
+		// response. Close anyway so a broken client cannot feed binary data
+		// into the next HTTP request decoder.
+		request.Close = true
+	}
 	record.StatusCode = response.StatusCode
 	removeHopByHopHeaders(response.Header)
 	closeClient := prepareClientResponse(response, request)
@@ -352,6 +480,82 @@ func (proxy *Proxy) forward(
 	record.EndedAt = time.Now().UTC()
 	proxy.recordRequest(record)
 	return closeClient, nil
+}
+
+func (proxy *Proxy) forwardUpgrade(
+	client io.ReadWriteCloser,
+	clientReader io.Reader,
+	request *http.Request,
+	response *http.Response,
+	hostport string,
+	requestedUpgrade string,
+) (bool, error) {
+	responseUpgrade := protocolUpgrade(response.Header)
+	if requestedUpgrade == "" || responseUpgrade == "" ||
+		!strings.EqualFold(requestedUpgrade, responseUpgrade) {
+		proxy.recordUnintercepted(hostport,
+			"an invalid or unsolicited HTTP protocol upgrade was blocked")
+		_, _ = io.WriteString(client,
+			"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return true, errors.New("block invalid HTTP protocol upgrade")
+	}
+	upstream, ok := response.Body.(io.ReadWriteCloser)
+	if !ok {
+		proxy.recordUnintercepted(hostport,
+			"HTTP protocol upgrade could not be tunneled because the upstream was not bidirectional")
+		_, _ = io.WriteString(client,
+			"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return true, errors.New("upstream protocol upgrade is not bidirectional")
+	}
+
+	handshake := new(http.Response)
+	*handshake = *response
+	handshake.Header = response.Header.Clone()
+	handshake.Body = http.NoBody
+	handshake.ContentLength = 0
+	handshake.TransferEncoding = nil
+	handshake.Request = request
+	handshake.Proto = "HTTP/1.1"
+	handshake.ProtoMajor = 1
+	handshake.ProtoMinor = 1
+	prepareUpgradeHeaders(handshake.Header, responseUpgrade)
+	if err := handshake.Write(client); err != nil {
+		return true, fmt.Errorf("write HTTP protocol upgrade response: %w", err)
+	}
+
+	proxy.recordUnintercepted(hostport, fmt.Sprintf(
+		"HTTP protocol upgrade to %q was tunneled without payload interception",
+		responseUpgrade,
+	))
+	return true, relayUpgrade(client, clientReader, upstream)
+}
+
+func relayUpgrade(
+	client io.ReadWriteCloser,
+	clientReader io.Reader,
+	upstream io.ReadWriteCloser,
+) error {
+	results := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(upstream, clientReader)
+		results <- err
+	}()
+	go func() {
+		_, err := io.Copy(client, upstream)
+		results <- err
+	}()
+	first := <-results
+	_ = upstream.Close()
+	_ = client.Close()
+	second := <-results
+	return errors.Join(ignoreClosedConnection(first), ignoreClosedConnection(second))
+}
+
+func ignoreClosedConnection(err error) error {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 // prepareClientResponse translates the upstream response into the HTTP/1.1
@@ -405,6 +609,43 @@ func removeHopByHopHeaders(header http.Header) {
 	} {
 		header.Del(name)
 	}
+}
+
+func protocolUpgrade(header http.Header) string {
+	if !headerHasToken(header, "Connection", "upgrade") {
+		return ""
+	}
+	return strings.TrimSpace(header.Get("Upgrade"))
+}
+
+func prepareUpgradeHeaders(header http.Header, upgrade string) {
+	for _, value := range header.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.TrimSpace(name)
+			if !strings.EqualFold(name, "upgrade") {
+				header.Del(name)
+			}
+		}
+	}
+	for _, name := range []string{
+		"Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+		"Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
+	} {
+		header.Del(name)
+	}
+	header.Set("Connection", "Upgrade")
+	header.Set("Upgrade", upgrade)
+}
+
+func headerHasToken(header http.Header, name, token string) bool {
+	for _, value := range header.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hijack(response http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {

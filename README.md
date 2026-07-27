@@ -39,12 +39,19 @@ child uses the same backend transaction; individual protocol exchanges are seria
 because PostgreSQL has only one backend connection. Closing one client connection
 does not close the transaction.
 
-For HTTPS, the child receives `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`,
-and `CURL_CA_BUNDLE`. Node.js, curl, and Python's standard library therefore trust
-unring's local CA without changing trust for the user's shell or any other process.
+For network clients, the child receives upper- and lower-case HTTP/HTTPS proxy
+variables, plus `ALL_PROXY` and `FTP_PROXY`. Existing
+`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, and `CURL_CA_BUNDLE` files are merged with
+unring's local CA rather than discarded. Node.js, curl, and Python's standard library
+therefore trust both their prior roots and unring's CA without changing trust for the
+user's shell or any other process. If the parent environment requires an upstream
+HTTP or HTTPS proxy, unring honors it when forwarding and for CONNECT passthrough.
+
 Every successfully intercepted HTTPS request is forwarded in this slice and is shown
 under **HTTPS REQUESTS — INTERCEPTED AND ALREADY FORWARDED** in the review. A final
-discard cannot undo such a request; the warning is deliberate.
+discard cannot undo such a request; the warning is deliberate. Proxy-aware plain HTTP
+is routed to unring too, but is currently blocked with an HTTP 400 and reported as
+un-intercepted rather than being allowed to escape invisibly.
 
 After the child exits, `unring` prints the simple-query batches and asks whether to
 commit or discard. Automation must choose explicitly:
@@ -79,6 +86,15 @@ could not intercept. Signal termination, a recoverable unring panic, and backend
 all retain a record; an unknown database outcome is recorded as `unknown`, never as a
 successful discard.
 
+Audit records intentionally contain the child's complete argument vector and complete
+request URLs, including query strings. Those fields can contain tokens or other
+secrets, so protect the state directory accordingly. Unring does not store HTTP
+headers, request or response bodies, cookies, authorization headers, database
+environment variables, or CA key material as separate audit fields; a connection
+string supplied in the child's arguments is necessarily retained as part of that
+argument vector. `unring log` skips a damaged or unsupported record, prints a warning
+naming it, and still lists the readable history.
+
 ```sh
 unring log                    # list past sessions, newest first
 unring log <session-id>       # human-readable detail; an unambiguous prefix works
@@ -96,7 +112,9 @@ permissions. The CA is generated once and reused. The private key is never injec
 logged—only the certificate path is passed to the child. Unring never installs the CA
 in the system trust store or macOS keychain and never modifies a shell profile.
 Keeping it in private per-user state gives wrapped children a stable CA across runs
-without broadening trust for any process unring did not start.
+without broadening trust for any process unring did not start. When inherited CA bundle
+variables must be preserved, unring writes a mode-`0600` merged public-certificate
+bundle beside its CA files; it never copies a private key into that bundle.
 
 ## How it works
 
@@ -140,11 +158,19 @@ ability to make any of it permanent without you saying so.
 - A host can be deliberately passed through with
   `UNRING_HTTPS_PASSTHROUGH=host1,host2`. The CONNECT tunnel still uses the loopback
   proxy, but unring cannot see its requests or bodies; the host is therefore shown
-  prominently as un-intercepted in both review and audit.
-- Only HTTPS proxy traffic is covered. A child that overrides proxy settings, uses a
-  tool-specific bypass, or opens a direct connection can evade interception. Unring
-  clears inherited `NO_PROXY` for the child to avoid an invisible exclusion list, but
-  it is an accident guard, not a hostile-process sandbox.
+  prominently as un-intercepted in both review and audit. Passthrough can chain
+  through inherited HTTP and HTTPS upstream proxies; unsupported upstream schemes
+  fail visibly and are recorded.
+- HTTP protocol upgrades such as WebSockets are tunneled bidirectionally after the
+  HTTPS handshake. Their host and the fact that payloads were not inspected are shown
+  as un-intercepted in review and audit.
+- Coverage depends on clients honoring standard proxy variables. Proxy-aware plain
+  HTTP is blocked and reported; proxy-aware HTTPS is intercepted or reported. A child
+  that overrides proxy settings, uses a tool-specific bypass, speaks a protocol that
+  ignores these variables, or opens a direct socket can evade interception entirely.
+  Unring routes common HTTP/HTTPS/FTP/ALL proxy variables to loopback and clears
+  inherited `NO_PROXY` to close accidental exclusions, but it is not a hostile-process
+  network sandbox.
 - Sequences do not roll back — discarded runs still leave gaps in auto-increment IDs.
 - PostgreSQL does not expose authoritative per-table row counts for `TRUNCATE`.
   unring reports that summary as `UNKNOWN` and forces the session to discard, so a

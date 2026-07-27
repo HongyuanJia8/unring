@@ -227,6 +227,59 @@ socket.on("error", error => { console.error(error.message); process.exit(2); });
 	}
 }
 
+func TestPlainHTTPCurlCannotEscapeUnreportedIntegration(t *testing.T) {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skipf("curl unavailable: %v", err)
+	}
+	originReached := make(chan struct{}, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		originReached <- struct{}{}
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer origin.Close()
+
+	authority, err := httpsproxy.EnsureAuthority(t.TempDir())
+	if err != nil {
+		t.Fatalf("EnsureAuthority() error: %v", err)
+	}
+	proxy, err := httpsproxy.Start(authority, httpsproxy.Options{})
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = proxy.Close()
+	})
+	environment, err := childenv.HTTPS(os.Environ(), proxy.Address(), authority.CertificatePath)
+	if err != nil {
+		t.Fatalf("build child environment: %v", err)
+	}
+	body := runCurl(t, curl, environment, nil,
+		"--request", "DELETE", origin.URL+"/v1/orders/42")
+	if !strings.Contains(string(body), "unring blocked plain HTTP") {
+		t.Fatalf("plain HTTP response did not explain the fail-closed result: %q", body)
+	}
+	select {
+	case <-originReached:
+		t.Fatal("plain HTTP request escaped unring and reached its origin")
+	default:
+	}
+
+	sealContext, sealCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer sealCancel()
+	if err := proxy.Seal(sealContext); err != nil {
+		t.Fatalf("Seal() error: %v", err)
+	}
+	summary := proxy.Summary()
+	originURL, _ := url.Parse(origin.URL)
+	if len(summary.Requests) != 0 ||
+		len(summary.Unintercepted) != 1 ||
+		summary.Unintercepted[0].Host != originURL.Host ||
+		!strings.Contains(summary.Unintercepted[0].Detail, "plain HTTP") {
+		t.Fatalf("plain HTTP was not visibly reported with its host: %#v", summary)
+	}
+}
+
 func TestGoBinaryWithoutKeychainTrustIsReportedUninterceptedIntegration(t *testing.T) {
 	if os.Getenv("UNRING_GO_UNTRUSTED_HELPER") == "1" {
 		transport := &http.Transport{Proxy: http.ProxyFromEnvironment}

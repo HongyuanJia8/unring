@@ -478,8 +478,14 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 	if flags.NArg() == 0 {
 		records, err := store.List()
 		if err != nil {
-			fmt.Fprintf(stderr, "unring: %v\n", err)
-			return internalErrorExitCode
+			if records == nil {
+				fmt.Fprintf(stderr, "unring: %v\n", err)
+				return internalErrorExitCode
+			}
+			fmt.Fprintf(stderr,
+				"unring: warning: some audit records could not be read and were skipped: %v\n",
+				err,
+			)
 		}
 		if *asJSON {
 			return writeJSON(stdout, stderr, records)
