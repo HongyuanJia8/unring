@@ -23,6 +23,44 @@ func TestCatalogSnapshotCoversReviewableDDLClasses(t *testing.T) {
 	}
 }
 
+func TestSummaryReversibilityTracksEscapeActionsOnly(t *testing.T) {
+	t.Parallel()
+	proxy := &Proxy{
+		changes: ChangeSummary{Complete: false, Error: "unknown staged effect"},
+		unintercepted: []UninterceptedItem{{
+			Detail: "unclassified traffic",
+		}},
+		sequenceEffects: map[string]struct{}{"public.ids": {}},
+	}
+	summary := proxy.Summary()
+	if !summary.FullyReversible || len(summary.IrreversibleActions) != 0 {
+		t.Fatalf("non-escape warnings counterfeited reversibility stamp: %#v", summary)
+	}
+
+	proxy.irreversibleActions = []IrreversibleAction{{SQL: "VACUUM"}}
+	summary = proxy.Summary()
+	if summary.FullyReversible || len(summary.IrreversibleActions) != 1 {
+		t.Fatalf("recorded escape action did not change reversibility stamp: %#v", summary)
+	}
+}
+
+func TestSummaryRiskRequiresAnEffectWhenPostgresReportsRowCounts(t *testing.T) {
+	t.Parallel()
+	statement := clientStatement{
+		SummaryRisk: "unmeasurable target", RiskRequiresRows: true,
+	}
+	if summaryRiskApplies(statement, []string{"UPDATE 0"}) {
+		t.Fatal("zero-row statement applied an explicit-unknown effect")
+	}
+	if !summaryRiskApplies(statement, []string{"UPDATE 1"}) {
+		t.Fatal("nonzero statement did not apply its explicit-unknown effect")
+	}
+	statement.RiskRequiresRows = false
+	if !summaryRiskApplies(statement, []string{"TRUNCATE TABLE"}) {
+		t.Fatal("success-only uncountable statement lost its explicit-unknown effect")
+	}
+}
+
 func TestRowLedgerAttributesTriggersAndRestoresSavepoints(t *testing.T) {
 	const (
 		sourceOID = 101

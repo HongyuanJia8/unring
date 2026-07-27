@@ -533,8 +533,6 @@ func (p *Proxy) executeIrreversibleLocked(
 		}
 		return nil, true
 	}
-	actionIndex := p.beginIrreversibleAction(statement.SQL)
-
 	p.acquireClient(client)
 	sessionState, stateErr := p.escapeSessionStateLocked()
 	var lockConflict *escapeLockConflict
@@ -547,7 +545,6 @@ func (p *Proxy) executeIrreversibleLocked(
 	}
 	p.releaseClient(client)
 	if stateErr != nil {
-		p.finishIrreversibleAction(actionIndex, nil, stateErr)
 		p.sendStatementError(client, "58000",
 			fmt.Sprintf("unring could not capture session state for the irreversible statement: %v",
 				stateErr), true)
@@ -559,7 +556,6 @@ func (p *Proxy) executeIrreversibleLocked(
 	if lockCheckErr != nil {
 		err := fmt.Errorf("could not verify whether the shared session holds a conflicting lock: %w",
 			lockCheckErr)
-		p.finishIrreversibleAction(actionIndex, nil, err)
 		p.sendStatementError(client, "58000", err.Error(), true)
 		if client.transactionSavepoint != "" {
 			client.transactionFailed = true
@@ -568,7 +564,6 @@ func (p *Proxy) executeIrreversibleLocked(
 	}
 	if lockConflict != nil {
 		message := escapeLockConflictMessage(statement, *lockConflict)
-		p.finishIrreversibleAction(actionIndex, nil, errors.New(message))
 		p.sendStatementError(client, "55P03", message, false)
 		if client.transactionSavepoint != "" {
 			client.transactionFailed = true
@@ -576,8 +571,6 @@ func (p *Proxy) executeIrreversibleLocked(
 		return nil, true
 	}
 	if sessionState.hasUncommittedChanges {
-		err := errors.New("shared transaction contains uncommitted database changes")
-		p.finishIrreversibleAction(actionIndex, nil, err)
 		p.sendStatementError(client, "25001",
 			"unring cannot safely run this irreversible statement while the shared transaction "+
 				"contains uncommitted database changes", true)
@@ -589,7 +582,6 @@ func (p *Proxy) executeIrreversibleLocked(
 
 	connection, err := pgconn.ConnectConfig(client.ctx, p.config.Copy())
 	if err != nil {
-		p.finishIrreversibleAction(actionIndex, nil, err)
 		p.sendStatementError(client, "08001",
 			fmt.Sprintf("unring could not open the non-transactional connection: %v", err), true)
 		if client.transactionSavepoint != "" {
@@ -603,7 +595,6 @@ func (p *Proxy) executeIrreversibleLocked(
 		_ = connection.Close(closeContext)
 	}()
 	if err := applyEscapeSessionState(client.ctx, connection, sessionState); err != nil {
-		p.finishIrreversibleAction(actionIndex, nil, err)
 		p.sendStatementError(client, "08001",
 			fmt.Sprintf("unring could not mirror session state on the non-transactional connection: %v",
 				err), true)
@@ -612,7 +603,12 @@ func (p *Proxy) executeIrreversibleLocked(
 		}
 		return nil, true
 	}
-	results, execErr := connection.Exec(client.ctx, statement.SQL).ReadAll()
+	// Creating the result reader dispatches the query. Record the action only
+	// at this boundary: every earlier exit is a decline or refusal where
+	// nothing ran outside the shared transaction.
+	resultReader := connection.Exec(client.ctx, statement.SQL)
+	actionIndex := p.beginIrreversibleAction(statement.SQL)
+	results, execErr := resultReader.ReadAll()
 	if execErr != nil {
 		var postgresError *pgconn.PgError
 		if errors.As(execErr, &postgresError) && postgresError.Code == "55P03" {

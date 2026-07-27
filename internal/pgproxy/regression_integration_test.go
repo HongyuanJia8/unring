@@ -113,6 +113,10 @@ func TestLockConflictingIrreversibleStatementIsExplainedImmediatelyIntegration(t
 	if got := scalarTest(t, ctx, client, "SELECT 43"); got != "43" {
 		t.Fatalf("proxy did not recover after bounded escape failure: %s", got)
 	}
+	if summary := proxy.Summary(); !summary.FullyReversible ||
+		len(summary.IrreversibleActions) != 0 {
+		t.Fatalf("lock-conflict refusal changed reversibility summary: %#v", summary)
+	}
 }
 
 func TestEscapeConnectionMirrorsSearchPathIntegration(t *testing.T) {

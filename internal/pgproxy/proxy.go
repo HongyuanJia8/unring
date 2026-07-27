@@ -41,9 +41,10 @@ type QueryRecord struct {
 	Error       string
 }
 
-// IrreversibleAction records a statement approved for execution on a separate
-// autocommit connection. Failed records retain the execution error; approval
-// alone is enough to require explicit review.
+// IrreversibleAction records a statement dispatched on a separate autocommit
+// connection. Failed records retain the execution error because a dispatched
+// statement may have produced external or partially committed effects. A
+// decline or pre-execution refusal never creates this record.
 type IrreversibleAction struct {
 	SQL         string
 	CommandTags []string
@@ -110,8 +111,10 @@ type Options struct {
 
 // Summary is a point-in-time copy of the session activity.
 type Summary struct {
-	Connections         int
-	Queries             []QueryRecord
+	Connections int
+	Queries     []QueryRecord
+	// FullyReversible is false exactly when IrreversibleActions is non-empty.
+	// Other coverage and accounting warnings are represented separately.
 	FullyReversible     bool
 	IrreversibleActions []IrreversibleAction
 	Changes             ChangeSummary
@@ -318,11 +321,15 @@ func (p *Proxy) Summary() Summary {
 	sort.Slice(nonTransactional, func(i, j int) bool {
 		return nonTransactional[i].Detail < nonTransactional[j].Detail
 	})
+	// This flag has one deliberately narrow meaning: at least one statement
+	// was dispatched on the non-transactional escape connection. Coverage
+	// warnings, incomplete staged summaries, sequence effects, declines, and
+	// local refusals have their own fields and must not counterfeit this stamp.
+	fullyReversible := len(actions) == 0
 	return Summary{
-		Connections: p.connections,
-		Queries:     queries,
-		FullyReversible: len(actions) == 0 && len(nonTransactional) == 0 &&
-			p.changes.Complete && len(unintercepted) == 0,
+		Connections:         p.connections,
+		Queries:             queries,
+		FullyReversible:     fullyReversible,
 		IrreversibleActions: actions,
 		Changes: ChangeSummary{
 			Rows: rows, Schema: schema, Complete: p.changes.Complete, Error: p.changes.Error,

@@ -118,6 +118,31 @@ func TestUncountableDataEffectsNeverLookReadOnlyIntegration(t *testing.T) {
 	}
 }
 
+func TestRejectedUncountableStatementLeavesSummaryCompleteIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	proxy, err := Start(ctx, config)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	defer proxy.Close()
+	client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+	if _, err := client.Exec(ctx, "TRUNCATE unring_table_that_does_not_exist").ReadAll(); err == nil {
+		t.Fatal("invalid TRUNCATE unexpectedly succeeded")
+	}
+	_ = client.Close(ctx)
+	if err := proxy.Seal(ctx); err != nil {
+		t.Fatalf("Seal(): %v", err)
+	}
+	summary := proxy.Summary()
+	if !summary.Changes.Complete || !summary.FullyReversible ||
+		len(summary.IrreversibleActions) != 0 || summary.HasReviewableActivity() {
+		t.Fatalf("rejected uncountable statement changed the sealed summary: %#v", summary)
+	}
+}
+
 func TestSequenceAdvancementSurvivesClientRollbackInReviewIntegration(t *testing.T) {
 	connectionString := testpostgres.Start(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -143,7 +168,7 @@ func TestSequenceAdvancementSurvivesClientRollbackInReviewIntegration(t *testing
 		t.Fatalf("Seal(): %v", err)
 	}
 	summary := proxy.Summary()
-	if len(summary.NonTransactional) == 0 || summary.FullyReversible || !summary.HasReviewableActivity() {
+	if len(summary.NonTransactional) == 0 || !summary.FullyReversible || !summary.HasReviewableActivity() {
 		t.Fatalf("rolled-back sequence advancement was hidden: %#v", summary)
 	}
 }
@@ -336,6 +361,10 @@ func TestBroadMaintenanceConflictIsRefusedBeforePartialExecutionIntegration(t *t
 	}
 	if time.Since(started) >= time.Second {
 		t.Fatalf("broad maintenance reached the timeout instead of preflight")
+	}
+	if summary := proxy.Summary(); !summary.FullyReversible ||
+		len(summary.IrreversibleActions) != 0 {
+		t.Fatalf("broad maintenance refusal changed reversibility summary: %#v", summary)
 	}
 }
 
