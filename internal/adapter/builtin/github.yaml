@@ -1,0 +1,16 @@
+version: 1
+name: github
+rules:
+  - name: create-issue
+    match:
+      hosts:
+        - api.github.com
+      methods:
+        - POST
+      path: /repos/*/*/issues
+    tier: needs-approval
+    idempotency_key: '"github-issue:" + request.body_sha256'
+    undo:
+      method: POST
+      url: https://api.github.com/graphql
+      body: '{"query":"mutation($id:ID!){deleteIssue(input:{issueId:$id}){clientMutationId}}","variables":{"id":"${response.node_id}"}}'

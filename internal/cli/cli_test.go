@@ -31,6 +31,24 @@ func TestMainHelp(t *testing.T) {
 	}
 }
 
+func TestLoadAdaptersFailsLoudlyForMalformedUserFile(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "malformed-community-adapter.yaml")
+	if err := os.WriteFile(filename, []byte(`
+version: 1
+name: malformed
+rules:
+  - name: missing-match
+    tier: stageable
+`), 0o600); err != nil {
+		t.Fatalf("write malformed adapter: %v", err)
+	}
+	_, err := loadAdapters(filename)
+	if err == nil || !strings.Contains(err.Error(), filename) ||
+		!strings.Contains(err.Error(), "match.hosts") {
+		t.Fatalf("loadAdapters() error = %v", err)
+	}
+}
+
 func TestReviewModelExpandsStatementDetails(t *testing.T) {
 	t.Parallel()
 
@@ -124,6 +142,47 @@ func TestReviewReportsForwardedAndUninterceptedHTTPSSeparately(t *testing.T) {
 	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("HTTPS review missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T) {
+	t.Parallel()
+	httpsSummary := httpsproxy.Summary{
+		Sealed: true,
+		Staged: []httpsproxy.StagedRequest{{
+			Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+			Adapter: "slack", Rule: "post-message", State: "pending",
+			IdempotencyKey: "slack-message:abc", Body: `{"text":"later"}`,
+		}},
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "POST", URL: "https://api.github.com/repos/acme/widget/issues",
+			StatusCode: 201,
+		}},
+		Unintercepted: []httpsproxy.UninterceptedItem{{
+			Host: "opaque.example:443", Detail: "CONNECT tunnel was passed through",
+		}},
+	}
+	postgresSummary := pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}
+
+	view := newReviewModelWithHTTPS(postgresSummary, httpsSummary).View()
+	var plain bytes.Buffer
+	printSummaryWithHTTPS(&plain, postgresSummary, httpsSummary)
+	for label, text := range map[string]string{"TUI": view, "plain": plain.String()} {
+		for _, want := range []string{
+			"PENDING HTTPS — WILL BE SENT IF YOU COMMIT",
+			"slack.com/api/chat.postMessage",
+			"HTTPS REQUESTS —",
+			"api.github.com/repos/acme/widget/issues",
+			"UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC",
+			"opaque.example:443",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s review missing %q:\n%s", label, want, text)
+			}
 		}
 	}
 }

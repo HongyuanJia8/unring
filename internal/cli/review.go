@@ -18,6 +18,7 @@ type reviewItem struct {
 	section  string
 	title    string
 	SQL      string
+	body     string
 	affected string
 	err      string
 	detail   string
@@ -89,6 +90,31 @@ func newReviewModelWithHTTPS(summary pgproxy.Summary, httpsSummary httpsproxy.Su
 			title:   fmt.Sprintf("[%s] %s", status, compactSQL(action.SQL)),
 			SQL:     action.SQL, affected: affectedRows(action.CommandTags), err: action.Error,
 			detail: detail,
+		})
+	}
+	for _, request := range httpsSummary.Staged {
+		section := "PENDING HTTPS — WILL BE SENT IF YOU COMMIT"
+		detail := "The origin has not received this request. Commit sends it once with the listed idempotency key; discard drops it."
+		if request.State != "" && request.State != "pending" {
+			section = "STAGED HTTPS CALLS — FINAL OUTCOME"
+			detail = "Final staged-call state: " + request.State + "."
+		}
+		model.items = append(model.items, reviewItem{
+			section: section,
+			title:   fmt.Sprintf("[%s] %s %s", request.State, request.Method, request.URL),
+			body:    request.Body, err: request.Error,
+			detail: detail + " Idempotency key: " + request.IdempotencyKey,
+		})
+	}
+	for _, approval := range httpsSummary.Approvals {
+		if approval.Decision == "approved" {
+			continue
+		}
+		model.items = append(model.items, reviewItem{
+			section: "HTTPS APPROVALS — NOT SENT",
+			title:   fmt.Sprintf("[%s] %s %s", approval.Decision, approval.Method, approval.URL),
+			body:    approval.Body, err: approval.Error,
+			detail: "This needs-approval request did not reach its origin.",
 		})
 	}
 	for _, request := range httpsSummary.Requests {
@@ -231,6 +257,12 @@ func (model reviewModel) View() string {
 			}
 			if item.affected != "" {
 				fmt.Fprintf(&output, "      Rows affected: %s\n", item.affected)
+			}
+			if item.body != "" {
+				output.WriteString("      Request body:\n")
+				for _, line := range strings.Split(item.body, "\n") {
+					fmt.Fprintf(&output, "        %s\n", line)
+				}
 			}
 			if item.err != "" {
 				fmt.Fprintf(&output, "      Error: %s\n", item.err)

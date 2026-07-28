@@ -1,0 +1,23 @@
+version: 1
+name: slack
+rules:
+  - name: post-message
+    match:
+      hosts:
+        - slack.com
+        - www.slack.com
+      methods:
+        - POST
+      path: /api/chat.postMessage
+    tier: stageable
+    idempotency_key: '"slack-message:" + request.body_sha256'
+    response:
+      status: 200
+      headers:
+        Content-Type: application/json
+        X-Unring-Staged: "true"
+      body: '{"ok":true,"unring":{"staged":true,"real_response":false}}'
+    undo:
+      method: POST
+      url: https://slack.com/api/chat.delete
+      body: '{"channel":"${request.body.channel}","ts":"${response.ts}"}'

@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hyj28/unring/internal/adapter"
 	"github.com/hyj28/unring/internal/audit"
 	"github.com/hyj28/unring/internal/childenv"
 	"github.com/hyj28/unring/internal/httpsproxy"
@@ -153,6 +154,13 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 
+	adapterSet, err := loadAdapters(os.Getenv("UNRING_ADAPTERS"))
+	if err != nil {
+		auditError = err.Error()
+		fmt.Fprintf(stderr, "unring: load HTTPS adapters: %v\n", err)
+		return internalErrorExitCode
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	approvalRequests := make(chan runner.ApprovalRequest)
 	proxy, err = pgproxy.StartWithOptions(ctx, backendConfig, pgproxy.Options{
@@ -209,6 +217,45 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 	httpsProxy, err = httpsproxy.Start(authority, httpsproxy.Options{
 		PassthroughHost: configuredPassthroughHosts(os.Getenv("UNRING_HTTPS_PASSTHROUGH")),
+		Adapters:        adapterSet,
+		Approve: func(approvalContext context.Context, request httpsproxy.ApprovalRequest) (bool, error) {
+			reply := make(chan runner.ApprovalResult, 1)
+			work := runner.ApprovalRequest{
+				Decide: func() (bool, error) {
+					return promptHTTPSApproval(stdin, stdout, request), nil
+				},
+				Reply: reply,
+			}
+			select {
+			case approvalRequests <- work:
+			case <-approvalContext.Done():
+				return false, approvalContext.Err()
+			}
+			select {
+			case result := <-reply:
+				decision := "declined"
+				if result.Approved {
+					decision = "approved"
+				}
+				approvalError := ""
+				if result.Err != nil {
+					decision = "error"
+					approvalError = result.Err.Error()
+				}
+				if err := auditSession.Update(func(record *audit.Record) {
+					record.Approvals = append(record.Approvals, audit.Approval{
+						Kind: "https", Statement: request.Method + " " + request.URL,
+						Reason: request.Reason, Decision: decision,
+						Error: approvalError, Time: time.Now().UTC(),
+					})
+				}); err != nil {
+					return false, fmt.Errorf("record HTTPS approval decision: %w", err)
+				}
+				return result.Approved, result.Err
+			case <-approvalContext.Done():
+				return false, approvalContext.Err()
+			}
+		},
 	})
 	if err != nil {
 		auditError = err.Error()
@@ -287,14 +334,18 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
 		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		finalizeErr := proxy.Finalize(finalizeContext, pgproxy.DecisionRollback)
+		httpsFinalizeErr := httpsProxy.Finalize(finalizeContext, false)
+		finalizeErr := errors.Join(
+			httpsFinalizeErr,
+			proxy.Finalize(finalizeContext, pgproxy.DecisionRollback),
+		)
 		finalizeCancel()
 		if finalizeErr != nil {
 			finalized = true
 			auditError = finalizeErr.Error()
 			_ = auditSession.Update(func(record *audit.Record) {
 				record.Postgres = summary
-				updateHTTPSAudit(record, httpsSummary)
+				updateHTTPSAudit(record, httpsProxy.Summary())
 				record.Decision = "discard"
 				record.Outcome = "unknown"
 			})
@@ -304,7 +355,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		finalized = true
 		if err := auditSession.Update(func(record *audit.Record) {
 			record.Postgres = summary
-			updateHTTPSAudit(record, httpsSummary)
+			updateHTTPSAudit(record, httpsProxy.Summary())
 			record.Decision = "discard"
 			record.Outcome = "discarded"
 		}); err != nil {
@@ -361,7 +412,6 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		decision = pgproxy.DecisionRollback
 	}
 
-	finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := auditSession.Update(func(record *audit.Record) {
 		record.Postgres = summary
 		updateHTTPSAudit(record, httpsSummary)
@@ -372,18 +422,35 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		decision = pgproxy.DecisionRollback
 	}
 	requestedDecision = auditDecision(decision)
-	finalizeErr := proxy.Finalize(finalizeContext, decision)
+	commitHTTPS := decision == pgproxy.DecisionCommit
+	httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	httpsFinalizeErr := httpsProxy.Finalize(httpsFinalizeContext, commitHTTPS)
+	httpsFinalizeCancel()
+	postgresDecision := decision
+	if httpsFinalizeErr != nil {
+		// A staged HTTP replay may have partially succeeded. Keep the database
+		// reversible instead of compounding that uncertainty with a commit.
+		postgresDecision = pgproxy.DecisionRollback
+		auditError = joinErrorText(auditError, httpsFinalizeErr)
+	}
+	finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	postgresFinalizeErr := proxy.Finalize(finalizeContext, postgresDecision)
 	finalizeCancel()
+	finalizeErr := errors.Join(httpsFinalizeErr, postgresFinalizeErr)
 	finalized = true
 	if finalizeErr != nil {
-		auditError = finalizeErr.Error()
+		auditError = joinErrorText(auditError, postgresFinalizeErr)
 		_ = auditSession.Update(func(record *audit.Record) {
+			record.Postgres = proxy.Summary()
+			updateHTTPSAudit(record, httpsProxy.Summary())
 			record.Outcome = "unknown"
 		})
 		fmt.Fprintf(stderr, "unring: session outcome not confirmed: %v\n", finalizeErr)
 		return internalErrorExitCode
 	}
 	if err := auditSession.Update(func(record *audit.Record) {
+		record.Postgres = proxy.Summary()
+		updateHTTPSAudit(record, httpsProxy.Summary())
 		record.Outcome = pastTense(decision)
 	}); err != nil {
 		auditError = err.Error()
@@ -429,6 +496,27 @@ func configuredPassthroughHosts(value string) func(string) bool {
 		_, withoutPort := hosts[hostname]
 		return exact || withoutPort
 	}
+}
+
+func loadAdapters(value string) (*adapter.Set, error) {
+	var filenames []string
+	for _, filename := range strings.Split(value, string(os.PathListSeparator)) {
+		if filename = strings.TrimSpace(filename); filename != "" {
+			filenames = append(filenames, filename)
+		}
+	}
+	userSources, err := adapter.ReadFiles(filenames)
+	if err != nil {
+		return nil, err
+	}
+	builtinSources, err := adapter.BuiltinSources()
+	if err != nil {
+		return nil, err
+	}
+	// Both categories deliberately enter the exact same loader call. Load has
+	// no knowledge of names, origin, or built-in status.
+	sources := append(userSources, builtinSources...)
+	return adapter.Load(sources...)
 }
 
 func updateHTTPSAudit(record *audit.Record, summary httpsproxy.Summary) {
@@ -631,6 +719,37 @@ func promptIrreversibleApproval(
 	return approved
 }
 
+func promptHTTPSApproval(
+	input io.Reader,
+	output io.Writer,
+	request httpsproxy.ApprovalRequest,
+) bool {
+	fmt.Fprintln(output, "\nHTTPS action needs approval")
+	fmt.Fprintf(output, "  Request: %s %s\n", request.Method, request.URL)
+	if request.Adapter != "" {
+		fmt.Fprintf(output, "  Adapter rule: %s / %s\n", request.Adapter, request.Rule)
+	}
+	fmt.Fprintf(output, "  Reason: %s.\n", request.Reason)
+	fmt.Fprintln(output,
+		"  Approving sends this request to the real service now; declining guarantees it is not sent.")
+	if !isTerminal(input) || !isTerminalWriter(output) {
+		fmt.Fprintln(output, "  No interactive terminal; declining the action.")
+		return false
+	}
+	fmt.Fprint(output, "Send this HTTPS request? [y/N] ")
+	answer, err := readOnePromptLine(input)
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintf(output, "\nCould not read approval (%v); declining.\n", err)
+		return false
+	}
+	approved := strings.EqualFold(strings.TrimSpace(answer), "y") ||
+		strings.EqualFold(strings.TrimSpace(answer), "yes")
+	if !approved {
+		fmt.Fprintln(output, "Action declined; it was not sent.")
+	}
+	return approved
+}
+
 // readOnePromptLine deliberately limits every Read call to one byte. A
 // bufio.Reader may read several canonical terminal lines at once on Linux;
 // discarding that reader after the approval would then swallow input intended
@@ -750,6 +869,49 @@ func printSummaryWithHTTPS(
 			fmt.Fprintln(output)
 			if action.Error != "" {
 				fmt.Fprintf(output, "    Error: %s\n", action.Error)
+			}
+		}
+	}
+	if len(httpsSummary.Staged) > 0 {
+		pending := false
+		for _, request := range httpsSummary.Staged {
+			if request.State == "" || request.State == "pending" {
+				pending = true
+				break
+			}
+		}
+		if pending {
+			fmt.Fprintln(output, "\nPENDING HTTPS — WILL BE SENT IF YOU COMMIT")
+			fmt.Fprintln(output,
+				"  These requests have not reached their origins. Discard drops them without sending.")
+		} else {
+			fmt.Fprintln(output, "\nSTAGED HTTPS CALLS — FINAL OUTCOME")
+		}
+		for _, request := range httpsSummary.Staged {
+			fmt.Fprintf(output, "  - [%s] %s %s\n", request.State, request.Method, request.URL)
+			fmt.Fprintf(output, "    Idempotency key: %s\n", request.IdempotencyKey)
+			if request.Error != "" {
+				fmt.Fprintf(output, "    Error: %s\n", request.Error)
+			}
+		}
+	}
+	declinedApprovals := 0
+	for _, approval := range httpsSummary.Approvals {
+		if approval.Decision != "approved" {
+			declinedApprovals++
+		}
+	}
+	if declinedApprovals > 0 {
+		fmt.Fprintln(output, "\nHTTPS APPROVALS — NOT SENT")
+		fmt.Fprintln(output, "  These needs-approval requests did not reach their origins.")
+		for _, approval := range httpsSummary.Approvals {
+			if approval.Decision == "approved" {
+				continue
+			}
+			fmt.Fprintf(output, "  - [%s] %s %s\n",
+				approval.Decision, approval.Method, approval.URL)
+			if approval.Error != "" {
+				fmt.Fprintf(output, "    Error: %s\n", approval.Error)
 			}
 		}
 	}

@@ -47,6 +47,14 @@ func TestStorePersistsStructuredSessionAndLoadsByPrefix(t *testing.T) {
 			Requests: []httpsproxy.RequestRecord{{
 				Method: "POST", URL: "https://api.example.test/events", StatusCode: 201,
 			}},
+			Staged: []httpsproxy.StagedRequest{{
+				Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+				State: "sent", Body: "audit-must-not-store-this-staged-body",
+			}},
+			Approvals: []httpsproxy.ApprovalRecord{{
+				Method: "POST", URL: "https://unknown.example/action",
+				Decision: "declined", Body: "audit-must-not-store-this-approval-body",
+			}},
 		}
 		record.Unintercepted = []Unintercepted{{
 			Kind: "https", Host: "api.passthrough.test:443", Detail: "CONNECT passed through",
@@ -74,6 +82,13 @@ func TestStorePersistsStructuredSessionAndLoadsByPrefix(t *testing.T) {
 	}
 
 	path := filepath.Join(store.logDir, loaded.ID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read audit record: %v", err)
+	}
+	if strings.Contains(string(data), "audit-must-not-store") {
+		t.Fatalf("audit record persisted a request body:\n%s", data)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat audit record: %v", err)

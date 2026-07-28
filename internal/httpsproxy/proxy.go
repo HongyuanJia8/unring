@@ -3,6 +3,7 @@ package httpsproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -14,18 +15,60 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hyj28/unring/internal/adapter"
 )
 
 type tlsCertificate = tls.Certificate
 
-// RequestRecord is one HTTPS request that was intercepted and forwarded.
+// RequestRecord is one HTTPS request that was actually sent to an origin.
 type RequestRecord struct {
-	Method     string    `json:"method"`
-	URL        string    `json:"url"`
-	StatusCode int       `json:"status_code,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	StartedAt  time.Time `json:"started_at"`
-	EndedAt    time.Time `json:"ended_at"`
+	Method     string       `json:"method"`
+	URL        string       `json:"url"`
+	Tier       adapter.Tier `json:"tier,omitempty"`
+	Adapter    string       `json:"adapter,omitempty"`
+	Rule       string       `json:"rule,omitempty"`
+	StatusCode int          `json:"status_code,omitempty"`
+	Error      string       `json:"error,omitempty"`
+	StartedAt  time.Time    `json:"started_at"`
+	EndedAt    time.Time    `json:"ended_at"`
+}
+
+// StagedRequest is a call withheld from the origin until the final decision.
+type StagedRequest struct {
+	Method           string    `json:"method"`
+	URL              string    `json:"url"`
+	Adapter          string    `json:"adapter"`
+	Rule             string    `json:"rule"`
+	IdempotencyKey   string    `json:"idempotency_key"`
+	SyntheticStatus  int       `json:"synthetic_status"`
+	State            string    `json:"state"`
+	ReplayStatusCode int       `json:"replay_status_code,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	StagedAt         time.Time `json:"staged_at"`
+	Body             string    `json:"-"`
+}
+
+// ApprovalRecord is a needs-approval request and the user's decision.
+type ApprovalRecord struct {
+	Method   string    `json:"method"`
+	URL      string    `json:"url"`
+	Adapter  string    `json:"adapter,omitempty"`
+	Rule     string    `json:"rule,omitempty"`
+	Decision string    `json:"decision"`
+	Error    string    `json:"error,omitempty"`
+	Time     time.Time `json:"time"`
+	Body     string    `json:"-"`
+}
+
+// ApprovalRequest is shown before a needs-approval call can reach its origin.
+type ApprovalRequest struct {
+	Method  string
+	URL     string
+	Adapter string
+	Rule    string
+	Reason  string
+	Body    string
 }
 
 // UninterceptedItem is one connection unring saw but could not intercept.
@@ -39,19 +82,25 @@ type UninterceptedItem struct {
 type Summary struct {
 	Connections   int                 `json:"connections"`
 	Requests      []RequestRecord     `json:"requests"`
+	Staged        []StagedRequest     `json:"staged"`
+	Approvals     []ApprovalRecord    `json:"approvals"`
 	Unintercepted []UninterceptedItem `json:"unintercepted"`
 	Sealed        bool                `json:"sealed"`
+	Finalized     bool                `json:"finalized"`
 }
 
 // HasReviewableActivity reports whether any HTTPS coverage or forwarding was observed.
 func (summary Summary) HasReviewableActivity() bool {
-	return !summary.Sealed || len(summary.Requests) > 0 || len(summary.Unintercepted) > 0
+	return !summary.Sealed || len(summary.Requests) > 0 || len(summary.Staged) > 0 ||
+		len(summary.Approvals) > 0 || len(summary.Unintercepted) > 0
 }
 
 // Options configures upstream forwarding and explicit CONNECT passthrough.
 type Options struct {
 	Transport       http.RoundTripper
 	PassthroughHost func(host string) bool
+	Adapters        *adapter.Set
+	Approve         func(context.Context, ApprovalRequest) (bool, error)
 }
 
 // Proxy intercepts HTTPS CONNECT connections on loopback.
@@ -61,6 +110,8 @@ type Proxy struct {
 	server      *http.Server
 	transport   http.RoundTripper
 	passthrough func(string) bool
+	adapters    *adapter.Set
+	approve     func(context.Context, ApprovalRequest) (bool, error)
 	runCtx      context.Context
 	cancel      context.CancelFunc
 
@@ -72,9 +123,22 @@ type Proxy struct {
 
 	summaryMu sync.Mutex
 	summary   Summary
+	staged    []stagedCall
 
 	closeOnce sync.Once
 	closeErr  error
+
+	finalizeOnce sync.Once
+	finalizeErr  error
+}
+
+type stagedCall struct {
+	method string
+	url    *url.URL
+	host   string
+	header http.Header
+	body   []byte
+	key    string
 }
 
 // Start binds an HTTPS proxy to an ephemeral loopback port.
@@ -97,7 +161,8 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 	}
 	proxy := &Proxy{
 		authority: authority, listener: listener, transport: transport,
-		passthrough: options.PassthroughHost, connections: make(map[net.Conn]struct{}),
+		passthrough: options.PassthroughHost, adapters: options.Adapters,
+		approve: options.Approve, connections: make(map[net.Conn]struct{}),
 	}
 	proxy.runCtx, proxy.cancel = context.WithCancel(context.Background())
 	proxy.server = &http.Server{
@@ -125,8 +190,11 @@ func (proxy *Proxy) Summary() Summary {
 	return Summary{
 		Connections:   proxy.summary.Connections,
 		Requests:      append([]RequestRecord(nil), proxy.summary.Requests...),
+		Staged:        append([]StagedRequest(nil), proxy.summary.Staged...),
+		Approvals:     append([]ApprovalRecord(nil), proxy.summary.Approvals...),
 		Unintercepted: append([]UninterceptedItem(nil), proxy.summary.Unintercepted...),
 		Sealed:        proxy.summary.Sealed,
+		Finalized:     proxy.summary.Finalized,
 	}
 }
 
@@ -168,11 +236,85 @@ func (proxy *Proxy) Seal(ctx context.Context) error {
 	return proxy.closeErr
 }
 
-// Close seals the proxy with a bounded timeout.
+// Finalize sends all staged calls on commit or drops them on discard. The
+// operation is single-shot because one decision applies to the whole session.
+func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
+	proxy.finalizeOnce.Do(func() {
+		if !proxy.Summary().Sealed {
+			proxy.finalizeErr = errors.New("finalize HTTPS proxy: proxy is not sealed")
+			return
+		}
+		proxy.summaryMu.Lock()
+		calls := append([]stagedCall(nil), proxy.staged...)
+		if !commit {
+			for index := range proxy.summary.Staged {
+				proxy.summary.Staged[index].State = "discarded"
+			}
+			proxy.staged = nil
+			proxy.summary.Finalized = true
+			proxy.summaryMu.Unlock()
+			return
+		}
+		proxy.summaryMu.Unlock()
+
+		var replayErrors []error
+		for index, call := range calls {
+			status, err := proxy.replay(ctx, call)
+			proxy.summaryMu.Lock()
+			if index < len(proxy.summary.Staged) {
+				proxy.summary.Staged[index].ReplayStatusCode = status
+				if err != nil {
+					proxy.summary.Staged[index].State = "send-failed"
+					proxy.summary.Staged[index].Error = err.Error()
+				} else {
+					proxy.summary.Staged[index].State = "sent"
+				}
+			}
+			proxy.summaryMu.Unlock()
+			if err != nil {
+				replayErrors = append(replayErrors, fmt.Errorf(
+					"send staged request %s %s: %w", call.method, call.url, err,
+				))
+			}
+		}
+		proxy.summaryMu.Lock()
+		proxy.staged = nil
+		proxy.summary.Finalized = true
+		proxy.summaryMu.Unlock()
+		proxy.finalizeErr = errors.Join(replayErrors...)
+	})
+	return proxy.finalizeErr
+}
+
+func (proxy *Proxy) replay(ctx context.Context, call stagedCall) (int, error) {
+	request, err := http.NewRequestWithContext(ctx, call.method, call.url.String(), bytes.NewReader(call.body))
+	if err != nil {
+		return 0, fmt.Errorf("build replay request: %w", err)
+	}
+	request.Host = call.host
+	request.Header = call.header.Clone()
+	request.Header.Set("Idempotency-Key", call.key)
+	removeHopByHopHeaders(request.Header)
+	response, err := proxy.transport.RoundTrip(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	_, readErr := io.Copy(io.Discard, response.Body)
+	if readErr != nil {
+		return response.StatusCode, fmt.Errorf("read replay response: %w", readErr)
+	}
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return response.StatusCode, fmt.Errorf("origin returned HTTP %d", response.StatusCode)
+	}
+	return response.StatusCode, nil
+}
+
+// Close seals and safely discards any staged calls with bounded timeouts.
 func (proxy *Proxy) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return proxy.Seal(ctx)
+	return errors.Join(proxy.Seal(ctx), proxy.Finalize(ctx, false))
 }
 
 func (proxy *Proxy) serveHTTP(response http.ResponseWriter, request *http.Request) {
@@ -428,16 +570,215 @@ func (proxy *Proxy) forward(
 	request *http.Request,
 	hostport string,
 ) (bool, error) {
-	started := time.Now().UTC()
-	record := RequestRecord{Method: request.Method, StartedAt: started}
+	const maximumClassifiedBody = 16 << 20
+	body, err := io.ReadAll(io.LimitReader(request.Body, maximumClassifiedBody+1))
+	if request.Body != nil {
+		_ = request.Body.Close()
+	}
+	if err != nil {
+		proxy.recordUnintercepted(hostport,
+			"intercepted request body could not be read and was blocked: "+err.Error())
+		writeProxyResponse(client, http.StatusBadRequest, http.Header{
+			"X-Unring-Blocked": []string{"true"},
+		}, "")
+		return true, err
+	}
+	if len(body) > maximumClassifiedBody {
+		detail := fmt.Sprintf(
+			"intercepted request body exceeded the %d byte classification limit and was blocked",
+			maximumClassifiedBody,
+		)
+		proxy.recordUnintercepted(hostport, detail)
+		writeProxyResponse(client, http.StatusRequestEntityTooLarge, http.Header{
+			"X-Unring-Blocked": []string{"true"},
+		}, "")
+		return true, errors.New(detail)
+	}
+
 	request.RequestURI = ""
 	request.URL.Scheme = "https"
 	request.URL.Host = hostport
-	request = request.WithContext(proxy.runCtx)
 	if request.Host == "" {
 		request.Host = hostport
 	}
-	record.URL = request.URL.String()
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.ContentLength = int64(len(body))
+
+	classification, matched, err := proxy.classify(request, body)
+	if err != nil {
+		proxy.recordUnintercepted(hostport,
+			"adapter classification failed and the request was blocked: "+err.Error())
+		writeProxyResponse(client, http.StatusBadGateway, http.Header{
+			"X-Unring-Blocked": []string{"true"},
+		}, "")
+		return true, err
+	}
+	if !matched && safeHTTPMethod(request.Method) {
+		classification = adapter.Classification{
+			Tier: adapter.TierAlreadyIrreversible, Rule: "safe-http-method",
+		}
+		matched = true
+	}
+	if !matched {
+		classification = adapter.Classification{Tier: adapter.TierNeedsApproval}
+	}
+
+	switch classification.Tier {
+	case adapter.TierStageable:
+		return proxy.stage(client, request, body, classification)
+	case adapter.TierNeedsApproval:
+		return proxy.requestApproval(
+			client, clientReader, request, body, hostport, classification,
+		)
+	case adapter.TierAlreadyIrreversible:
+		return proxy.forwardActual(client, clientReader, request, classification)
+	default:
+		err := fmt.Errorf("classification returned unsupported tier %q", classification.Tier)
+		proxy.recordUnintercepted(hostport, err.Error()+"; request was blocked")
+		writeProxyResponse(client, http.StatusBadGateway, http.Header{
+			"X-Unring-Blocked": []string{"true"},
+		}, "")
+		return true, err
+	}
+}
+
+func (proxy *Proxy) classify(
+	request *http.Request,
+	body []byte,
+) (adapter.Classification, bool, error) {
+	if proxy.adapters == nil {
+		return adapter.Classification{}, false, nil
+	}
+	return proxy.adapters.Classify(adapter.Request{
+		Method: request.Method, URL: request.URL, Header: request.Header, Body: body,
+	})
+}
+
+func safeHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+func (proxy *Proxy) stage(
+	client io.Writer,
+	request *http.Request,
+	body []byte,
+	classification adapter.Classification,
+) (bool, error) {
+	if classification.Response == nil {
+		err := errors.New("stageable classification has no synthesized response")
+		proxy.recordUnintercepted(request.URL.Host, err.Error()+"; request was blocked")
+		writeProxyResponse(client, http.StatusBadGateway, http.Header{
+			"X-Unring-Blocked": []string{"true"},
+		}, "")
+		return true, err
+	}
+	headers := make(http.Header, len(classification.Response.Headers))
+	for name, value := range classification.Response.Headers {
+		headers.Set(name, value)
+	}
+	started := time.Now().UTC()
+	call := stagedCall{
+		method: request.Method,
+		url:    cloneURL(request.URL),
+		host:   request.Host,
+		header: request.Header.Clone(),
+		body:   append([]byte(nil), body...),
+		key:    classification.IdempotencyKey,
+	}
+	proxy.summaryMu.Lock()
+	proxy.staged = append(proxy.staged, call)
+	proxy.summary.Staged = append(proxy.summary.Staged, StagedRequest{
+		Method: request.Method, URL: request.URL.String(),
+		Adapter: classification.Adapter, Rule: classification.Rule,
+		IdempotencyKey:  classification.IdempotencyKey,
+		SyntheticStatus: classification.Response.Status,
+		State:           "pending", StagedAt: started, Body: string(body),
+	})
+	proxy.summaryMu.Unlock()
+	if err := writeProxyResponse(
+		client, classification.Response.Status, headers, classification.Response.Body,
+	); err != nil {
+		return true, err
+	}
+	return request.Close, nil
+}
+
+func (proxy *Proxy) requestApproval(
+	client io.ReadWriteCloser,
+	clientReader io.Reader,
+	request *http.Request,
+	body []byte,
+	hostport string,
+	classification adapter.Classification,
+) (bool, error) {
+	reason := "no adapter or safe HTTP heuristic recognized this request"
+	if classification.Adapter != "" {
+		reason = fmt.Sprintf(
+			"adapter %s rule %s classifies this call as needs approval",
+			classification.Adapter, classification.Rule,
+		)
+	}
+	approval := ApprovalRequest{
+		Method: request.Method, URL: request.URL.String(),
+		Adapter: classification.Adapter, Rule: classification.Rule,
+		Reason: reason, Body: string(body),
+	}
+	approved := false
+	var approvalErr error
+	if proxy.approve != nil {
+		approved, approvalErr = proxy.approve(proxy.runCtx, approval)
+	}
+	decision := "declined"
+	if approved {
+		decision = "approved"
+	}
+	if approvalErr != nil {
+		decision = "error"
+	}
+	proxy.summaryMu.Lock()
+	proxy.summary.Approvals = append(proxy.summary.Approvals, ApprovalRecord{
+		Method: request.Method, URL: request.URL.String(),
+		Adapter: classification.Adapter, Rule: classification.Rule,
+		Decision: decision, Error: errorText(approvalErr),
+		Time: time.Now().UTC(), Body: string(body),
+	})
+	proxy.summaryMu.Unlock()
+	if approvalErr != nil {
+		proxy.recordUnintercepted(hostport,
+			"needs-approval prompt failed and the request was blocked: "+approvalErr.Error())
+		writeProxyResponse(client, http.StatusBadGateway, http.Header{
+			"X-Unring-Approval": []string{"error"},
+		}, "")
+		return true, approvalErr
+	}
+	if !approved {
+		err := writeProxyResponse(client, http.StatusForbidden, http.Header{
+			"Content-Type":      []string{"application/json"},
+			"X-Unring-Approval": []string{"declined"},
+		}, `{"error":"unring approval declined","sent":false}`)
+		return request.Close, err
+	}
+	return proxy.forwardActual(client, clientReader, request, classification)
+}
+
+func (proxy *Proxy) forwardActual(
+	client io.ReadWriteCloser,
+	clientReader io.Reader,
+	request *http.Request,
+	classification adapter.Classification,
+) (bool, error) {
+	started := time.Now().UTC()
+	record := RequestRecord{
+		Method: request.Method, URL: request.URL.String(),
+		Tier: classification.Tier, Adapter: classification.Adapter,
+		Rule: classification.Rule, StartedAt: started,
+	}
+	request = request.WithContext(proxy.runCtx)
 	requestedUpgrade := protocolUpgrade(request.Header)
 	if requestedUpgrade == "" {
 		removeHopByHopHeaders(request.Header)
@@ -459,7 +800,7 @@ func (proxy *Proxy) forward(
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusSwitchingProtocols {
 		return proxy.forwardUpgrade(
-			client, clientReader, request, response, hostport, requestedUpgrade,
+			client, clientReader, request, response, request.URL.Host, requestedUpgrade,
 		)
 	}
 	if requestedUpgrade != "" {
@@ -480,6 +821,34 @@ func (proxy *Proxy) forward(
 	record.EndedAt = time.Now().UTC()
 	proxy.recordRequest(record)
 	return closeClient, nil
+}
+
+func writeProxyResponse(
+	writer io.Writer,
+	status int,
+	headers http.Header,
+	body string,
+) error {
+	response := &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Proto:      "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header: headers.Clone(), Body: io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	return response.Write(writer)
+}
+
+func cloneURL(source *url.URL) *url.URL {
+	clone := *source
+	return &clone
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (proxy *Proxy) forwardUpgrade(
