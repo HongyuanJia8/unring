@@ -13,20 +13,38 @@ The name comes from *you can't unring a bell*. That is the whole point: now you 
 > a per-session `gh` shim covers GitHub CLI traffic, and declared compensations run
 > on discard with their limits shown before the decision.
 
-## Try the Postgres slice
+## Install
 
-Set your normal PostgreSQL connection environment, then wrap a command:
+You need Go 1.26 or newer, cgo enabled, and a C compiler. The compiler is
+required because `pg_query_go` embeds libpg_query, PostgreSQL's parser. Install
+Xcode Command Line Tools or Clang on macOS, or GCC/Clang (typically the
+`build-essential` package) on Linux, before running:
+
+```sh
+go install github.com/hyj28/unring/cmd/unring@latest
+unring --version
+```
+
+If the second command is not found, add `$(go env GOPATH)/bin` to your `PATH`.
+A missing compiler fails during `go install`, before an `unring` binary exists;
+check `go env CGO_ENABLED` (it must be `1`) and `cc --version` when diagnosing
+that build-time error.
+
+## First run
+
+Point `DATABASE_URL` at the real database, then wrap an agent or any command:
 
 ```sh
 export DATABASE_URL='postgresql://user:password@real-host/database'
-go build -o unring ./cmd/unring
-./unring run -- psql
+unring claude
+# Or:
+unring run -- psql
 ```
 
-Building requires cgo and a working C compiler because unring uses
-`pg_query_go`/libpg_query—the PostgreSQL parser itself—to classify transaction
-statements. The standard Go toolchain plus Clang on macOS or GCC/Clang on Linux is
-sufficient.
+`DATABASE_URL` is required. unring exits with a concrete hint when it is absent,
+when the URL cannot be parsed, when the database cannot be reached, or when the
+server is too old. Run `unring --help` for the command forms and safe
+non-interactive defaults.
 
 PostgreSQL 14 is the minimum supported version. Older servers are rejected at startup
 with an explicit version error before any client traffic is accepted; CI exercises
@@ -69,7 +87,7 @@ approval with the exact ambiguity rather than being guessed. The directory
 and socket are removed when the session ends; no shell profile or persistent `PATH`
 is changed.
 
-After the child exits, `unring` prints the simple-query batches and asks whether to
+After the child exits, `unring` prints the PostgreSQL statements and asks whether to
 commit or discard. Automation must choose explicitly:
 
 ```sh
@@ -102,14 +120,18 @@ could not intercept. Signal termination, a recoverable unring panic, and backend
 all retain a record; an unknown database outcome is recorded as `unknown`, never as a
 successful discard.
 
-Audit records intentionally contain the child's complete argument vector and complete
-request URLs, including query strings. Those fields can contain tokens or other
-secrets, so protect the state directory accordingly. Unring does not store HTTP
-headers, request or response bodies, cookies, authorization headers, database
-environment variables, or CA key material as separate audit fields; a connection
-string supplied in the child's arguments is necessarily retained as part of that
-argument vector. `unring log` skips a damaged or unsupported record, prints a warning
-naming it, and still lists the readable history.
+Audit records intentionally contain the child's complete argument vector, full
+PostgreSQL statement text, argument vectors for mutating or ambiguous `gh` calls,
+and complete request and compensation URLs, including query strings. They also
+store command tags and errors, status codes, classifications, approval decisions,
+idempotency keys, and compensation outcomes. Those fields can contain tokens,
+SQL literals, message text passed as an argument, or other secrets, so protect the
+state directory accordingly. Unring does not store HTTP headers, request or
+response bodies, cookies, authorization headers, database environment variables,
+or CA key material as separate audit fields; a secret supplied in a command
+argument, SQL statement, or URL is necessarily retained there. `unring log` skips
+a damaged or unsupported record, prints a warning naming it, and still lists the
+readable history.
 
 ```sh
 unring log                    # list past sessions, newest first
@@ -206,10 +228,22 @@ ability to make any of it permanent without you saying so.
   Unring routes common HTTP/HTTPS/FTP/ALL proxy variables to loopback and clears
   inherited `NO_PROXY` to close accidental exclusions, but it is not a hostile-process
   network sandbox.
-- Sequences do not roll back — discarded runs still leave gaps in auto-increment IDs.
-- PostgreSQL does not expose authoritative per-table row counts for `TRUNCATE`.
-  unring reports that summary as `UNKNOWN` and forces the session to discard, so a
-  session containing a successful `TRUNCATE` cannot currently be committed.
+- PostgreSQL `nextval` calls do not roll back, including values consumed by
+  identity/serial inserts, so discarded runs can leave ID gaps. The sequence reset
+  performed by `TRUNCATE ... RESTART IDENTITY` is a PostgreSQL exception: that reset
+  is transactional and does roll back with the truncation.
+- PostgreSQL does not expose authoritative transaction counters for `TRUNCATE`, so
+  unring takes `ACCESS EXCLUSIVE` locks over the complete truncate set and runs an
+  exact `COUNT(*)` on every physical table before forwarding the statement. This
+  covers multiple targets, recursive foreign-key `CASCADE`, and partitioned tables;
+  partitioned parents are reported per leaf partition.
+- That exactness has a visible cost: a normally fast `TRUNCATE` now scans every
+  affected table and can take as long as a full table scan. unring sends the client a
+  PostgreSQL notice before counting; there is no approximate fast mode. If an exact
+  count cannot be proven — for example, a foreign table is involved, row-level
+  security hides rows, the role cannot run `COUNT(*)`, or an enabled `ON TRUNCATE`
+  trigger could change the effect — the successful statement remains explicitly
+  `UNKNOWN` and the session is forced to discard.
 - Postgres only. MySQL commits DDL implicitly, which breaks the core guarantee.
 - Both PostgreSQL's simple and extended query protocols are supported. Prepared
   statement and portal names are isolated per client on the shared backend.
@@ -236,6 +270,11 @@ ability to make any of it permanent without you saying so.
   is intended to prevent.
 - Connection options passed directly as child command arguments can bypass injected
   environment variables. This tool guards against accidents, not deliberate bypass.
+- Discard rolls back the shared PostgreSQL transaction and omits staged external
+  calls. It does not revert filesystem changes (use git), statements already approved
+  to run outside the transaction, or already-forwarded external effects. For a
+  forwarded effect it only attempts the adapter's declared compensation, with the
+  Slack, GitHub, mail, and partial-failure boundaries above.
 - Some effects genuinely cannot be undone. The value is that most side effects never
   happen at all; compensation is only the fallback.
 

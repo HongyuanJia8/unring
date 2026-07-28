@@ -43,7 +43,7 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 - [x] M1.8 Map client `BEGIN`/`COMMIT`/`ROLLBACK` and named savepoints onto private
       savepoints inside the shared transaction. This preserves the single-decision
       guarantee while letting transaction-managing clients and ORMs run
-- [ ] M1.9 Count `TRUNCATE` effects authoritatively so sessions containing it can be
+- [x] M1.9 Count `TRUNCATE` effects authoritatively so sessions containing it can be
       reviewed and committed instead of being forced to discard
 
 ## M2 — Wrapper CLI

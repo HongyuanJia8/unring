@@ -76,6 +76,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return usageExitCode
 	}
 	if *forceCommit && *forceDiscard {
@@ -270,6 +273,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	if err != nil {
 		auditError = err.Error()
 		fmt.Fprintf(stderr, "unring: start postgres session: %v\n", err)
+		fmt.Fprintln(stderr,
+			"unring: check DATABASE_URL, database reachability and credentials, and that the server is PostgreSQL 14 or newer")
 		return internalErrorExitCode
 	}
 
