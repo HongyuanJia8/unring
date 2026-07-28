@@ -108,10 +108,13 @@ func TestUncountableDataEffectsNeverLookReadOnlyIntegration(t *testing.T) {
 	if summary.Changes.Complete || !summary.HasReviewableActivity() {
 		t.Fatalf("uncountable effects looked read-only: %#v", summary)
 	}
-	for _, want := range []string{"TRUNCATE", "REFRESH MATERIALIZED VIEW", "large-object"} {
+	for _, want := range []string{"REFRESH MATERIALIZED VIEW", "large-object"} {
 		if !strings.Contains(summary.Changes.Error, want) {
 			t.Fatalf("incomplete summary omitted %q: %s", want, summary.Changes.Error)
 		}
+	}
+	if strings.Contains(summary.Changes.Error, "TRUNCATE row count") {
+		t.Fatalf("countable TRUNCATE remained unknown: %s", summary.Changes.Error)
 	}
 	if strings.Contains(summary.Changes.Error, "reset row counters") {
 		t.Fatalf("TRUNCATE tripped the generic counter-decrease failure: %s", summary.Changes.Error)

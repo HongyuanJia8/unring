@@ -30,14 +30,16 @@ type clientState struct {
 	id      uint64
 	backend *pgproto3.Backend
 
-	locked         bool
-	extended       bool
-	extendedFailed bool
-	cycleSavepoint string
-	pendingEscape  *clientStatement
-	rollbackCycle  bool
-	cycleUncertain []string
-	lastError      string
+	locked             bool
+	extended           bool
+	extendedFailed     bool
+	cycleSavepoint     string
+	pendingEscape      *clientStatement
+	rollbackCycle      bool
+	cycleUncertain     []string
+	cycleRows          rowLedgerSnapshot
+	cycleUncertainBase int
+	lastError          string
 
 	transactionSavepoint string
 	transactionFailed    bool
@@ -124,11 +126,15 @@ func (p *Proxy) cleanupClient(client *clientState) {
 				"; RELEASE SAVEPOINT " + client.cycleSavepoint); err != nil {
 				p.markFatal(fmt.Errorf("recover abandoned extended query: %w", err))
 			}
+			p.restoreRowLedgerLocked(client.cycleRows)
+			p.restoreUncertainEffectsLocked(client.cycleUncertainBase)
 			p.reconcileRowChangesLocked(false)
 		}
 		client.extended = false
 		client.cycleSavepoint = ""
 		client.cycleUncertain = nil
+		client.cycleRows = nil
+		client.cycleUncertainBase = 0
 	}
 
 	if client.transactionSavepoint != "" {

@@ -408,6 +408,20 @@ func (p *Proxy) executeRegularLocked(
 		p.markFatal(fmt.Errorf("create query savepoint: %w", err))
 		return nil, true
 	}
+	var truncateEffect truncateEffect
+	if len(statement.TruncateTargets) > 0 {
+		client.backend.Send(&pgproto3.NoticeResponse{
+			Severity: "NOTICE", Code: "00000",
+			Message: "unring is scanning every affected table before TRUNCATE to report an exact row count; large tables can make this take as long as a full table scan",
+		})
+		_ = client.backend.Flush()
+		var err error
+		truncateEffect, err = p.prepareTruncateEffectLocked(statement)
+		if err != nil {
+			statement.SummaryRisk = "TRUNCATE row count is UNKNOWN: " + err.Error()
+			statement.RiskRequiresRows = false
+		}
+	}
 
 	p.frontend.Send(&pgproto3.Query{String: statement.SQL})
 	if err := p.frontend.Flush(); err != nil {
@@ -484,7 +498,11 @@ complete:
 	if riskApplies {
 		p.addUncertainEffectLocked(statement.SummaryRisk)
 	}
-	p.reconcileRowChangesLocked(keep && !riskApplies)
+	if len(statement.TruncateTargets) > 0 && truncateEffect != nil {
+		p.reconcileTruncateLocked(truncateEffect, keep && !riskApplies)
+	} else {
+		p.reconcileRowChangesLocked(keep && !riskApplies)
+	}
 	if transactionBlockError != nil {
 		statement.Irreversible = transactionBlockError.Message
 		return p.executeIrreversibleLocked(client, statement)

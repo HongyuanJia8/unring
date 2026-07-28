@@ -169,7 +169,6 @@ func TestAnalyzeClientSQLLeavesClientCopyStreamsTransactional(t *testing.T) {
 func TestAnalyzeClientSQLMarksUncountableEffects(t *testing.T) {
 	t.Parallel()
 	for _, sql := range []string{
-		"TRUNCATE orders",
 		"REFRESH MATERIALIZED VIEW totals",
 		"ALTER SUBSCRIPTION reporting CONNECTION 'host=publisher'",
 		"SELECT lo_from_bytea(0, 'abc'::bytea)",
@@ -181,6 +180,23 @@ func TestAnalyzeClientSQLMarksUncountableEffects(t *testing.T) {
 		if len(statements) != 1 || statements[0].SummaryRisk == "" {
 			t.Fatalf("analyzeClientSQL(%q) = %#v, want an explicit summary risk", sql, statements)
 		}
+	}
+}
+
+func TestAnalyzeClientSQLCapturesTruncateRelationSemantics(t *testing.T) {
+	t.Parallel()
+	statements, err := analyzeClientSQL(`TRUNCATE ONLY app.one, "Odd Name" * CASCADE`)
+	if err != nil {
+		t.Fatalf("analyzeClientSQL(): %v", err)
+	}
+	if len(statements) != 1 || !statements[0].TruncateCascade ||
+		len(statements[0].TruncateTargets) != 2 {
+		t.Fatalf("TRUNCATE analysis = %#v", statements)
+	}
+	first, second := statements[0].TruncateTargets[0], statements[0].TruncateTargets[1]
+	if first.IncludeDescendants || first.Relation.Schema != "app" || first.Relation.Name != "one" ||
+		!second.IncludeDescendants || second.Relation.Name != "Odd Name" {
+		t.Fatalf("TRUNCATE targets = %#v", statements[0].TruncateTargets)
 	}
 }
 

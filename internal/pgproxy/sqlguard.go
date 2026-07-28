@@ -35,6 +35,13 @@ type clientStatement struct {
 	SummaryRisk      string
 	SummaryTarget    *relationReference
 	RiskRequiresRows bool
+	TruncateTargets  []truncateTarget
+	TruncateCascade  bool
+}
+
+type truncateTarget struct {
+	Relation           relationReference
+	IncludeDescendants bool
 }
 
 type relationReference struct {
@@ -104,6 +111,7 @@ func analyzeClientSQL(sql string) ([]clientStatement, error) {
 		statement.Irreversible = irreversibleReason(node)
 		statement.LockTargets, statement.LockOperation = maintenanceLockTargets(node)
 		statement.SummaryRisk, statement.SummaryTarget = summaryRisk(node, statement.SQL)
+		statement.TruncateTargets, statement.TruncateCascade = truncateDetails(node.GetTruncateStmt())
 		statement.ReadOnly = readOnlySelect(node.GetSelectStmt())
 		if node.GetDiscardStmt() != nil &&
 			node.GetDiscardStmt().GetTarget() == pg_query.DiscardMode_DISCARD_ALL {
@@ -149,8 +157,6 @@ func maintenanceLockTargets(node *pg_query.Node) ([]relationReference, string) {
 
 func summaryRisk(node *pg_query.Node, sql string) (string, *relationReference) {
 	switch {
-	case node.GetTruncateStmt() != nil:
-		return "TRUNCATE resets PostgreSQL's transaction row counters; exact affected-row counts are unavailable", nil
 	case node.GetRefreshMatViewStmt() != nil:
 		return "REFRESH MATERIALIZED VIEW rewrites through a transient relation; exact affected-row counts are unavailable", nil
 	case node.GetAlterSubscriptionStmt() != nil:
@@ -174,6 +180,24 @@ func summaryRisk(node *pg_query.Node, sql string) (string, *relationReference) {
 		return "", &refs[0]
 	}
 	return "", nil
+}
+
+func truncateDetails(statement *pg_query.TruncateStmt) ([]truncateTarget, bool) {
+	if statement == nil {
+		return nil, false
+	}
+	targets := make([]truncateTarget, 0, len(statement.GetRelations()))
+	for _, node := range statement.GetRelations() {
+		relation := node.GetRangeVar()
+		refs := rangeVarReferences(relation)
+		if len(refs) != 1 {
+			continue
+		}
+		targets = append(targets, truncateTarget{
+			Relation: refs[0], IncludeDescendants: relation.GetInh(),
+		})
+	}
+	return targets, statement.GetBehavior() == pg_query.DropBehavior_DROP_CASCADE
 }
 
 func containsLargeObjectMutation(sql string) bool {
