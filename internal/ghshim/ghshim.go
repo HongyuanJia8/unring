@@ -354,7 +354,10 @@ func (session *Session) decide(call request) response {
 			reason = "adapter classification failed: " + err.Error()
 			classification = adapter.Classification{Tier: adapter.TierNeedsApproval}
 		case !matched:
-			reason = "no adapter recognized the parsed gh mutation"
+			reason = parsed.Reason
+			if reason == "" {
+				reason = "no adapter recognized the parsed gh mutation"
+			}
 			classification = adapter.Classification{Tier: adapter.TierNeedsApproval}
 		case classification.Tier == adapter.TierStageable:
 			reason = fmt.Sprintf(

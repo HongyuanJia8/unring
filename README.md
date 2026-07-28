@@ -59,7 +59,8 @@ The complete community adapter format is documented in
 
 `gh` is handled without TLS interception. For each run, unring creates a private
 directory, places a `gh` shim there, and prepends that directory only to the wrapped
-child's `PATH`. Confident reads such as `gh issue list` execute the real pre-resolved
+child's `PATH`. Enumerated reads such as `gh --version`, `gh auth status`,
+`gh issue list`, `gh pr view`, and a method-safe `gh api` GET execute the real pre-resolved
 `gh` with unchanged standard streams, exit status, stdin, and terminal. Parsed
 mutations such as `gh issue create` are withheld and shown as structured intent; the
 real command runs only if the whole session commits. Unknown subcommands or flags

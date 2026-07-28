@@ -175,6 +175,39 @@ func TestGHCreateRunsOnlyOnCommitAgainstFakeGH(t *testing.T) {
 	}
 }
 
+func TestGHVersionPassesThroughWithoutApproval(t *testing.T) {
+	connectionString, backendDone := startReviewTestBackend(t, false)
+	t.Setenv("DATABASE_URL", connectionString)
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+	fakeDirectory := t.TempDir()
+	fakeGH := filepath.Join(fakeDirectory, "gh")
+	if err := os.WriteFile(fakeGH, []byte(
+		"#!/bin/sh\nprintf 'fake-gh-version\\n'\nprintf 'fake-gh-diagnostic\\n' >&2\nexit 23\n",
+	), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--discard", "--", "gh", "--version")
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 23 {
+		t.Fatalf("gh --version exit = %v, want 23\n%s", err, output)
+	}
+	text := string(output)
+	if !strings.Contains(text, "fake-gh-version") ||
+		!strings.Contains(text, "fake-gh-diagnostic") ||
+		strings.Contains(text, "needs approval") ||
+		strings.Contains(text, "UNRING SESSION REVIEW") {
+		t.Fatalf("gh --version was not transparent:\n%s", text)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
 func TestNonTerminalReviewUsesPlainTextWithoutANSI(t *testing.T) {
 	connectionString, backendDone := startReviewTestBackend(t, true)
 	t.Setenv("DATABASE_URL", connectionString)
