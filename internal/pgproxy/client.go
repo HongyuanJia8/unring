@@ -95,12 +95,14 @@ func (p *Proxy) acquireClient(client *clientState) {
 	}
 	p.queryMu.Lock()
 	client.locked = true
+	p.setActiveCancel(client.id, p.cancelSharedBackend)
 }
 
 func (p *Proxy) releaseClientIfIdle(client *clientState) {
 	if !client.locked || client.extended {
 		return
 	}
+	p.clearActiveCancel(client.id)
 	client.locked = false
 	p.queryMu.Unlock()
 }
@@ -109,6 +111,7 @@ func (p *Proxy) releaseClient(client *clientState) {
 	if !client.locked {
 		return
 	}
+	p.clearActiveCancel(client.id)
 	client.locked = false
 	p.queryMu.Unlock()
 }
@@ -120,6 +123,7 @@ func (p *Proxy) cleanupClient(client *clientState) {
 		if err := p.synchronizeExtendedBackendLocked(nil); err != nil {
 			p.markFatal(fmt.Errorf("synchronize abandoned extended query: %w", err))
 			client.extended = false
+			p.clearActiveCancel(client.id)
 			client.locked = false
 			p.queryMu.Unlock()
 			return
@@ -161,6 +165,7 @@ func (p *Proxy) cleanupClient(client *clientState) {
 			p.markFatal(fmt.Errorf("clean up disconnected client's protocol objects: %w", err))
 		}
 	}
+	p.clearActiveCancel(client.id)
 	client.locked = false
 	p.queryMu.Unlock()
 }

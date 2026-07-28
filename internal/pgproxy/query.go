@@ -633,6 +633,8 @@ func (p *Proxy) executeIrreversibleLocked(
 	// Creating the result reader dispatches the query. Record the action only
 	// at this boundary: every earlier exit is a decline or refusal where
 	// nothing ran outside the shared transaction.
+	p.setActiveCancel(client.id, connection.CancelRequest)
+	defer p.clearActiveCancel(client.id)
 	resultReader := connection.Exec(client.ctx, statement.SQL)
 	actionIndex := p.beginIrreversibleAction(statement.SQL)
 	results, execErr := resultReader.ReadAll()

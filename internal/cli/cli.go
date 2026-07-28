@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -285,9 +287,10 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 	httpsProxy, err = httpsproxy.Start(authority, httpsproxy.Options{
-		PassthroughHost: configuredPassthroughHosts(os.Getenv("UNRING_HTTPS_PASSTHROUGH")),
-		Adapters:        adapterSet,
-		StagedUpdated:   stagedAuditUpdater(auditSession),
+		PassthroughHost:   configuredPassthroughHosts(os.Getenv("UNRING_HTTPS_PASSTHROUGH")),
+		AgentControlPlane: configuredAgentControlPlane(command),
+		Adapters:          adapterSet,
+		StagedUpdated:     stagedAuditUpdater(auditSession),
 		Approve: func(approvalContext context.Context, request httpsproxy.ApprovalRequest) (bool, error) {
 			reply := make(chan runner.ApprovalResult, 1)
 			work := runner.ApprovalRequest{
@@ -620,10 +623,14 @@ func printPartialCommitOutcome(
 			fmt.Fprintf(output, "    Error: %s\n", request.Error)
 		}
 	}
-	if len(summary.Requests) > 0 {
+	if summary.HasForwardedEffects() {
 		fmt.Fprintln(output,
 			"Already-forwarded HTTPS requests remain as sent. Commit never runs discard compensation:")
 		for _, request := range summary.Requests {
+			if request.Disposition == httpsproxy.RequestDispositionSafeRead ||
+				request.Disposition == httpsproxy.RequestDispositionControlPlane {
+				continue
+			}
 			fmt.Fprintf(output, "  - %s %s\n", request.Method, request.URL)
 		}
 	}
@@ -668,6 +675,54 @@ func configuredPassthroughHosts(value string) func(string) bool {
 		_, exact := hosts[host]
 		_, withoutPort := hosts[hostname]
 		return exact || withoutPort
+	}
+}
+
+type agentControlPlaneRule struct {
+	method string
+	host   string
+	path   string
+}
+
+func configuredAgentControlPlane(command []string) func(*http.Request) bool {
+	if len(command) == 0 {
+		return nil
+	}
+	var rules []agentControlPlaneRule
+	switch strings.ToLower(filepath.Base(command[0])) {
+	case "claude":
+		rules = []agentControlPlaneRule{
+			{method: http.MethodPost, host: "api.anthropic.com", path: "/v1/messages"},
+		}
+	case "codex":
+		rules = []agentControlPlaneRule{
+			{method: http.MethodPost, host: "api.openai.com", path: "/v1/responses"},
+			{method: http.MethodPost, host: "chatgpt.com", path: "/backend-api/codex/responses"},
+			{method: http.MethodGet, host: "chatgpt.com", path: "/backend-api/codex/responses"},
+		}
+	case "opencode":
+		rules = []agentControlPlaneRule{
+			{method: http.MethodPost, host: "opencode.ai", path: "/zen/v1/responses"},
+			{method: http.MethodPost, host: "opencode.ai", path: "/zen/v1/chat/completions"},
+			{method: http.MethodPost, host: "api.anthropic.com", path: "/v1/messages"},
+			{method: http.MethodPost, host: "api.openai.com", path: "/v1/responses"},
+			{method: http.MethodPost, host: "api.openai.com", path: "/v1/chat/completions"},
+		}
+	default:
+		return nil
+	}
+	return func(request *http.Request) bool {
+		if request == nil || request.URL == nil {
+			return false
+		}
+		host := strings.ToLower(request.URL.Hostname())
+		for _, rule := range rules {
+			if request.Method == rule.method && host == rule.host &&
+				request.URL.Path == rule.path {
+				return true
+			}
+		}
+		return false
 	}
 }
 
@@ -1048,7 +1103,10 @@ func printSummaryWithExternal(
 	}
 
 	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
-	if !summary.FullyReversible || len(httpsSummary.Requests) > 0 || ghMayHaveExternalEffect(ghSummary) {
+	fmt.Fprintln(output, "One decision applies to the whole session; partial commit is not available.")
+	fmt.Fprintln(output,
+		"Keeping database changes while withholding a related external action could commit inconsistent state—for example, notified_at set when its mail was never sent.")
+	if !summary.FullyReversible || httpsSummary.HasForwardedEffects() || ghMayHaveExternalEffect(ghSummary) {
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		fmt.Fprintln(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE")
 		fmt.Fprintln(output, "Unring cannot guarantee every recorded effect can be undone by discarding.")
@@ -1147,21 +1205,17 @@ func printSummaryWithExternal(
 			}
 		}
 	}
-	if len(httpsSummary.Requests) > 0 {
-		fmt.Fprintln(output, "\nHTTPS REQUESTS — INTERCEPTED AND ALREADY FORWARDED")
-		fmt.Fprintln(output, "  These requests reached their destinations.")
-		for _, request := range httpsSummary.Requests {
-			status := "forwarded"
-			if request.StatusCode != 0 {
-				status = fmt.Sprintf("HTTP %d", request.StatusCode)
-			}
-			fmt.Fprintf(output, "  - [%s] %s %s\n", status, request.Method, request.URL)
-			if request.Error != "" {
-				fmt.Fprintf(output, "    Error: %s\n", request.Error)
-			}
-			printUndoDisclosure(output, request.Undo)
-		}
-	}
+	printForwardedHTTPSRequests(output, httpsSummary.Requests,
+		httpsproxy.RequestDispositionControlPlane,
+		"AGENT CONTROL PLANE — FORWARDED WITHOUT GATING",
+		"  These enumerated model requests were deliberately not gated so the wrapped agent could function; they remain visible here and in the audit.")
+	printForwardedHTTPSRequests(output, httpsSummary.Requests,
+		httpsproxy.RequestDispositionSafeRead,
+		"HTTPS SAFE READS — OBSERVED AND FORWARDED",
+		"  These safe-method requests were recorded for audit and did not create an irreversible-effect warning.")
+	printForwardedHTTPSRequests(output, httpsSummary.Requests, "",
+		"HTTPS REQUESTS — INTERCEPTED AND ALREADY FORWARDED",
+		"  These requests reached their destinations; discard may not undo their effects.")
 	if len(ghSummary.Records) > 0 {
 		fmt.Fprintln(output, "\nGH INVOCATIONS — MUTATIONS AND AMBIGUOUS COMMANDS")
 		printGHSummary(output, ghSummary)
@@ -1183,6 +1237,43 @@ func printSummaryWithExternal(
 			fmt.Fprintf(output, "  Detail: %s\n", item.Detail)
 		}
 		fmt.Fprintln(output, "================================================================")
+	}
+}
+
+func printForwardedHTTPSRequests(
+	output io.Writer,
+	requests []httpsproxy.RequestRecord,
+	disposition string,
+	header string,
+	detail string,
+) {
+	matching := make([]httpsproxy.RequestRecord, 0, len(requests))
+	for _, request := range requests {
+		if disposition == "" {
+			if request.Disposition == httpsproxy.RequestDispositionSafeRead ||
+				request.Disposition == httpsproxy.RequestDispositionControlPlane {
+				continue
+			}
+		} else if request.Disposition != disposition {
+			continue
+		}
+		matching = append(matching, request)
+	}
+	if len(matching) == 0 {
+		return
+	}
+	fmt.Fprintln(output, "\n"+header)
+	fmt.Fprintln(output, detail)
+	for _, request := range matching {
+		status := "forwarded"
+		if request.StatusCode != 0 {
+			status = fmt.Sprintf("HTTP %d", request.StatusCode)
+		}
+		fmt.Fprintf(output, "  - [%s] %s %s\n", status, request.Method, request.URL)
+		if request.Error != "" {
+			fmt.Fprintf(output, "    Error: %s\n", request.Error)
+		}
+		printUndoDisclosure(output, request.Undo)
 	}
 }
 

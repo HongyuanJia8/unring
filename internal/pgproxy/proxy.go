@@ -198,8 +198,20 @@ type Proxy struct {
 	fatalErr  error
 	fatalDone chan struct{}
 
-	backendKey atomic.Uint32
+	backendKey     atomic.Uint32
+	upstreamPID    uint32
+	upstreamSecret uint32
+	cancelMu       sync.Mutex
+	cancelClients  map[cancelKey]uint64
+	activeCancels  map[uint64]func(context.Context) error
 }
+
+type cancelKey struct {
+	processID uint32
+	secretKey uint32
+}
+
+var errCancelRequestHandled = errors.New("postgres cancel request handled")
 
 // Start connects to the real database, starts the shared transaction, and
 // begins listening on an ephemeral loopback port.
@@ -241,6 +253,10 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 		approve:         options.Approve,
 		runCtx:          runCtx,
 		cancel:          cancel,
+		upstreamPID:     hijacked.PID,
+		upstreamSecret:  hijacked.SecretKey,
+		cancelClients:   make(map[cancelKey]uint64),
+		activeCancels:   make(map[uint64]func(context.Context) error),
 	}
 
 	// READ COMMITTED is deliberate. The baseline is captured explicitly below,
@@ -520,14 +536,20 @@ func (p *Proxy) handleClient(conn net.Conn) {
 	}()
 
 	backend := pgproto3.NewBackend(conn, conn)
-	if err := p.handshake(conn, backend); err != nil {
+	clientID := p.clientID.Add(1)
+	key, err := p.handshake(conn, backend, clientID)
+	if errors.Is(err, errCancelRequestHandled) {
+		return
+	}
+	if err != nil {
 		p.recordUnintercepted("", "PostgreSQL startup traffic was not intercepted: "+err.Error())
 		p.sendFatal(backend, fmt.Sprintf("unring postgres handshake failed: %v", err))
 		return
 	}
+	defer p.unregisterCancelClient(key)
 
 	clientContext, cancelClient := context.WithCancel(p.context())
-	client := newClientState(p.clientID.Add(1), backend)
+	client := newClientState(clientID, backend)
 	client.ctx = clientContext
 	client.cancel = cancelClient
 	client.incoming = make(chan clientInput)
@@ -597,16 +619,20 @@ func (p *Proxy) receiveClient(client *clientState) {
 	}
 }
 
-func (p *Proxy) handshake(conn net.Conn, backend *pgproto3.Backend) error {
+func (p *Proxy) handshake(
+	conn net.Conn,
+	backend *pgproto3.Backend,
+	clientID uint64,
+) (cancelKey, error) {
 	for {
 		message, err := backend.ReceiveStartupMessage()
 		if err != nil {
-			return fmt.Errorf("receive startup message: %w", err)
+			return cancelKey{}, fmt.Errorf("receive startup message: %w", err)
 		}
-		switch message.(type) {
+		switch message := message.(type) {
 		case *pgproto3.SSLRequest, *pgproto3.GSSEncRequest:
 			if _, err := conn.Write([]byte{'N'}); err != nil {
-				return fmt.Errorf("decline transport encryption: %w", err)
+				return cancelKey{}, fmt.Errorf("decline transport encryption: %w", err)
 			}
 			continue
 		case *pgproto3.StartupMessage:
@@ -623,22 +649,103 @@ func (p *Proxy) handshake(conn net.Conn, backend *pgproto3.Backend) error {
 			}
 			p.paramsMu.RUnlock()
 
-			key := p.backendKey.Add(1)
+			key := cancelKey{
+				processID: uint32(clientID),
+				secretKey: p.backendKey.Add(1),
+			}
+			p.registerCancelClient(key, clientID)
 			backend.Send(&pgproto3.BackendKeyData{
-				ProcessID: uint32(time.Now().UnixNano()),
-				SecretKey: key,
+				ProcessID: key.processID,
+				SecretKey: key.secretKey,
 			})
 			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 			if err := backend.Flush(); err != nil {
-				return fmt.Errorf("send startup response: %w", err)
+				p.unregisterCancelClient(key)
+				return cancelKey{}, fmt.Errorf("send startup response: %w", err)
 			}
-			return nil
+			return key, nil
 		case *pgproto3.CancelRequest:
-			return errors.New("query cancellation is not supported")
+			p.handleCancelRequest(message)
+			return cancelKey{}, errCancelRequestHandled
 		default:
-			return fmt.Errorf("unsupported startup message %T", message)
+			return cancelKey{}, fmt.Errorf("unsupported startup message %T", message)
 		}
 	}
+}
+
+func (p *Proxy) registerCancelClient(key cancelKey, clientID uint64) {
+	p.cancelMu.Lock()
+	if p.cancelClients == nil {
+		p.cancelClients = make(map[cancelKey]uint64)
+	}
+	p.cancelClients[key] = clientID
+	p.cancelMu.Unlock()
+}
+
+func (p *Proxy) unregisterCancelClient(key cancelKey) {
+	p.cancelMu.Lock()
+	clientID := p.cancelClients[key]
+	delete(p.cancelClients, key)
+	delete(p.activeCancels, clientID)
+	p.cancelMu.Unlock()
+}
+
+func (p *Proxy) handleCancelRequest(request *pgproto3.CancelRequest) {
+	key := cancelKey{processID: request.ProcessID, secretKey: request.SecretKey}
+	p.cancelMu.Lock()
+	clientID, known := p.cancelClients[key]
+	cancelActive := p.activeCancels[clientID]
+	p.cancelMu.Unlock()
+	if !known || cancelActive == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = cancelActive(ctx)
+}
+
+func (p *Proxy) setActiveCancel(clientID uint64, cancel func(context.Context) error) {
+	p.cancelMu.Lock()
+	if p.activeCancels == nil {
+		p.activeCancels = make(map[uint64]func(context.Context) error)
+	}
+	p.activeCancels[clientID] = cancel
+	p.cancelMu.Unlock()
+}
+
+func (p *Proxy) clearActiveCancel(clientID uint64) {
+	p.cancelMu.Lock()
+	delete(p.activeCancels, clientID)
+	p.cancelMu.Unlock()
+}
+
+func (p *Proxy) cancelSharedBackend(ctx context.Context) error {
+	serverAddr := p.upstream.RemoteAddr()
+	network, address := serverAddr.Network(), serverAddr.String()
+	if network == "unix" {
+		network, address = pgconn.NetworkAddress(p.config.Host, p.config.Port)
+	}
+	connection, err := p.config.DialFunc(ctx, network, address)
+	if err != nil {
+		return fmt.Errorf("dial postgres cancellation connection: %w", err)
+	}
+	defer connection.Close()
+	message := &pgproto3.CancelRequest{
+		ProcessID: p.upstreamPID,
+		SecretKey: p.upstreamSecret,
+	}
+	encoded, err := message.Encode(nil)
+	if err != nil {
+		return fmt.Errorf("encode postgres cancellation request: %w", err)
+	}
+	written, err := connection.Write(encoded)
+	if err != nil {
+		return fmt.Errorf("send postgres cancellation request: %w", err)
+	}
+	if written != len(encoded) {
+		return fmt.Errorf("send postgres cancellation request: %w", io.ErrShortWrite)
+	}
+	return nil
 }
 
 func (p *Proxy) stopClients() {

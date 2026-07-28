@@ -67,6 +67,41 @@ func TestProxyInterceptsRecordsAndForwardsHTTPS(t *testing.T) {
 	if len(summary.Unintercepted) != 0 {
 		t.Fatalf("successful interception was reported as uncovered: %#v", summary.Unintercepted)
 	}
+	if summary.Requests[0].Disposition != RequestDispositionSafeRead ||
+		summary.HasReviewableActivity() || summary.HasForwardedEffects() {
+		t.Fatalf("safe GET manufactured reviewable activity: %#v", summary)
+	}
+}
+
+func TestSummaryOnlyTreatsForwardedMutationsAsEffects(t *testing.T) {
+	t.Parallel()
+	safe := Summary{
+		Sealed: true,
+		Requests: []RequestRecord{{
+			Method: http.MethodGet, Disposition: RequestDispositionSafeRead,
+		}},
+	}
+	if safe.HasReviewableActivity() || safe.HasForwardedEffects() {
+		t.Fatalf("safe read requires review: %#v", safe)
+	}
+	controlPlane := Summary{
+		Sealed: true,
+		Requests: []RequestRecord{{
+			Method: http.MethodPost, Disposition: RequestDispositionControlPlane,
+		}},
+	}
+	if controlPlane.HasReviewableActivity() || controlPlane.HasForwardedEffects() {
+		t.Fatalf("agent control plane requires review: %#v", controlPlane)
+	}
+	mutation := Summary{
+		Sealed: true,
+		Requests: []RequestRecord{{
+			Method: http.MethodPost, Disposition: RequestDispositionApproved,
+		}},
+	}
+	if !mutation.HasReviewableActivity() || !mutation.HasForwardedEffects() {
+		t.Fatalf("forwarded mutation does not require review: %#v", mutation)
+	}
 }
 
 func TestPrepareClientResponseAddsHTTP11Framing(t *testing.T) {
