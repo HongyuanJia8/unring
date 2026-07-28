@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/HongyuanJia8/unring/internal/cli"
+	"github.com/hyj28/unring/internal/cli"
 )
 
 func main() {

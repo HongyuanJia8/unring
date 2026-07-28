@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	testpostgres "github.com/HongyuanJia8/unring/internal/testsupport/postgres"
+	testpostgres "github.com/hyj28/unring/internal/testsupport/postgres"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 

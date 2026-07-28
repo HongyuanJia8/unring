@@ -1,4 +1,4 @@
-module github.com/HongyuanJia8/unring
+module github.com/hyj28/unring
 
 go 1.26
 
