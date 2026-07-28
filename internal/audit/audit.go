@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/HongyuanJia8/unring/internal/httpsproxy"
-	"github.com/HongyuanJia8/unring/internal/pgproxy"
+	"github.com/hyj28/unring/internal/httpsproxy"
+	"github.com/hyj28/unring/internal/pgproxy"
 )
 
 const recordVersion = 1

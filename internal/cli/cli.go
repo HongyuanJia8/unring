@@ -18,11 +18,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/HongyuanJia8/unring/internal/audit"
-	"github.com/HongyuanJia8/unring/internal/childenv"
-	"github.com/HongyuanJia8/unring/internal/httpsproxy"
-	"github.com/HongyuanJia8/unring/internal/pgproxy"
-	"github.com/HongyuanJia8/unring/internal/runner"
+	"github.com/hyj28/unring/internal/audit"
+	"github.com/hyj28/unring/internal/childenv"
+	"github.com/hyj28/unring/internal/httpsproxy"
+	"github.com/hyj28/unring/internal/pgproxy"
+	"github.com/hyj28/unring/internal/runner"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/term"
 )

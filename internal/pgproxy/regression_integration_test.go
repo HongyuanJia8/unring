@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	testpostgres "github.com/HongyuanJia8/unring/internal/testsupport/postgres"
+	testpostgres "github.com/hyj28/unring/internal/testsupport/postgres"
 )
 
 func TestOpenClientTransactionDoesNotPinBackendIntegration(t *testing.T) {

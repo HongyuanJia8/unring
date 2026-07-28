@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/HongyuanJia8/unring/internal/childenv"
-	"github.com/HongyuanJia8/unring/internal/httpsproxy"
+	"github.com/hyj28/unring/internal/childenv"
+	"github.com/hyj28/unring/internal/httpsproxy"
 )
 
 func TestCurlReceivesCompleteResponsesIntegration(t *testing.T) {
