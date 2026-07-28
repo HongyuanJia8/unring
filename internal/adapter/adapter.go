@@ -76,12 +76,15 @@ type SyntheticResponse struct {
 	Body    string            `yaml:"body,omitempty"`
 }
 
-// Undo declares the compensating request for M8. Slice 5 validates and retains
-// it but deliberately does not execute it.
+// Undo declares a best-effort compensating request and the honest user-facing
+// boundary of that compensation.
 type Undo struct {
-	Method string `yaml:"method"`
-	URL    string `yaml:"url"`
-	Body   string `yaml:"body,omitempty"`
+	Method      string            `yaml:"method"`
+	URL         string            `yaml:"url"`
+	Headers     map[string]string `yaml:"headers,omitempty"`
+	Body        string            `yaml:"body,omitempty"`
+	Effect      string            `yaml:"effect,omitempty"`
+	StillExists string            `yaml:"still_exists,omitempty"`
 }
 
 // Request is the complete deterministic classification input.
@@ -371,8 +374,22 @@ func validateRule(rule Rule) error {
 		if rule.Undo.Method == "" || rule.Undo.URL == "" {
 			return errors.New("undo.method and undo.url are required when undo is declared")
 		}
-		if _, err := url.ParseRequestURI(rule.Undo.URL); err != nil {
+		renderableURL := templatePlaceholder.ReplaceAllString(rule.Undo.URL, "placeholder")
+		if templatePlaceholder.MatchString(rule.Undo.URL) &&
+			templatePlaceholder.FindString(rule.Undo.URL) == rule.Undo.URL {
+			renderableURL = "https://placeholder.invalid/resource"
+		}
+		parsedUndoURL, err := url.ParseRequestURI(renderableURL)
+		if err != nil {
 			return fmt.Errorf("invalid undo.url: %w", err)
+		}
+		if !parsedUndoURL.IsAbs() || parsedUndoURL.Host == "" {
+			return errors.New("undo.url must be absolute")
+		}
+		for name := range rule.Undo.Headers {
+			if strings.TrimSpace(name) == "" || isHopByHop(name) {
+				return fmt.Errorf("undo header %q is invalid or hop-by-hop", name)
+			}
 		}
 	}
 	return nil
@@ -528,6 +545,10 @@ func cloneUndo(undo *Undo) *Undo {
 		return nil
 	}
 	clone := *undo
+	clone.Headers = make(map[string]string, len(undo.Headers))
+	for name, value := range undo.Headers {
+		clone.Headers[name] = value
+	}
 	return &clone
 }
 

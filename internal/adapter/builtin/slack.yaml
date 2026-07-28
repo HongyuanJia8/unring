@@ -20,4 +20,8 @@ rules:
     undo:
       method: POST
       url: https://slack.com/api/chat.delete
+      headers:
+        Content-Type: application/json
       body: '{"channel":"${request.body.channel}","ts":"${response.ts}"}'
+      effect: delete the Slack message posted by this token
+      still_exists: if deletion fails, the Slack message remains posted; even after deletion, someone may already have read it

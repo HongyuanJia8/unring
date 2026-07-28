@@ -11,6 +11,10 @@ rules:
     tier: needs-approval
     idempotency_key: '"github-issue:" + request.body_sha256'
     undo:
-      method: POST
-      url: https://api.github.com/graphql
-      body: '{"query":"mutation($id:ID!){deleteIssue(input:{issueId:$id}){clientMutationId}}","variables":{"id":"${response.node_id}"}}'
+      method: PATCH
+      url: ${response.url}
+      headers:
+        Content-Type: application/json
+      body: '{"state":"closed"}'
+      effect: close the created GitHub issue
+      still_exists: the issue and its history remain on GitHub in a closed state; GitHub REST cannot delete an issue

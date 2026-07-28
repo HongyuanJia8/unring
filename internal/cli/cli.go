@@ -21,6 +21,7 @@ import (
 	"github.com/hyj28/unring/internal/adapter"
 	"github.com/hyj28/unring/internal/audit"
 	"github.com/hyj28/unring/internal/childenv"
+	"github.com/hyj28/unring/internal/ghshim"
 	"github.com/hyj28/unring/internal/httpsproxy"
 	"github.com/hyj28/unring/internal/pgproxy"
 	"github.com/hyj28/unring/internal/runner"
@@ -93,6 +94,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 
 	var proxy *pgproxy.Proxy
 	var httpsProxy *httpsproxy.Proxy
+	var ghSession *ghshim.Session
 	var finalized bool
 	var auditError string
 	requestedDecision := "discard"
@@ -113,6 +115,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 				auditError = joinErrorText(auditError, closeErr)
 			}
 		}
+		if ghSession != nil {
+			if closeErr := ghSession.Close(); closeErr != nil {
+				auditError = joinErrorText(auditError, closeErr)
+			}
+		}
 		if recovered != nil {
 			auditError = fmt.Sprintf("panic: %v", recovered)
 			if exitCode == 0 {
@@ -129,6 +136,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 			if httpsProxy != nil {
 				updateHTTPSAudit(record, httpsProxy.Summary())
+			}
+			if ghSession != nil {
+				record.GH = ghSession.Summary()
 			}
 			if outcome != "" {
 				record.Outcome = outcome
@@ -163,6 +173,52 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	approvalRequests := make(chan runner.ApprovalRequest)
+	ghSession, err = ghshim.Start(ghshim.Options{
+		Adapters: adapterSet, Stdin: stdin, Stdout: stdout, Stderr: stderr,
+		Approve: func(approvalContext context.Context, request ghshim.ApprovalRequest) (bool, error) {
+			reply := make(chan runner.ApprovalResult, 1)
+			work := runner.ApprovalRequest{
+				Decide: func() (bool, error) {
+					return promptGHApproval(stdin, stdout, request), nil
+				},
+				Reply: reply,
+			}
+			select {
+			case approvalRequests <- work:
+			case <-approvalContext.Done():
+				return false, approvalContext.Err()
+			}
+			select {
+			case result := <-reply:
+				decision := "declined"
+				if result.Approved {
+					decision = "approved"
+				}
+				approvalError := ""
+				if result.Err != nil {
+					decision = "error"
+					approvalError = result.Err.Error()
+				}
+				if err := auditSession.Update(func(record *audit.Record) {
+					record.Approvals = append(record.Approvals, audit.Approval{
+						Kind: "gh", Statement: request.Invocation, Reason: request.Reason,
+						Decision: decision, Error: approvalError, Time: time.Now().UTC(),
+					})
+				}); err != nil {
+					return false, fmt.Errorf("record gh approval decision: %w", err)
+				}
+				return result.Approved, result.Err
+			case <-approvalContext.Done():
+				return false, approvalContext.Err()
+			}
+		},
+	})
+	if err != nil {
+		cancel()
+		auditError = err.Error()
+		fmt.Fprintf(stderr, "unring: start per-session gh shim: %v\n", err)
+		return internalErrorExitCode
+	}
 	proxy, err = pgproxy.StartWithOptions(ctx, backendConfig, pgproxy.Options{
 		Approve: func(approvalContext context.Context, request pgproxy.ApprovalRequest) (bool, error) {
 			reply := make(chan runner.ApprovalResult, 1)
@@ -278,6 +334,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: build child HTTPS environment: %v\n", err)
 		return internalErrorExitCode
 	}
+	childEnvironment = ghSession.Environment(childEnvironment)
 
 	signalChannel := make(chan os.Signal, 2)
 	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
@@ -297,6 +354,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	if result.Err != nil {
 		auditError = joinErrorText(auditError, result.Err)
 	}
+
+	ghSealContext, ghSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ghSealErr := ghSession.Seal(ghSealContext)
+	ghSealCancel()
+	ghSummary := ghSession.Summary()
 
 	httpsSealContext, httpsSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	httpsSealErr := httpsProxy.Seal(httpsSealContext)
@@ -327,17 +389,24 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			"unring: HTTPS INTERCEPTION LOST: the HTTPS audit may be incomplete; "+
 				"the database session will be discarded: %v\n", httpsSealErr)
 	}
-	interceptionErr := errors.Join(postgresInterceptionErr, httpsSealErr)
+	if ghSealErr != nil {
+		auditError = joinErrorText(auditError, ghSealErr)
+		fmt.Fprintf(stderr,
+			"unring: GH SHIM LOST: gh activity may be incomplete; the session will be discarded: %v\n",
+			ghSealErr)
+	}
+	interceptionErr := errors.Join(postgresInterceptionErr, httpsSealErr, ghSealErr)
 
 	if interceptionErr == nil && !summary.HasReviewableActivity() &&
-		!httpsSummary.HasReviewableActivity() {
+		!httpsSummary.HasReviewableActivity() && !ghSummary.HasReviewableActivity() {
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
 		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ghFinalizeErr := ghSession.Finalize(finalizeContext, false)
 		httpsFinalizeErr := httpsProxy.Finalize(finalizeContext, false)
 		finalizeErr := errors.Join(
-			httpsFinalizeErr,
+			ghFinalizeErr, httpsFinalizeErr,
 			proxy.Finalize(finalizeContext, pgproxy.DecisionRollback),
 		)
 		finalizeCancel()
@@ -347,6 +416,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			_ = auditSession.Update(func(record *audit.Record) {
 				record.Postgres = summary
 				updateHTTPSAudit(record, httpsProxy.Summary())
+				record.GH = ghSummary
 				record.Decision = "discard"
 				record.Outcome = "unknown"
 			})
@@ -357,6 +427,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if err := auditSession.Update(func(record *audit.Record) {
 			record.Postgres = summary
 			updateHTTPSAudit(record, httpsProxy.Summary())
+			record.GH = ghSummary
 			record.Decision = "discard"
 			record.Outcome = "discarded"
 		}); err != nil {
@@ -370,7 +441,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	useTUI := interceptionErr == nil && !interrupted && result.Err == nil &&
 		summary.Changes.Complete && !*forceCommit && !*forceDiscard && shouldUseTUI(stdin, stdout)
 	if !useTUI {
-		printSummaryWithHTTPS(stdout, summary, httpsSummary)
+		printSummaryWithExternal(stdout, summary, httpsSummary, ghSummary)
 	}
 
 	decision := pgproxy.DecisionRollback
@@ -393,7 +464,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if useTUI {
 			var reviewErr error
 			decision, interrupted, reviewErr = reviewDecisionWithSignal(
-				stdin, stdout, signalChannel, summary, httpsSummary,
+				stdin, stdout, signalChannel, summary, httpsSummary, ghSummary,
 			)
 			if reviewErr != nil {
 				fmt.Fprintf(stderr, "unring: %v; defaulting to discard\n", reviewErr)
@@ -416,6 +487,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	if err := auditSession.Update(func(record *audit.Record) {
 		record.Postgres = summary
 		updateHTTPSAudit(record, httpsSummary)
+		record.GH = ghSummary
 		record.Decision = auditDecision(decision)
 	}); err != nil {
 		auditError = err.Error()
@@ -423,12 +495,19 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		decision = pgproxy.DecisionRollback
 	}
 	requestedDecision = auditDecision(decision)
-	commitHTTPS := decision == pgproxy.DecisionCommit
+	commitExternal := decision == pgproxy.DecisionCommit
+	ghFinalizeContext, ghFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ghFinalizeErr := ghSession.Finalize(ghFinalizeContext, commitExternal)
+	ghFinalizeCancel()
+	if ghFinalizeErr != nil {
+		auditError = joinErrorText(auditError, ghFinalizeErr)
+	}
+	commitHTTPS := commitExternal && ghFinalizeErr == nil
 	httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	httpsFinalizeErr := httpsProxy.Finalize(httpsFinalizeContext, commitHTTPS)
 	httpsFinalizeCancel()
 	postgresDecision := decision
-	if httpsFinalizeErr != nil {
+	if httpsFinalizeErr != nil || ghFinalizeErr != nil {
 		// A staged HTTP replay may have partially succeeded. Keep the database
 		// reversible instead of compounding that uncertainty with a commit.
 		postgresDecision = pgproxy.DecisionRollback
@@ -437,7 +516,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	postgresFinalizeErr := proxy.Finalize(finalizeContext, postgresDecision)
 	finalizeCancel()
-	finalizeErr := errors.Join(httpsFinalizeErr, postgresFinalizeErr)
+	finalizeErr := errors.Join(ghFinalizeErr, httpsFinalizeErr, postgresFinalizeErr)
 	finalized = true
 	if finalizeErr != nil {
 		auditError = joinErrorText(auditError, postgresFinalizeErr)
@@ -445,17 +524,26 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		_ = auditSession.Update(func(record *audit.Record) {
 			record.Postgres = proxy.Summary()
 			updateHTTPSAudit(record, finalHTTPS)
+			record.GH = ghSession.Summary()
 			record.Outcome = "unknown"
 		})
 		if commitHTTPS && httpsFinalizeErr != nil {
 			printPartialCommitOutcome(stdout, finalHTTPS, postgresFinalizeErr)
 		}
+		if ghFinalizeErr != nil {
+			fmt.Fprintln(stdout, "\nGH DISCARD COMPENSATION FAILED OR WAS IMPOSSIBLE")
+			fmt.Fprintln(stdout,
+				"An approved gh mutation really ran and may still exist. Unring is not claiming it was undone.")
+			printGHSummary(stdout, ghSession.Summary())
+		}
+		printCompensationFailures(stdout, finalHTTPS)
 		fmt.Fprintf(stderr, "unring: session outcome not confirmed: %v\n", finalizeErr)
 		return internalErrorExitCode
 	}
 	if err := auditSession.Update(func(record *audit.Record) {
 		record.Postgres = proxy.Summary()
 		updateHTTPSAudit(record, httpsProxy.Summary())
+		record.GH = ghSession.Summary()
 		record.Outcome = pastTense(decision)
 	}); err != nil {
 		auditError = err.Error()
@@ -468,6 +556,35 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return result.ExitCode
 	}
 	return result.ExitCode
+}
+
+func printCompensationFailures(output io.Writer, summary httpsproxy.Summary) {
+	printedHeader := false
+	printOne := func(method, target string, undo *httpsproxy.UndoRecord) {
+		if undo == nil || (undo.State != "failed" && undo.State != "unavailable") {
+			return
+		}
+		if !printedHeader {
+			fmt.Fprintln(output, "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+			fmt.Fprintln(output, "DISCARD COMPENSATION FAILED OR WAS IMPOSSIBLE")
+			fmt.Fprintln(output,
+				"The original external effect may still exist. Unring is not claiming it was undone.")
+			fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+			printedHeader = true
+		}
+		fmt.Fprintf(output, "  - %s %s\n", method, target)
+		fmt.Fprintf(output, "    Attempted: %s\n", undo.Effect)
+		if undo.Error != "" {
+			fmt.Fprintf(output, "    Error: %s\n", undo.Error)
+		}
+		fmt.Fprintf(output, "    WHAT REMAINS: %s\n", undo.StillExists)
+	}
+	for _, request := range summary.Requests {
+		printOne(request.Method, request.URL, request.Undo)
+	}
+	for _, request := range summary.Staged {
+		printOne(request.Method, request.URL, request.Undo)
+	}
 }
 
 func printPartialCommitOutcome(
@@ -488,6 +605,13 @@ func printPartialCommitOutcome(
 		}
 		if request.Error != "" {
 			fmt.Fprintf(output, "    Error: %s\n", request.Error)
+		}
+	}
+	if len(summary.Requests) > 0 {
+		fmt.Fprintln(output,
+			"Already-forwarded HTTPS requests remain as sent. Commit never runs discard compensation:")
+		for _, request := range summary.Requests {
+			fmt.Fprintf(output, "  - %s %s\n", request.Method, request.URL)
 		}
 	}
 	if postgresFinalizeErr == nil {
@@ -669,7 +793,7 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	if record.Error != "" {
 		fmt.Fprintf(output, "Error: %s\n", record.Error)
 	}
-	printSummaryWithHTTPS(output, record.Postgres, record.HTTPS)
+	printSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
 	if len(record.Approvals) > 0 {
 		fmt.Fprintln(output, "\nIRREVERSIBLE ACTION DECISIONS")
 		for _, approval := range record.Approvals {
@@ -794,6 +918,35 @@ func promptHTTPSApproval(
 	return approved
 }
 
+func promptGHApproval(
+	input io.Reader,
+	output io.Writer,
+	request ghshim.ApprovalRequest,
+) bool {
+	fmt.Fprintln(output, "\ngh action needs approval")
+	fmt.Fprintf(output, "  Invocation: %s\n", request.Invocation)
+	fmt.Fprintf(output, "  Structured intent: %s\n", request.Intent)
+	fmt.Fprintf(output, "  Reason: %s.\n", request.Reason)
+	fmt.Fprintln(output,
+		"  Approving runs the real gh now with the same stdin, stdout, stderr, and terminal; declining guarantees it is not run.")
+	if !isTerminal(input) || !isTerminalWriter(output) {
+		fmt.Fprintln(output, "  No interactive terminal; declining the action.")
+		return false
+	}
+	fmt.Fprint(output, "Run this gh invocation? [y/N] ")
+	answer, err := readOnePromptLine(input)
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintf(output, "\nCould not read approval (%v); declining.\n", err)
+		return false
+	}
+	approved := strings.EqualFold(strings.TrimSpace(answer), "y") ||
+		strings.EqualFold(strings.TrimSpace(answer), "yes")
+	if !approved {
+		fmt.Fprintln(output, "Action declined; gh was not run.")
+	}
+	return approved
+}
+
 // readOnePromptLine deliberately limits every Read call to one byte. A
 // bufio.Reader may read several canonical terminal lines at once on Linux;
 // discarding that reader after the approval would then swallow input intended
@@ -859,6 +1012,15 @@ func printSummaryWithHTTPS(
 	summary pgproxy.Summary,
 	httpsSummary httpsproxy.Summary,
 ) {
+	printSummaryWithExternal(output, summary, httpsSummary, ghshim.Summary{Sealed: true})
+}
+
+func printSummaryWithExternal(
+	output io.Writer,
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+) {
 	failed := 0
 	for _, query := range summary.Queries {
 		if query.Failed {
@@ -867,7 +1029,7 @@ func printSummaryWithHTTPS(
 	}
 
 	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
-	if !summary.FullyReversible || len(httpsSummary.Requests) > 0 {
+	if !summary.FullyReversible || len(httpsSummary.Requests) > 0 || ghMayHaveExternalEffect(ghSummary) {
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		fmt.Fprintln(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE")
 		fmt.Fprintln(output, "Unring cannot guarantee every recorded effect can be undone by discarding.")
@@ -940,6 +1102,10 @@ func printSummaryWithHTTPS(
 			if request.Warning != "" {
 				fmt.Fprintf(output, "    Warning: %s\n", request.Warning)
 			}
+			if request.State != "" && request.State != "pending" &&
+				request.State != "discarded" {
+				printUndoDisclosure(output, request.Undo)
+			}
 		}
 	}
 	declinedApprovals := 0
@@ -964,8 +1130,7 @@ func printSummaryWithHTTPS(
 	}
 	if len(httpsSummary.Requests) > 0 {
 		fmt.Fprintln(output, "\nHTTPS REQUESTS — INTERCEPTED AND ALREADY FORWARDED")
-		fmt.Fprintln(output,
-			"  These requests reached their destinations; commit/discard cannot undo external effects.")
+		fmt.Fprintln(output, "  These requests reached their destinations.")
 		for _, request := range httpsSummary.Requests {
 			status := "forwarded"
 			if request.StatusCode != 0 {
@@ -975,7 +1140,12 @@ func printSummaryWithHTTPS(
 			if request.Error != "" {
 				fmt.Fprintf(output, "    Error: %s\n", request.Error)
 			}
+			printUndoDisclosure(output, request.Undo)
 		}
+	}
+	if len(ghSummary.Records) > 0 {
+		fmt.Fprintln(output, "\nGH INVOCATIONS — MUTATIONS AND AMBIGUOUS COMMANDS")
+		printGHSummary(output, ghSummary)
 	}
 	if len(summary.Unintercepted) > 0 || len(httpsSummary.Unintercepted) > 0 {
 		fmt.Fprintln(output, "\n================================================================")
@@ -994,6 +1164,53 @@ func printSummaryWithHTTPS(
 			fmt.Fprintf(output, "  Detail: %s\n", item.Detail)
 		}
 		fmt.Fprintln(output, "================================================================")
+	}
+}
+
+func printGHSummary(output io.Writer, summary ghshim.Summary) {
+	for _, record := range summary.Records {
+		fmt.Fprintf(output, "  - [%s] gh %s\n",
+			record.State, strings.Join(record.Arguments, " "))
+		fmt.Fprintf(output, "    Intent: %s\n", record.Intent)
+		fmt.Fprintf(output, "    Reason: %s\n", record.Reason)
+		if record.UndoEffect != "" {
+			fmt.Fprintf(output, "    Declared compensation: %s\n", record.UndoEffect)
+		}
+		if record.StillExists != "" {
+			fmt.Fprintf(output, "    What remains or may remain: %s\n", record.StillExists)
+		}
+		if record.UndoState != "" {
+			fmt.Fprintf(output, "    Compensation state: %s\n", record.UndoState)
+		}
+		if record.UndoError != "" {
+			fmt.Fprintf(output, "    Compensation error: %s\n", record.UndoError)
+		}
+		if record.Error != "" {
+			fmt.Fprintf(output, "    Error: %s\n", record.Error)
+		}
+	}
+}
+
+func printUndoDisclosure(output io.Writer, undo *httpsproxy.UndoRecord) {
+	if undo == nil {
+		fmt.Fprintln(output,
+			"    Discard cannot undo this forwarded request; any external effect remains.")
+		return
+	}
+	switch undo.State {
+	case "available":
+		fmt.Fprintf(output, "    Discard will attempt: %s\n", undo.Effect)
+		fmt.Fprintf(output, "    What remains or may remain: %s\n", undo.StillExists)
+	case "succeeded":
+		fmt.Fprintf(output, "    Compensation succeeded: %s\n", undo.Effect)
+		fmt.Fprintf(output, "    What still remains: %s\n", undo.StillExists)
+	case "failed", "unavailable":
+		fmt.Fprintf(output, "    COMPENSATION %s: %s\n",
+			strings.ToUpper(undo.State), undo.Error)
+		fmt.Fprintf(output, "    WHAT REMAINS: %s\n", undo.StillExists)
+	default:
+		fmt.Fprintf(output, "    Compensation state: %s; action: %s\n", undo.State, undo.Effect)
+		fmt.Fprintf(output, "    Boundary: %s\n", undo.StillExists)
 	}
 }
 

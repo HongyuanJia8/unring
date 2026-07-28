@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
 
+	"github.com/hyj28/unring/internal/ghshim"
 	"github.com/hyj28/unring/internal/httpsproxy"
 	"github.com/hyj28/unring/internal/pgproxy"
 )
@@ -28,6 +29,7 @@ type reviewItem struct {
 type reviewModel struct {
 	summary  pgproxy.Summary
 	https    httpsproxy.Summary
+	gh       ghshim.Summary
 	items    []reviewItem
 	expanded map[int]bool
 	cursor   int
@@ -42,8 +44,17 @@ func newReviewModel(summary pgproxy.Summary) reviewModel {
 }
 
 func newReviewModelWithHTTPS(summary pgproxy.Summary, httpsSummary httpsproxy.Summary) reviewModel {
+	return newReviewModelWithExternal(summary, httpsSummary, ghshim.Summary{Sealed: true})
+}
+
+func newReviewModelWithExternal(
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+) reviewModel {
 	model := reviewModel{
-		summary: summary, https: httpsSummary, expanded: make(map[int]bool), height: 24,
+		summary: summary, https: httpsSummary, gh: ghSummary,
+		expanded: make(map[int]bool), height: 24,
 		decision: pgproxy.DecisionRollback,
 	}
 	for _, item := range summary.Unintercepted {
@@ -126,12 +137,64 @@ func newReviewModelWithHTTPS(summary pgproxy.Summary, httpsSummary httpsproxy.Su
 		if request.Error != "" {
 			status = "forwarding failed"
 		}
+		section := "HTTPS REQUESTS — ALREADY FORWARDED; DISCARD CANNOT UNDO"
+		detail := "This request was intercepted and forwarded. No compensation is declared; any external effect remains after discard."
+		if request.Undo != nil {
+			section = "HTTPS REQUESTS — DISCARD COMPENSATION"
+			detail = undoReviewDetail(request.Undo)
+		}
+		title := fmt.Sprintf("[%s] %s %s", status, request.Method, request.URL)
+		if request.Undo != nil {
+			title += fmt.Sprintf(" [discard: %s; limit: %s]",
+				request.Undo.Effect, request.Undo.StillExists)
+		} else {
+			title += " [discard cannot undo this]"
+		}
 		model.items = append(model.items, reviewItem{
-			section: "HTTPS REQUESTS — ALREADY FORWARDED",
-			title:   fmt.Sprintf("[%s] %s %s", status, request.Method, request.URL),
-			err:     request.Error,
-			detail: "This request was intercepted and forwarded. " +
-				"The final commit/discard decision cannot undo an external effect.",
+			section: section,
+			title:   title,
+			err:     request.Error, detail: detail,
+		})
+	}
+	for _, record := range ghSummary.Records {
+		section := "GH APPROVALS — NOT RUN"
+		detail := "This gh invocation did not run."
+		switch record.State {
+		case "ran", "failed":
+			section = "GH MUTATIONS — ALREADY RAN"
+			detail = "This gh invocation ran outside a transaction."
+			if record.UndoEffect != "" {
+				detail += " Discard compensation: " + record.UndoEffect + "."
+			}
+			if record.StillExists != "" {
+				detail += " Honest limit: " + record.StillExists + "."
+			}
+		case "approved":
+			section = "GH MUTATIONS — EXECUTION OUTCOME UNCONFIRMED"
+			detail = "Approval was granted, but unring received no execution outcome. " +
+				"The invocation may or may not have run; unring will not assume success."
+			if record.StillExists != "" {
+				detail += " Possible external remainder: " + record.StillExists + "."
+			}
+		}
+		title := fmt.Sprintf("[%s] gh %s", record.State, strings.Join(record.Arguments, " "))
+		if record.UndoEffect != "" {
+			switch record.UndoState {
+			case "available":
+				title += fmt.Sprintf(" [discard: %s; limit: %s]",
+					record.UndoEffect, record.StillExists)
+			case "failed", "unavailable", "succeeded":
+				title += fmt.Sprintf(" [discard compensation %s: %s; remains: %s]",
+					record.UndoState, record.UndoError, record.StillExists)
+			default:
+				title += fmt.Sprintf(" [discard compensation not yet available; limit: %s]",
+					record.StillExists)
+			}
+		}
+		model.items = append(model.items, reviewItem{
+			section: section,
+			title:   title,
+			err:     record.Error, detail: detail + " Reason: " + record.Reason,
 		})
 	}
 	return model
@@ -203,7 +266,8 @@ func (model reviewModel) View() string {
 	var output strings.Builder
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
-	if !model.summary.FullyReversible || len(model.https.Requests) > 0 {
+	if !model.summary.FullyReversible || len(model.https.Requests) > 0 ||
+		ghMayHaveExternalEffect(model.gh) {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
 		output.WriteString("Unring cannot guarantee every recorded effect can be undone by discarding.\n")
@@ -293,6 +357,7 @@ func reviewDecisionWithSignal(
 	signals <-chan os.Signal,
 	summary pgproxy.Summary,
 	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
 ) (pgproxy.Decision, bool, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -308,7 +373,7 @@ func reviewDecisionWithSignal(
 	}()
 
 	program := tea.NewProgram(
-		newReviewModelWithHTTPS(summary, httpsSummary),
+		newReviewModelWithExternal(summary, httpsSummary, ghSummary),
 		tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output),
 	)
 	final, err := program.Run()
@@ -326,6 +391,32 @@ func reviewDecisionWithSignal(
 		return pgproxy.DecisionRollback, false, nil
 	}
 	return model.decision, false, nil
+}
+
+func undoReviewDetail(undo *httpsproxy.UndoRecord) string {
+	switch undo.State {
+	case "available":
+		return "Discard will attempt to " + undo.Effect + ". What remains or may remain: " +
+			undo.StillExists + "."
+	case "succeeded":
+		return "Discard compensation succeeded: " + undo.Effect +
+			". What still remains: " + undo.StillExists + "."
+	case "failed", "unavailable":
+		return "Discard compensation is " + undo.State + ": " + undo.Error +
+			". What remains: " + undo.StillExists + "."
+	default:
+		return "Compensation state: " + undo.State + ". If needed, discard will attempt to " +
+			undo.Effect + ". Boundary: " + undo.StillExists + "."
+	}
+}
+
+func ghMayHaveExternalEffect(summary ghshim.Summary) bool {
+	for _, record := range summary.Records {
+		if record.State == "ran" || record.State == "failed" || record.State == "approved" {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldUseTUI(input io.Reader, output io.Writer) bool {

@@ -124,6 +124,83 @@ func TestReadOnlySessionExitsSilently(t *testing.T) {
 	}
 }
 
+func TestGHCreateCommandSubstitutionCannotSilentlySucceed(t *testing.T) {
+	connectionString, backendDone := startReviewTestBackend(t, false)
+	runLog := filepath.Join(t.TempDir(), "gh-runs")
+	fakeDirectory := t.TempDir()
+	fakeGH := filepath.Join(fakeDirectory, "gh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + runLog + "\"\n"
+	if err := os.WriteFile(fakeGH, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("DATABASE_URL", connectionString)
+	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+
+	binary := buildTestBinary(t)
+	childScript := `
+URL=$(gh issue create --repo acme/widget --title 'shim acceptance' --body 'body')
+create_status=$?
+printf 'captured=<%s> status=%s\n' "$URL" "$create_status"
+if [ "$create_status" -eq 0 ]; then
+  printf 'SILENT_EMPTY_SUCCESS\n'
+fi
+exit "$create_status"
+`
+	command := exec.Command(binary, "run", "--discard", "--", "/bin/sh", "-c", childScript)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
+		t.Fatalf("declined command substitution exit = %v, want non-zero\n%s", err, output)
+	}
+	text := string(output)
+	if !strings.Contains(text, "captured=<> status=1") ||
+		!strings.Contains(text, "cannot be staged honestly") ||
+		strings.Contains(text, "SILENT_EMPTY_SUCCESS") {
+		t.Fatalf("command substitution silently accepted a non-run mutation:\n%s", text)
+	}
+	if _, err := os.Stat(runLog); !os.IsNotExist(err) {
+		t.Fatalf("declined command substitution invoked real gh: %v", err)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
+func TestGHVersionPassesThroughWithoutApproval(t *testing.T) {
+	connectionString, backendDone := startReviewTestBackend(t, false)
+	t.Setenv("DATABASE_URL", connectionString)
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+	fakeDirectory := t.TempDir()
+	fakeGH := filepath.Join(fakeDirectory, "gh")
+	if err := os.WriteFile(fakeGH, []byte(
+		"#!/bin/sh\nprintf 'fake-gh-version\\n'\nprintf 'fake-gh-diagnostic\\n' >&2\nexit 23\n",
+	), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--discard", "--", "gh", "--version")
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 23 {
+		t.Fatalf("gh --version exit = %v, want 23\n%s", err, output)
+	}
+	text := string(output)
+	if !strings.Contains(text, "fake-gh-version") ||
+		!strings.Contains(text, "fake-gh-diagnostic") ||
+		strings.Contains(text, "needs approval") ||
+		strings.Contains(text, "UNRING SESSION REVIEW") {
+		t.Fatalf("gh --version was not transparent:\n%s", text)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
 func TestNonTerminalReviewUsesPlainTextWithoutANSI(t *testing.T) {
 	connectionString, backendDone := startReviewTestBackend(t, true)
 	t.Setenv("DATABASE_URL", connectionString)
@@ -670,7 +747,7 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 				}})
 				backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("170000")}})
 				tag = "SHOW"
-			case query.String == "ROLLBACK":
+			case query.String == "ROLLBACK" || query.String == "COMMIT":
 				status = 'I'
 			case strings.HasPrefix(query.String, "SAVEPOINT ") &&
 				strings.Contains(query.String, "SET LOCAL search_path = pg_catalog"):
@@ -711,7 +788,7 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 				done <- fmt.Errorf("send response for %q: %w", query.String, err)
 				return
 			}
-			if query.String == "ROLLBACK" {
+			if query.String == "ROLLBACK" || query.String == "COMMIT" {
 				return
 			}
 		}

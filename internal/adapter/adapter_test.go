@@ -103,6 +103,34 @@ rules:
 	}
 }
 
+func TestUndoTemplatesResolveOnlyRealRequestAndResponseFields(t *testing.T) {
+	declaration := &Undo{
+		Method: "POST", URL: "https://slack.com/api/chat.delete",
+		Body: `{"channel":"${request.body.channel}","ts":"${response.ts}"}`,
+	}
+	requestURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
+	rendered, err := RenderUndo(declaration, Request{
+		Method: http.MethodPost, URL: requestURL,
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   []byte(`{"channel":"C123"}`),
+	}, []byte(`{"ok":true,"ts":"1712345678.000100"}`))
+	if err != nil {
+		t.Fatalf("RenderUndo() error: %v", err)
+	}
+	if rendered.Body != `{"channel":"C123","ts":"1712345678.000100"}` {
+		t.Fatalf("rendered undo body = %q", rendered.Body)
+	}
+
+	_, err = RenderUndo(declaration, Request{
+		Method: http.MethodPost, URL: requestURL,
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   []byte(`{"channel":"C123"}`),
+	}, []byte(`{"ok":true}`))
+	if err == nil || !strings.Contains(err.Error(), "${response.ts}") {
+		t.Fatalf("missing response identifier error = %v", err)
+	}
+}
+
 func TestMalformedAndUnreadableAdaptersFailLoudly(t *testing.T) {
 	t.Run("malformed", func(t *testing.T) {
 		filename := filepath.Join(t.TempDir(), "broken-adapter.yaml")

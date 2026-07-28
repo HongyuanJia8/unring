@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/hyj28/unring/internal/audit"
+	"github.com/hyj28/unring/internal/ghshim"
 	"github.com/hyj28/unring/internal/httpsproxy"
 	"github.com/hyj28/unring/internal/pgproxy"
 )
@@ -188,6 +189,115 @@ func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T)
 	}
 }
 
+func TestReviewBeforeDecisionDistinguishesCompensableAndPermanentEffects(t *testing.T) {
+	t.Parallel()
+	postgresSummary := pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}
+	httpsSummary := httpsproxy.Summary{
+		Sealed: true,
+		Requests: []httpsproxy.RequestRecord{
+			{
+				Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+				StatusCode: 200,
+				Undo: &httpsproxy.UndoRecord{
+					Effect:      "delete the Slack message posted by this token",
+					StillExists: "someone may already have read it",
+					State:       "available",
+				},
+			},
+			{
+				Method: "POST", URL: "https://mail.example/send",
+				StatusCode: 202,
+			},
+		},
+	}
+	ghSummary := ghshim.Summary{
+		Sealed: true,
+		Records: []ghshim.Record{{
+			Arguments: []string{"issue", "create", "--title", "boundary"},
+			State:     "ran", UndoEffect: "close the created GitHub issue",
+			UndoState:   "available",
+			StillExists: "the issue and its history remain in a closed state; REST cannot delete it",
+		}},
+	}
+	view := newReviewModelWithExternal(postgresSummary, httpsSummary, ghSummary).View()
+	var plain bytes.Buffer
+	printSummaryWithExternal(&plain, postgresSummary, httpsSummary, ghSummary)
+	for label, text := range map[string]string{"TUI": view, "plain": plain.String()} {
+		for _, want := range []string{
+			"delete the Slack message",
+			"someone may already have read it",
+			"cannot undo",
+			"close the created GitHub issue",
+			"REST cannot delete it",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s review missing %q:\n%s", label, want, text)
+			}
+		}
+	}
+}
+
+func TestReviewDoesNotDisplayApprovedGHAsHavingRun(t *testing.T) {
+	t.Parallel()
+	model := newReviewModelWithExternal(
+		pgproxy.Summary{
+			Sealed: true, FullyReversible: true,
+			Changes: pgproxy.ChangeSummary{Complete: true},
+		},
+		httpsproxy.Summary{Sealed: true},
+		ghshim.Summary{Sealed: true, Records: []ghshim.Record{{
+			Arguments: []string{"issue", "create", "--title", "unconfirmed"},
+			Decision:  "approved", State: "approved",
+			UndoEffect:  "close the created GitHub issue",
+			StillExists: "the issue remains visible in history",
+		}}},
+	)
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	view := updated.(reviewModel).View()
+	for _, want := range []string{
+		"GH MUTATIONS — EXECUTION OUTCOME UNCONFIRMED",
+		"may or may not have run",
+		"discard compensation not yet available",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("unconfirmed gh review missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "GH MUTATIONS — ALREADY RAN") ||
+		strings.Contains(view, "discard compensation :") {
+		t.Fatalf("unconfirmed gh approval was presented as execution:\n%s", view)
+	}
+}
+
+func TestFailedCompensationIsProminentAndNamesRemainingEffect(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	printCompensationFailures(&output, httpsproxy.Summary{
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+			Undo: &httpsproxy.UndoRecord{
+				Effect:      "delete the Slack message",
+				StillExists: "the Slack message remains posted",
+				State:       "failed", Error: "Slack returned ok=false",
+			},
+		}},
+	})
+	text := output.String()
+	for _, want := range []string{
+		"DISCARD COMPENSATION FAILED OR WAS IMPOSSIBLE",
+		"not claiming it was undone",
+		"Slack returned ok=false",
+		"WHAT REMAINS: the Slack message remains posted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("failed compensation output missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestStagedReplayTransitionsArePersistedImmediatelyToAudit(t *testing.T) {
 	store, err := audit.OpenStoreAt(t.TempDir())
 	if err != nil {
@@ -224,18 +334,26 @@ func TestStagedReplayTransitionsArePersistedImmediatelyToAudit(t *testing.T) {
 
 func TestPartialCommitOutcomeListsSentUnknownAndDatabaseRollback(t *testing.T) {
 	var output bytes.Buffer
-	printPartialCommitOutcome(&output, httpsproxy.Summary{Staged: []httpsproxy.StagedRequest{
-		{Method: "POST", URL: "https://slack.com/one", State: "sent", ReplayStatusCode: 200},
-		{Method: "POST", URL: "https://slack.com/two", State: "unknown", ReplayStatusCode: 500,
-			Error: "origin returned HTTP 500; delivery outcome is unknown"},
-		{Method: "POST", URL: "https://slack.com/three", State: "sent", ReplayStatusCode: 200},
-	}}, nil)
+	printPartialCommitOutcome(&output, httpsproxy.Summary{
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "POST", URL: "https://api.github.com/repos/acme/widget/issues",
+		}},
+		Staged: []httpsproxy.StagedRequest{
+			{Method: "POST", URL: "https://slack.com/one", State: "sent", ReplayStatusCode: 200},
+			{Method: "POST", URL: "https://slack.com/two", State: "unknown", ReplayStatusCode: 500,
+				Error: "origin returned HTTP 500; delivery outcome is unknown"},
+			{Method: "POST", URL: "https://slack.com/three", State: "sent", ReplayStatusCode: 200},
+		},
+	}, nil)
 	text := output.String()
 	for _, want := range []string{
 		"COMMIT DID NOT COMPLETE",
 		"[sent] POST https://slack.com/one",
 		"[unknown] POST https://slack.com/two",
 		"[sent] POST https://slack.com/three",
+		"Already-forwarded HTTPS requests remain as sent",
+		"Commit never runs discard compensation",
+		"POST https://api.github.com/repos/acme/widget/issues",
 		"Postgres transaction: DISCARDED",
 		"requested commit became a rollback",
 	} {

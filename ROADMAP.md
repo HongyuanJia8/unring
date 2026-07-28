@@ -87,15 +87,16 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 
 ## M7 — `gh` PATH shim
 
-- [ ] M7.1 Shim injected at the front of the child's `PATH` — captures structured
+- [x] M7.1 Shim injected at the front of the child's `PATH` — captures structured
       intent, no certificate trust required (works around Go binaries ignoring
       `SSL_CERT_FILE` on macOS)
-- [ ] M7.2 Replay approved `gh` invocations on commit
+- [x] M7.2 Run output-dependent `gh` mutations only after explicit approval;
+      never synthesize a successful CLI result
 
 ## M8 — Compensating undo
 
-- [ ] M8.1 Undo actions declared per adapter, executed on discard
-- [ ] M8.2 Slack `chat.delete`; document precisely what GitHub cannot undo
+- [x] M8.1 Undo actions declared per adapter, executed on discard
+- [x] M8.2 Slack `chat.delete`; document precisely what GitHub cannot undo
 
 ---
 

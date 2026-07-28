@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hyj28/unring/internal/ghshim"
 	"github.com/hyj28/unring/internal/httpsproxy"
 	"github.com/hyj28/unring/internal/pgproxy"
 )
@@ -52,6 +53,7 @@ type Record struct {
 	Error         string             `json:"error,omitempty"`
 	Postgres      pgproxy.Summary    `json:"postgres"`
 	HTTPS         httpsproxy.Summary `json:"https"`
+	GH            ghshim.Summary     `json:"gh"`
 	Approvals     []Approval         `json:"irreversible_actions"`
 	Unintercepted []Unintercepted    `json:"unintercepted"`
 }
