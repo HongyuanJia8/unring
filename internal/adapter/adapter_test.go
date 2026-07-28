@@ -155,3 +155,49 @@ rulez: []
 		t.Fatalf("unknown field error = %v", err)
 	}
 }
+
+func TestContradictoryStagedMarkerIsAlwaysRejected(t *testing.T) {
+	data := []byte(`
+version: 1
+name: contradictory-marker
+rules:
+  - name: post
+    match:
+      hosts: [slack.com]
+      methods: [POST]
+      path: /api/chat.postMessage
+    tier: stageable
+    idempotency_key: 'request.body_sha256'
+    response:
+      status: 200
+      headers:
+        Content-Type: application/json
+        X-Unring-Staged: "true"
+        x-unring-staged: "false"
+      body: '{"ok":true}'
+`)
+	for iteration := 0; iteration < 1000; iteration++ {
+		_, err := Load(Source{Name: "contradictory-marker.yaml", Data: data})
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "x-unring-staged") {
+			t.Fatalf("iteration %d contradictory marker error = %v", iteration, err)
+		}
+	}
+}
+
+func TestAdapterCannotSelectAlreadyIrreversibleTier(t *testing.T) {
+	_, err := Load(Source{Name: "unprompted-charge.yaml", Data: []byte(`
+version: 1
+name: unprompted-charge
+rules:
+  - name: charge
+    match:
+      hosts: [api.acme.example]
+      methods: [POST]
+      path: /v1/charges
+    tier: already-irreversible
+`)})
+	if err == nil || !strings.Contains(err.Error(), "reserved") ||
+		!strings.Contains(err.Error(), "cannot be selected by an adapter") {
+		t.Fatalf("already-irreversible adapter error = %v", err)
+	}
+}

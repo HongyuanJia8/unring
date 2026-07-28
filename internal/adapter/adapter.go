@@ -345,7 +345,12 @@ func validateRule(rule Rule) error {
 		return fmt.Errorf("invalid match.path glob: %w", err)
 	}
 	switch rule.Tier {
-	case TierStageable, TierNeedsApproval, TierAlreadyIrreversible:
+	case TierStageable, TierNeedsApproval:
+	case TierAlreadyIrreversible:
+		return errors.New(
+			"tier already-irreversible is reserved for traffic unring could not intercept " +
+				"and cannot be selected by an adapter",
+		)
 	default:
 		return fmt.Errorf("tier %q is invalid", rule.Tier)
 	}
@@ -377,15 +382,24 @@ func validateSyntheticResponse(response SyntheticResponse) error {
 	if response.Status < 200 || response.Status > 299 {
 		return errors.New("stageable response.status must be a 2xx status")
 	}
-	stagedMarker := ""
+	stagedMarkers := 0
 	for name, value := range response.Headers {
 		if strings.EqualFold(name, "X-Unring-Staged") {
-			stagedMarker = value
-			break
+			stagedMarkers++
+			if !strings.EqualFold(value, "true") {
+				return fmt.Errorf(
+					"stageable response header %q must be true", name,
+				)
+			}
 		}
 	}
-	if !strings.EqualFold(stagedMarker, "true") {
+	if stagedMarkers == 0 {
 		return errors.New(`stageable response.headers must include "X-Unring-Staged: true"`)
+	}
+	if stagedMarkers > 1 {
+		return errors.New(
+			"stageable response.headers must not contain case-variant duplicate X-Unring-Staged headers",
+		)
 	}
 	for name := range response.Headers {
 		if isHopByHop(name) {

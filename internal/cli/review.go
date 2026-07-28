@@ -21,6 +21,7 @@ type reviewItem struct {
 	body     string
 	affected string
 	err      string
+	warning  string
 	detail   string
 }
 
@@ -102,7 +103,7 @@ func newReviewModelWithHTTPS(summary pgproxy.Summary, httpsSummary httpsproxy.Su
 		model.items = append(model.items, reviewItem{
 			section: section,
 			title:   fmt.Sprintf("[%s] %s %s", request.State, request.Method, request.URL),
-			body:    request.Body, err: request.Error,
+			body:    request.Body, err: request.Error, warning: request.Warning,
 			detail: detail + " Idempotency key: " + request.IdempotencyKey,
 		})
 	}
@@ -266,6 +267,9 @@ func (model reviewModel) View() string {
 			}
 			if item.err != "" {
 				fmt.Fprintf(&output, "      Error: %s\n", item.err)
+			}
+			if item.warning != "" {
+				fmt.Fprintf(&output, "      Warning: %s\n", item.warning)
 			}
 			if item.detail != "" {
 				fmt.Fprintf(&output, "      Detail: %s\n", item.detail)

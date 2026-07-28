@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -184,6 +185,69 @@ func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T)
 				t.Fatalf("%s review missing %q:\n%s", label, want, text)
 			}
 		}
+	}
+}
+
+func TestStagedReplayTransitionsArePersistedImmediatelyToAudit(t *testing.T) {
+	store, err := audit.OpenStoreAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStoreAt() error: %v", err)
+	}
+	session, err := store.Begin([]string{"agent"}, time.Now())
+	if err != nil {
+		t.Fatalf("Begin() error: %v", err)
+	}
+	id := session.Snapshot().ID
+	update := stagedAuditUpdater(session)
+
+	summary := httpsproxy.Summary{Sealed: true, Staged: []httpsproxy.StagedRequest{
+		{Method: "POST", URL: "https://slack.com/one", State: "sent"},
+		{Method: "POST", URL: "https://slack.com/two", State: "sending"},
+		{Method: "POST", URL: "https://slack.com/three", State: "pending"},
+	}}
+	if err := update(summary); err != nil {
+		t.Fatalf("persist replay transition: %v", err)
+	}
+	loaded, err := store.Load(id)
+	if err != nil {
+		t.Fatalf("Load() after transition: %v", err)
+	}
+	states := []string{
+		loaded.HTTPS.Staged[0].State,
+		loaded.HTTPS.Staged[1].State,
+		loaded.HTTPS.Staged[2].State,
+	}
+	if states[0] != "sent" || states[1] != "sending" || states[2] != "pending" {
+		t.Fatalf("durable replay states = %v", states)
+	}
+}
+
+func TestPartialCommitOutcomeListsSentUnknownAndDatabaseRollback(t *testing.T) {
+	var output bytes.Buffer
+	printPartialCommitOutcome(&output, httpsproxy.Summary{Staged: []httpsproxy.StagedRequest{
+		{Method: "POST", URL: "https://slack.com/one", State: "sent", ReplayStatusCode: 200},
+		{Method: "POST", URL: "https://slack.com/two", State: "unknown", ReplayStatusCode: 500,
+			Error: "origin returned HTTP 500; delivery outcome is unknown"},
+		{Method: "POST", URL: "https://slack.com/three", State: "sent", ReplayStatusCode: 200},
+	}}, nil)
+	text := output.String()
+	for _, want := range []string{
+		"COMMIT DID NOT COMPLETE",
+		"[sent] POST https://slack.com/one",
+		"[unknown] POST https://slack.com/two",
+		"[sent] POST https://slack.com/three",
+		"Postgres transaction: DISCARDED",
+		"requested commit became a rollback",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("partial commit report missing %q:\n%s", want, text)
+		}
+	}
+
+	output.Reset()
+	printPartialCommitOutcome(&output, httpsproxy.Summary{}, errors.New("backend lost"))
+	if !strings.Contains(output.String(), "Postgres transaction: UNKNOWN") {
+		t.Fatalf("unconfirmed rollback was overstated:\n%s", output.String())
 	}
 }
 

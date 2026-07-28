@@ -45,6 +45,7 @@ type StagedRequest struct {
 	State            string    `json:"state"`
 	ReplayStatusCode int       `json:"replay_status_code,omitempty"`
 	Error            string    `json:"error,omitempty"`
+	Warning          string    `json:"warning,omitempty"`
 	StagedAt         time.Time `json:"staged_at"`
 	Body             string    `json:"-"`
 }
@@ -101,19 +102,21 @@ type Options struct {
 	PassthroughHost func(host string) bool
 	Adapters        *adapter.Set
 	Approve         func(context.Context, ApprovalRequest) (bool, error)
+	StagedUpdated   func(Summary) error
 }
 
 // Proxy intercepts HTTPS CONNECT connections on loopback.
 type Proxy struct {
-	authority   *Authority
-	listener    net.Listener
-	server      *http.Server
-	transport   http.RoundTripper
-	passthrough func(string) bool
-	adapters    *adapter.Set
-	approve     func(context.Context, ApprovalRequest) (bool, error)
-	runCtx      context.Context
-	cancel      context.CancelFunc
+	authority     *Authority
+	listener      net.Listener
+	server        *http.Server
+	transport     http.RoundTripper
+	passthrough   func(string) bool
+	adapters      *adapter.Set
+	approve       func(context.Context, ApprovalRequest) (bool, error)
+	stagedUpdated func(Summary) error
+	runCtx        context.Context
+	cancel        context.CancelFunc
 
 	connectionsMu sync.Mutex
 	connections   map[net.Conn]struct{}
@@ -162,7 +165,8 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 	proxy := &Proxy{
 		authority: authority, listener: listener, transport: transport,
 		passthrough: options.PassthroughHost, adapters: options.Adapters,
-		approve: options.Approve, connections: make(map[net.Conn]struct{}),
+		approve: options.Approve, stagedUpdated: options.StagedUpdated,
+		connections: make(map[net.Conn]struct{}),
 	}
 	proxy.runCtx, proxy.cancel = context.WithCancel(context.Background())
 	proxy.server = &http.Server{
@@ -253,27 +257,52 @@ func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
 			proxy.staged = nil
 			proxy.summary.Finalized = true
 			proxy.summaryMu.Unlock()
+			if err := proxy.persistStagedUpdate(); err != nil {
+				proxy.finalizeErr = fmt.Errorf("record discarded staged requests: %w", err)
+			}
 			return
 		}
 		proxy.summaryMu.Unlock()
 
 		var replayErrors []error
 		for index, call := range calls {
-			status, err := proxy.replay(ctx, call)
 			proxy.summaryMu.Lock()
 			if index < len(proxy.summary.Staged) {
-				proxy.summary.Staged[index].ReplayStatusCode = status
-				if err != nil {
-					proxy.summary.Staged[index].State = "send-failed"
-					proxy.summary.Staged[index].Error = err.Error()
-				} else {
-					proxy.summary.Staged[index].State = "sent"
-				}
+				proxy.summary.Staged[index].State = "sending"
+				proxy.summary.Staged[index].Error = ""
+				proxy.summary.Staged[index].Warning = ""
 			}
 			proxy.summaryMu.Unlock()
-			if err != nil {
+			if err := proxy.persistStagedUpdate(); err != nil {
+				proxy.summaryMu.Lock()
+				if index < len(proxy.summary.Staged) {
+					proxy.summary.Staged[index].State = "not-sent"
+					proxy.summary.Staged[index].Error = "persist sending state: " + err.Error()
+				}
+				proxy.summaryMu.Unlock()
 				replayErrors = append(replayErrors, fmt.Errorf(
-					"send staged request %s %s: %w", call.method, call.url, err,
+					"record staged request %s %s before sending: %w", call.method, call.url, err,
+				))
+				continue
+			}
+
+			result := proxy.replay(ctx, call)
+			proxy.summaryMu.Lock()
+			if index < len(proxy.summary.Staged) {
+				proxy.summary.Staged[index].ReplayStatusCode = result.status
+				proxy.summary.Staged[index].State = result.state
+				proxy.summary.Staged[index].Warning = result.warning
+				proxy.summary.Staged[index].Error = errorText(result.err)
+			}
+			proxy.summaryMu.Unlock()
+			if persistErr := proxy.persistStagedUpdate(); persistErr != nil {
+				replayErrors = append(replayErrors, fmt.Errorf(
+					"record staged request %s %s outcome: %w", call.method, call.url, persistErr,
+				))
+			}
+			if result.err != nil {
+				replayErrors = append(replayErrors, fmt.Errorf(
+					"send staged request %s %s: %w", call.method, call.url, result.err,
 				))
 			}
 		}
@@ -281,33 +310,65 @@ func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
 		proxy.staged = nil
 		proxy.summary.Finalized = true
 		proxy.summaryMu.Unlock()
+		if err := proxy.persistStagedUpdate(); err != nil {
+			replayErrors = append(replayErrors, fmt.Errorf("record finalized staged requests: %w", err))
+		}
 		proxy.finalizeErr = errors.Join(replayErrors...)
 	})
 	return proxy.finalizeErr
 }
 
-func (proxy *Proxy) replay(ctx context.Context, call stagedCall) (int, error) {
-	request, err := http.NewRequestWithContext(ctx, call.method, call.url.String(), bytes.NewReader(call.body))
+type replayResult struct {
+	status  int
+	state   string
+	warning string
+	err     error
+}
+
+func (proxy *Proxy) replay(ctx context.Context, call stagedCall) replayResult {
+	// Supplying an opaque ReadCloser deliberately leaves GetBody nil, even for
+	// an empty body. Together with a non-NoBody Body this prevents net/http from
+	// treating our Idempotency-Key header as permission to retry a write after
+	// the request may already have reached the origin.
+	body := io.NopCloser(bytes.NewReader(call.body))
+	request, err := http.NewRequestWithContext(ctx, call.method, call.url.String(), body)
 	if err != nil {
-		return 0, fmt.Errorf("build replay request: %w", err)
+		return replayResult{state: "not-sent", err: fmt.Errorf("build replay request: %w", err)}
 	}
+	request.ContentLength = int64(len(call.body))
+	request.GetBody = nil
 	request.Host = call.host
 	request.Header = call.header.Clone()
 	request.Header.Set("Idempotency-Key", call.key)
 	removeHopByHopHeaders(request.Header)
 	response, err := proxy.transport.RoundTrip(request)
 	if err != nil {
-		return 0, err
+		return replayResult{state: "unknown", err: err}
 	}
 	defer response.Body.Close()
 	_, readErr := io.Copy(io.Discard, response.Body)
+	if response.StatusCode >= 200 && response.StatusCode <= 299 {
+		result := replayResult{status: response.StatusCode, state: "sent"}
+		if readErr != nil {
+			result.warning = fmt.Sprintf(
+				"origin accepted the request with HTTP %d, but reading its response body failed: %v",
+				response.StatusCode, readErr,
+			)
+		}
+		return result
+	}
+	err = fmt.Errorf("origin returned HTTP %d; delivery outcome is unknown", response.StatusCode)
 	if readErr != nil {
-		return response.StatusCode, fmt.Errorf("read replay response: %w", readErr)
+		err = errors.Join(err, fmt.Errorf("read replay response: %w", readErr))
 	}
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return response.StatusCode, fmt.Errorf("origin returned HTTP %d", response.StatusCode)
+	return replayResult{status: response.StatusCode, state: "unknown", err: err}
+}
+
+func (proxy *Proxy) persistStagedUpdate() error {
+	if proxy.stagedUpdated == nil {
+		return nil
 	}
-	return response.StatusCode, nil
+	return proxy.stagedUpdated(proxy.Summary())
 }
 
 // Close seals and safely discards any staged calls with bounded timeouts.
@@ -681,6 +742,9 @@ func (proxy *Proxy) stage(
 	for name, value := range classification.Response.Headers {
 		headers.Set(name, value)
 	}
+	// This protocol marker belongs to unring, not the adapter. Apply it last so
+	// case canonicalization or a contradictory map key can never clear it.
+	headers.Set("X-Unring-Staged", "true")
 	started := time.Now().UTC()
 	call := stagedCall{
 		method: request.Method,

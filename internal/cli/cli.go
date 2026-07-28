@@ -218,6 +218,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	httpsProxy, err = httpsproxy.Start(authority, httpsproxy.Options{
 		PassthroughHost: configuredPassthroughHosts(os.Getenv("UNRING_HTTPS_PASSTHROUGH")),
 		Adapters:        adapterSet,
+		StagedUpdated:   stagedAuditUpdater(auditSession),
 		Approve: func(approvalContext context.Context, request httpsproxy.ApprovalRequest) (bool, error) {
 			reply := make(chan runner.ApprovalResult, 1)
 			work := runner.ApprovalRequest{
@@ -440,11 +441,15 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	finalized = true
 	if finalizeErr != nil {
 		auditError = joinErrorText(auditError, postgresFinalizeErr)
+		finalHTTPS := httpsProxy.Summary()
 		_ = auditSession.Update(func(record *audit.Record) {
 			record.Postgres = proxy.Summary()
-			updateHTTPSAudit(record, httpsProxy.Summary())
+			updateHTTPSAudit(record, finalHTTPS)
 			record.Outcome = "unknown"
 		})
+		if commitHTTPS && httpsFinalizeErr != nil {
+			printPartialCommitOutcome(stdout, finalHTTPS, postgresFinalizeErr)
+		}
 		fmt.Fprintf(stderr, "unring: session outcome not confirmed: %v\n", finalizeErr)
 		return internalErrorExitCode
 	}
@@ -463,6 +468,37 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return result.ExitCode
 	}
 	return result.ExitCode
+}
+
+func printPartialCommitOutcome(
+	output io.Writer,
+	summary httpsproxy.Summary,
+	postgresFinalizeErr error,
+) {
+	fmt.Fprintln(output, "\nUNRING COMMIT DID NOT COMPLETE")
+	fmt.Fprintln(output,
+		"Some staged HTTPS delivery outcomes are irreversible or unknown; inspect every item below.")
+	for _, request := range summary.Staged {
+		fmt.Fprintf(output, "  - [%s] %s %s\n", request.State, request.Method, request.URL)
+		if request.ReplayStatusCode != 0 {
+			fmt.Fprintf(output, "    Origin status: HTTP %d\n", request.ReplayStatusCode)
+		}
+		if request.Warning != "" {
+			fmt.Fprintf(output, "    Warning: %s\n", request.Warning)
+		}
+		if request.Error != "" {
+			fmt.Fprintf(output, "    Error: %s\n", request.Error)
+		}
+	}
+	if postgresFinalizeErr == nil {
+		fmt.Fprintln(output,
+			"Postgres transaction: DISCARDED. The requested commit became a rollback because HTTPS replay was not fully confirmed.")
+	} else {
+		fmt.Fprintf(output,
+			"Postgres transaction: UNKNOWN. Rollback could not be confirmed: %v\n",
+			postgresFinalizeErr,
+		)
+	}
 }
 
 func joinErrorText(existing string, err error) string {
@@ -535,6 +571,14 @@ func updateHTTPSAudit(record *audit.Record, summary httpsproxy.Summary) {
 		})
 	}
 	record.Unintercepted = unintercepted
+}
+
+func stagedAuditUpdater(session *audit.Session) func(httpsproxy.Summary) error {
+	return func(summary httpsproxy.Summary) error {
+		return session.Update(func(record *audit.Record) {
+			updateHTTPSAudit(record, summary)
+		})
+	}
 }
 
 func auditDecision(decision pgproxy.Decision) string {
@@ -892,6 +936,9 @@ func printSummaryWithHTTPS(
 			fmt.Fprintf(output, "    Idempotency key: %s\n", request.IdempotencyKey)
 			if request.Error != "" {
 				fmt.Fprintf(output, "    Error: %s\n", request.Error)
+			}
+			if request.Warning != "" {
+				fmt.Fprintf(output, "    Warning: %s\n", request.Warning)
 			}
 		}
 	}

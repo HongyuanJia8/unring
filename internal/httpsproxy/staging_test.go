@@ -1,6 +1,7 @@
 package httpsproxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
@@ -165,6 +167,215 @@ func TestUnknownMutatingRequestDefaultsToNeedsApproval(t *testing.T) {
 	if summary := proxy.Summary(); len(summary.Approvals) != 1 ||
 		summary.Approvals[0].Decision != "declined" {
 		t.Fatalf("unknown request summary = %#v", summary)
+	}
+}
+
+func TestStagedReplayIsNeverAutomaticallyRetried(t *testing.T) {
+	var mu sync.Mutex
+	received := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		mu.Lock()
+		received++
+		call := received
+		mu.Unlock()
+		if call == 2 {
+			connection, _, err := response.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack second replay: %v", err)
+				return
+			}
+			_ = connection.Close()
+			return
+		}
+		response.Header().Set("Content-Length", "2")
+		_, _ = io.WriteString(response, "ok")
+	}))
+	defer origin.Close()
+	originURL, _ := url.Parse(origin.URL)
+	transport := &http.Transport{MaxIdleConnsPerHost: 1}
+	defer transport.CloseIdleConnections()
+	proxy := &Proxy{
+		transport: transport,
+		summary: Summary{Sealed: true, Staged: []StagedRequest{
+			{Method: http.MethodPost, URL: origin.URL + "/one", State: "pending"},
+			{Method: http.MethodPost, URL: origin.URL + "/two", State: "pending"},
+		}},
+		staged: []stagedCall{
+			{method: http.MethodPost, url: cloneURL(originURL), host: originURL.Host,
+				header: make(http.Header), body: []byte("first"), key: "key-one"},
+			{method: http.MethodPost, url: cloneURL(originURL), host: originURL.Host,
+				header: make(http.Header), body: nil, key: "key-two"},
+		},
+	}
+	proxy.staged[0].url.Path = "/one"
+	proxy.staged[1].url.Path = "/two"
+
+	err := proxy.Finalize(context.Background(), true)
+	if err == nil {
+		t.Fatal("replay whose response connection vanished unexpectedly succeeded")
+	}
+	mu.Lock()
+	gotReceived := received
+	mu.Unlock()
+	if gotReceived != 2 {
+		t.Fatalf("origin received %d POSTs, want exactly 2 (no transparent retry)", gotReceived)
+	}
+	summary := proxy.Summary()
+	if summary.Staged[0].State != "sent" || summary.Staged[1].State != "unknown" {
+		t.Fatalf("at-most-once replay states = %#v", summary.Staged)
+	}
+}
+
+func TestSynthesizedMarkerCannotBeOverriddenDuringEmission(t *testing.T) {
+	for iteration := 0; iteration < 1000; iteration++ {
+		proxy := &Proxy{}
+		requestURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
+		request := &http.Request{
+			Method: http.MethodPost, URL: requestURL, Header: make(http.Header),
+		}
+		var wire bytes.Buffer
+		_, err := proxy.stage(&wire, request, nil, adapter.Classification{
+			Tier: adapter.TierStageable, Adapter: "adversarial", Rule: "marker",
+			IdempotencyKey: "key",
+			Response: &adapter.SyntheticResponse{
+				Status: http.StatusOK,
+				Headers: map[string]string{
+					"X-Unring-Staged": "true",
+					"x-unring-staged": "false",
+				},
+				Body: `{"ok":true}`,
+			},
+		})
+		if err != nil {
+			t.Fatalf("iteration %d stage() error: %v", iteration, err)
+		}
+		response, err := http.ReadResponse(bufio.NewReader(&wire), request)
+		if err != nil {
+			t.Fatalf("iteration %d decode synthesized response: %v", iteration, err)
+		}
+		_ = response.Body.Close()
+		if got := response.Header.Get("X-Unring-Staged"); got != "true" {
+			t.Fatalf("iteration %d emitted staged marker = %q, want true", iteration, got)
+		}
+	}
+}
+
+func TestAcceptedReplayWithTruncatedResponseBodyIsStillSent(t *testing.T) {
+	proxy := proxyWithOneStagedCall(testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       &unexpectedEOFBody{},
+			Request:    request,
+		}, nil
+	}))
+	if err := proxy.Finalize(context.Background(), true); err != nil {
+		t.Fatalf("accepted replay Finalize() error: %v", err)
+	}
+	staged := proxy.Summary().Staged[0]
+	if staged.State != "sent" || staged.ReplayStatusCode != http.StatusOK ||
+		!strings.Contains(staged.Warning, "origin accepted") || staged.Error != "" {
+		t.Fatalf("accepted truncated response outcome = %#v", staged)
+	}
+}
+
+func TestNon2xxReplayOutcomeIsUnknownNotSendFailed(t *testing.T) {
+	proxy := proxyWithOneStagedCall(testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("redirect not followed")),
+			Request:    request,
+		}, nil
+	}))
+	if err := proxy.Finalize(context.Background(), true); err == nil {
+		t.Fatal("non-2xx replay unexpectedly produced a confirmed outcome")
+	}
+	staged := proxy.Summary().Staged[0]
+	if staged.State != "unknown" || staged.ReplayStatusCode != http.StatusFound ||
+		!strings.Contains(staged.Error, "delivery outcome is unknown") {
+		t.Fatalf("non-2xx replay outcome = %#v", staged)
+	}
+}
+
+func TestReplayTransitionsArePublishedIncrementally(t *testing.T) {
+	var snapshots []Summary
+	proxy := &Proxy{
+		transport: testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader("ok")), Request: request,
+			}, nil
+		}),
+		summary: Summary{Sealed: true, Staged: []StagedRequest{
+			{Method: http.MethodPost, URL: "https://example.test/one", State: "pending"},
+			{Method: http.MethodPost, URL: "https://example.test/two", State: "pending"},
+		}},
+		staged: []stagedCall{
+			newTestStagedCall("https://example.test/one"),
+			newTestStagedCall("https://example.test/two"),
+		},
+	}
+	proxy.stagedUpdated = func(summary Summary) error {
+		snapshots = append(snapshots, summary)
+		return nil
+	}
+	if err := proxy.Finalize(context.Background(), true); err != nil {
+		t.Fatalf("Finalize() error: %v", err)
+	}
+	want := [][]string{
+		{"sending", "pending"},
+		{"sent", "pending"},
+		{"sent", "sending"},
+		{"sent", "sent"},
+	}
+	if len(snapshots) < len(want) {
+		t.Fatalf("published %d snapshots, want at least %d", len(snapshots), len(want))
+	}
+	for index, states := range want {
+		got := []string{snapshots[index].Staged[0].State, snapshots[index].Staged[1].State}
+		if got[0] != states[0] || got[1] != states[1] {
+			t.Fatalf("snapshot %d states = %v, want %v", index, got, states)
+		}
+	}
+}
+
+type testRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (function testRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+type unexpectedEOFBody struct {
+	read bool
+}
+
+func (body *unexpectedEOFBody) Read(buffer []byte) (int, error) {
+	if body.read {
+		return 0, io.ErrUnexpectedEOF
+	}
+	body.read = true
+	return copy(buffer, "partial"), nil
+}
+
+func (*unexpectedEOFBody) Close() error { return nil }
+
+func proxyWithOneStagedCall(transport http.RoundTripper) *Proxy {
+	return &Proxy{
+		transport: transport,
+		summary: Summary{Sealed: true, Staged: []StagedRequest{{
+			Method: http.MethodPost, URL: "https://example.test/action", State: "pending",
+		}}},
+		staged: []stagedCall{newTestStagedCall("https://example.test/action")},
+	}
+}
+
+func newTestStagedCall(rawURL string) stagedCall {
+	parsed, _ := url.Parse(rawURL)
+	return stagedCall{
+		method: http.MethodPost, url: parsed, host: parsed.Host,
+		header: make(http.Header), body: []byte(`{"value":true}`), key: "test-key",
 	}
 }
 

@@ -85,7 +85,7 @@ Rule fields:
 | `match.methods` | yes | Uppercase HTTP methods. |
 | `match.path` | yes | Go-style path glob. `*` matches within one path segment. |
 | `when` | no | CEL boolean expression. A false result continues to the next rule. |
-| `tier` | yes | `stageable`, `needs-approval`, or `already-irreversible`. |
+| `tier` | yes | `stageable` or `needs-approval`. `already-irreversible` is a review description reserved by unring and is rejected in adapter files. |
 | `idempotency_key` | required for `stageable` | CEL string expression. |
 | `response` | required for `stageable` | The response returned without contacting the origin. |
 | `undo` | no | Compensating HTTP request metadata reserved for M8. It is validated and retained but is not executed yet. |
@@ -105,6 +105,13 @@ On commit, unring sends the original method, URL, headers, and body and sets the
 `Idempotency-Key` header to the evaluated key. On discard, it deletes the
 in-memory staged call without sending it. Request bodies are available in the
 live review but are not serialized into audit JSON.
+
+Unring disables Go's automatic request replay for every staged write. The key
+is still delivered for services that honor it, but the presence of the header
+never authorizes the HTTP transport to send a write twice. A transport error or
+a non-2xx response is recorded as an unknown delivery outcome, because the
+origin may have received the request even when unring could not confirm its
+response.
 
 `undo` currently accepts:
 
