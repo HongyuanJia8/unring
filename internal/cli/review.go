@@ -159,14 +159,7 @@ func newReviewModelWithExternal(
 	for _, record := range ghSummary.Records {
 		section := "GH APPROVALS — NOT RUN"
 		detail := "This gh invocation did not run."
-		if record.State == "pending" {
-			section = "PENDING GH — REAL GH RUNS ONLY IF YOU COMMIT"
-			detail = "Discard drops this invocation, so the GitHub issue will not be created."
-			if record.UndoEffect != "" {
-				detail += " If commit partially delivers, compensation can only " +
-					record.UndoEffect + "; " + record.StillExists + "."
-			}
-		} else if record.State == "ran" || record.State == "failed" || record.State == "approved" {
+		if record.State == "ran" || record.State == "failed" || record.State == "approved" {
 			section = "GH MUTATIONS — ALREADY RAN"
 			detail = "This gh invocation ran outside a transaction."
 			if record.UndoEffect != "" {
@@ -177,15 +170,14 @@ func newReviewModelWithExternal(
 			}
 		}
 		title := fmt.Sprintf("[%s] gh %s", record.State, strings.Join(record.Arguments, " "))
-		if record.State == "pending" {
-			title += " [discard: do not run]"
-			if record.UndoEffect != "" {
-				title += fmt.Sprintf(" [commit-failure limit: %s; %s]",
+		if record.UndoEffect != "" {
+			if record.UndoState == "available" {
+				title += fmt.Sprintf(" [discard: %s; limit: %s]",
 					record.UndoEffect, record.StillExists)
+			} else {
+				title += fmt.Sprintf(" [discard compensation %s: %s; remains: %s]",
+					record.UndoState, record.UndoError, record.StillExists)
 			}
-		} else if record.UndoEffect != "" {
-			title += fmt.Sprintf(" [discard: %s; limit: %s]",
-				record.UndoEffect, record.StillExists)
 		}
 		model.items = append(model.items, reviewItem{
 			section: section,

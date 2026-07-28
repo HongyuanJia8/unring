@@ -218,6 +218,7 @@ func TestReviewBeforeDecisionDistinguishesCompensableAndPermanentEffects(t *test
 		Records: []ghshim.Record{{
 			Arguments: []string{"issue", "create", "--title", "boundary"},
 			State:     "ran", UndoEffect: "close the created GitHub issue",
+			UndoState:   "available",
 			StillExists: "the issue and its history remain in a closed state; REST cannot delete it",
 		}},
 	}

@@ -124,54 +124,47 @@ func TestReadOnlySessionExitsSilently(t *testing.T) {
 	}
 }
 
-func TestGHCreateRunsOnlyOnCommitAgainstFakeGH(t *testing.T) {
+func TestGHCreateCommandSubstitutionCannotSilentlySucceed(t *testing.T) {
+	connectionString, backendDone := startReviewTestBackend(t, false)
+	runLog := filepath.Join(t.TempDir(), "gh-runs")
+	fakeDirectory := t.TempDir()
+	fakeGH := filepath.Join(fakeDirectory, "gh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + runLog + "\"\n"
+	if err := os.WriteFile(fakeGH, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("DATABASE_URL", connectionString)
+	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+
 	binary := buildTestBinary(t)
-	for _, test := range []struct {
-		name     string
-		decision string
-		wantRun  bool
-	}{
-		{name: "discard", decision: "--discard", wantRun: false},
-		{name: "commit", decision: "--commit", wantRun: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			connectionString, backendDone := startReviewTestBackend(t, false)
-			runLog := filepath.Join(t.TempDir(), "gh-runs")
-			fakeDirectory := t.TempDir()
-			fakeGH := filepath.Join(fakeDirectory, "gh")
-			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + runLog + "\"\n"
-			if err := os.WriteFile(fakeGH, []byte(script), 0o755); err != nil {
-				t.Fatalf("write fake gh: %v", err)
-			}
-			t.Setenv("DATABASE_URL", connectionString)
-			t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
-			t.Setenv("UNRING_STATE_DIR", t.TempDir())
-			command := exec.Command(
-				binary, "run", test.decision, "--",
-				"/bin/sh", "-c",
-				"gh issue create --repo acme/widget --title 'shim acceptance'",
-			)
-			command.Env = os.Environ()
-			output, err := command.CombinedOutput()
-			if err != nil {
-				t.Fatalf("unring gh %s failed: %v\n%s", test.name, err, output)
-			}
-			data, readErr := os.ReadFile(runLog)
-			if readErr != nil && !os.IsNotExist(readErr) {
-				t.Fatalf("read fake gh log: %v", readErr)
-			}
-			ran := strings.Contains(string(data), "issue create")
-			if ran != test.wantRun {
-				t.Fatalf("fake gh ran=%v, want %v; log=%q\n%s",
-					ran, test.wantRun, data, output)
-			}
-			if !strings.Contains(string(output), "staged create GitHub issue") {
-				t.Fatalf("gh mutation was not visibly staged:\n%s", output)
-			}
-			if err := <-backendDone; err != nil {
-				t.Fatalf("fake Postgres backend: %v", err)
-			}
-		})
+	childScript := `
+URL=$(gh issue create --repo acme/widget --title 'shim acceptance' --body 'body')
+create_status=$?
+printf 'captured=<%s> status=%s\n' "$URL" "$create_status"
+if [ "$create_status" -eq 0 ]; then
+  printf 'SILENT_EMPTY_SUCCESS\n'
+fi
+exit "$create_status"
+`
+	command := exec.Command(binary, "run", "--discard", "--", "/bin/sh", "-c", childScript)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
+		t.Fatalf("declined command substitution exit = %v, want non-zero\n%s", err, output)
+	}
+	text := string(output)
+	if !strings.Contains(text, "captured=<> status=1") ||
+		!strings.Contains(text, "cannot be staged honestly") ||
+		strings.Contains(text, "SILENT_EMPTY_SUCCESS") {
+		t.Fatalf("command substitution silently accepted a non-run mutation:\n%s", text)
+	}
+	if _, err := os.Stat(runLog); !os.IsNotExist(err) {
+		t.Fatalf("declined command substitution invoked real gh: %v", err)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatalf("fake Postgres backend: %v", err)
 	}
 }
 

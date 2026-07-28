@@ -61,10 +61,11 @@ The complete community adapter format is documented in
 directory, places a `gh` shim there, and prepends that directory only to the wrapped
 child's `PATH`. Enumerated reads such as `gh --version`, `gh auth status`,
 `gh issue list`, `gh pr view`, and a method-safe `gh api` GET execute the real pre-resolved
-`gh` with unchanged standard streams, exit status, stdin, and terminal. Parsed
-mutations such as `gh issue create` are withheld and shown as structured intent; the
-real command runs only if the whole session commits. Unknown subcommands or flags
-stop for approval with the exact ambiguity rather than being guessed. The directory
+`gh` with unchanged standard streams, exit status, stdin, and terminal. Output-dependent
+mutations such as `gh issue create` require approval and cannot be staged honestly:
+declining returns non-zero with no stdout, while approval runs real `gh` immediately
+so callers receive its real URL and status. Unknown subcommands or flags stop for
+approval with the exact ambiguity rather than being guessed. The directory
 and socket are removed when the session ends; no shell profile or persistent `PATH`
 is changed.
 

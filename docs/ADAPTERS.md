@@ -175,3 +175,21 @@ Plain HTTP is still blocked and reported as un-intercepted because unring cannot
 provide the same confidentiality and classification guarantees without TLS
 interception. CONNECT passthrough and protocol upgrades are also listed as
 un-intercepted.
+
+## `gh` and output-dependent mutations
+
+The per-session `gh` shim converts confidently parsed commands into the same
+adapter request shape used by HTTPS interception. Tiers retain their meaning,
+including for GitHub's `create-issue` rule: issue creation is
+`needs-approval`, not stageable.
+
+This distinction is required by the CLI contract. Real `gh issue create` exits
+successfully and writes the new issue URL to stdout; scripts commonly consume
+that value immediately. Unring cannot invent an honest URL for an issue that
+does not exist, and returning success with empty stdout would falsely claim the
+operation completed. A declined or non-interactively unapprovable mutation
+therefore exits non-zero, writes the reason only to stderr, and emits no stdout.
+Approval runs the real `gh` immediately so its exact stdout, stderr, stdin, and
+exit status remain available to the caller. If that approved issue is later
+discarded, compensation can close it, subject to the GitHub limitation above;
+it cannot delete the issue or erase history.

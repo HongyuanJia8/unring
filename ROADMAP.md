@@ -90,7 +90,8 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 - [x] M7.1 Shim injected at the front of the child's `PATH` — captures structured
       intent, no certificate trust required (works around Go binaries ignoring
       `SSL_CERT_FILE` on macOS)
-- [x] M7.2 Replay approved `gh` invocations on commit
+- [x] M7.2 Run output-dependent `gh` mutations only after explicit approval;
+      never synthesize a successful CLI result
 
 ## M8 — Compensating undo
 

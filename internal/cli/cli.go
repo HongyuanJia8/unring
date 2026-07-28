@@ -529,9 +529,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			printPartialCommitOutcome(stdout, finalHTTPS, postgresFinalizeErr)
 		}
 		if ghFinalizeErr != nil {
-			fmt.Fprintln(stdout, "\nGH COMMIT REPLAY FAILED")
+			fmt.Fprintln(stdout, "\nGH DISCARD COMPENSATION FAILED OR WAS IMPOSSIBLE")
 			fmt.Fprintln(stdout,
-				"A staged gh mutation may have run. Inspect each outcome; unring is not claiming it was undone.")
+				"An approved gh mutation really ran and may still exist. Unring is not claiming it was undone.")
 			printGHSummary(stdout, ghSession.Summary())
 		}
 		printCompensationFailures(stdout, finalHTTPS)
@@ -1164,22 +1164,17 @@ func printGHSummary(output io.Writer, summary ghshim.Summary) {
 			record.State, strings.Join(record.Arguments, " "))
 		fmt.Fprintf(output, "    Intent: %s\n", record.Intent)
 		fmt.Fprintf(output, "    Reason: %s\n", record.Reason)
-		switch record.State {
-		case "pending":
-			fmt.Fprintln(output,
-				"    Discard: the real gh will not run, so no GitHub issue will exist.")
-			if record.UndoEffect != "" {
-				fmt.Fprintf(output,
-					"    If commit partially delivers, compensation can only: %s\n",
-					record.UndoEffect)
-			}
-		default:
-			if record.UndoEffect != "" {
-				fmt.Fprintf(output, "    Declared compensation: %s\n", record.UndoEffect)
-			}
+		if record.UndoEffect != "" {
+			fmt.Fprintf(output, "    Declared compensation: %s\n", record.UndoEffect)
 		}
 		if record.StillExists != "" {
 			fmt.Fprintf(output, "    What remains or may remain: %s\n", record.StillExists)
+		}
+		if record.UndoState != "" {
+			fmt.Fprintf(output, "    Compensation state: %s\n", record.UndoState)
+		}
+		if record.UndoError != "" {
+			fmt.Fprintf(output, "    Compensation error: %s\n", record.UndoError)
 		}
 		if record.Error != "" {
 			fmt.Fprintf(output, "    Error: %s\n", record.Error)

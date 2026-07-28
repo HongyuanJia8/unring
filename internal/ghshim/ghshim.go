@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/hyj28/unring/internal/adapter"
+	"golang.org/x/term"
 )
 
 const (
@@ -52,6 +54,9 @@ type Record struct {
 	Error       string       `json:"error,omitempty"`
 	UndoEffect  string       `json:"undo_effect,omitempty"`
 	StillExists string       `json:"still_exists,omitempty"`
+	ResourceURL string       `json:"resource_url,omitempty"`
+	UndoState   string       `json:"undo_state,omitempty"`
+	UndoError   string       `json:"undo_error,omitempty"`
 	Time        time.Time    `json:"time"`
 }
 
@@ -89,15 +94,9 @@ type Session struct {
 
 	mu           sync.Mutex
 	summary      Summary
-	staged       []stagedInvocation
 	wg           sync.WaitGroup
 	finalizeOnce sync.Once
 	finalizeErr  error
-}
-
-type stagedInvocation struct {
-	arguments []string
-	index     int
 }
 
 type request struct {
@@ -109,8 +108,6 @@ type request struct {
 type response struct {
 	Execute      bool   `json:"execute"`
 	PassThrough  bool   `json:"pass_through"`
-	Staged       bool   `json:"staged"`
-	Intent       string `json:"intent,omitempty"`
 	RecordIndex  int    `json:"record_index"`
 	Reason       string `json:"reason,omitempty"`
 	RealGH       string `json:"real_gh"`
@@ -122,6 +119,7 @@ type outcome struct {
 	RecordIndex int    `json:"record_index"`
 	ExitCode    int    `json:"exit_code"`
 	Error       string `json:"error,omitempty"`
+	Stdout      string `json:"stdout,omitempty"`
 }
 
 // Start creates a per-session gh executable and a private Unix socket.
@@ -231,56 +229,66 @@ func (session *Session) Close() error {
 	return os.RemoveAll(session.directory)
 }
 
-// Finalize replays withheld mutations only for a committed session. A discard
-// drops them, which is stronger than attempting compensation after creation.
+// Finalize compensates approved gh mutations on discard. Output-dependent gh
+// mutations are never staged: they either ran after explicit approval or did
+// not run and returned a non-zero status to their caller.
 func (session *Session) Finalize(ctx context.Context, commit bool) error {
 	session.finalizeOnce.Do(func() {
-		session.mu.Lock()
-		staged := append([]stagedInvocation(nil), session.staged...)
-		session.staged = nil
-		if !commit {
-			for _, invocation := range staged {
-				session.summary.Records[invocation.index].State = "discarded"
-				session.summary.Records[invocation.index].Decision = "discarded"
-			}
-			session.mu.Unlock()
+		if commit {
 			return
+		}
+		session.mu.Lock()
+		var indexes []int
+		for index, record := range session.summary.Records {
+			if record.State == "ran" && record.UndoEffect != "" {
+				indexes = append(indexes, index)
+			}
 		}
 		session.mu.Unlock()
 
-		var replayErrors []error
-		for _, invocation := range staged {
+		var undoErrors []error
+		for _, index := range indexes {
 			if err := ctx.Err(); err != nil {
-				replayErrors = append(replayErrors, err)
+				undoErrors = append(undoErrors, err)
 				break
 			}
-			command := exec.CommandContext(ctx, session.realGH, invocation.arguments...)
+			session.mu.Lock()
+			record := session.summary.Records[index]
+			session.mu.Unlock()
+			if record.ResourceURL == "" {
+				err := errors.New("real gh succeeded but its stdout did not contain a created issue URL")
+				session.updateUndo(index, "unavailable", err)
+				undoErrors = append(undoErrors, fmt.Errorf(
+					"cannot %s; %s: %w", record.UndoEffect, record.StillExists, err))
+				continue
+			}
+			command := exec.CommandContext(ctx, session.realGH, "issue", "close", record.ResourceURL)
 			command.Env = clientEnvironment(os.Environ(), session.originalPath)
-			command.Stdin = session.stdin
+			command.Stdin = nil
 			command.Stdout = session.stdout
 			command.Stderr = session.stderr
 			err := command.Run()
-			exitCode := commandExitCode(err)
-			session.mu.Lock()
-			record := &session.summary.Records[invocation.index]
-			record.ExitCode = exitCode
-			record.Decision = "committed"
 			if err == nil {
-				record.State = "sent"
+				session.updateUndo(index, "succeeded", nil)
 			} else {
-				record.State = "failed"
-				record.Error = err.Error()
-			}
-			session.mu.Unlock()
-			if err != nil {
-				replayErrors = append(replayErrors,
-					fmt.Errorf("replay staged gh %s: %w",
-						strings.Join(invocation.arguments, " "), err))
+				session.updateUndo(index, "failed", err)
+				undoErrors = append(undoErrors, fmt.Errorf(
+					"%s failed; %s: %w", record.UndoEffect, record.StillExists, err))
 			}
 		}
-		session.finalizeErr = errors.Join(replayErrors...)
+		session.finalizeErr = errors.Join(undoErrors...)
 	})
 	return session.finalizeErr
+}
+
+func (session *Session) updateUndo(index int, state string, err error) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	record := &session.summary.Records[index]
+	record.UndoState = state
+	if err != nil {
+		record.UndoError = err.Error()
+	}
 }
 
 func (session *Session) serve() {
@@ -361,35 +369,16 @@ func (session *Session) decide(call request) response {
 			classification = adapter.Classification{Tier: adapter.TierNeedsApproval}
 		case classification.Tier == adapter.TierStageable:
 			reason = fmt.Sprintf(
-				"adapter %s rule %s is stageable for HTTPS, but gh cannot receive a truthful synthetic service response",
+				"adapter %s rule %s is stageable for HTTPS, but this gh invocation cannot receive a truthful CLI result without running",
 				classification.Adapter, classification.Rule)
 			classification.Tier = adapter.TierNeedsApproval
 		default:
 			reason = fmt.Sprintf("adapter %s rule %s classifies this intent as %s",
 				classification.Adapter, classification.Rule, classification.Tier)
+			if classification.Tier == adapter.TierNeedsApproval {
+				reason += "; the command must run to produce its real stdout, so it cannot be staged honestly"
+			}
 		}
-	}
-	if parseErr == nil && classification.Adapter != "" {
-		record := Record{
-			Arguments: append([]string(nil), call.Arguments...), Intent: intentText,
-			Tier: classification.Tier, Adapter: classification.Adapter, Rule: classification.Rule,
-			Reason:   reason + "; the real gh will run only if the whole session is committed",
-			Decision: "pending", State: "pending", Time: time.Now().UTC(),
-		}
-		if classification.Undo != nil {
-			record.UndoEffect = classification.Undo.Effect
-			record.StillExists = classification.Undo.StillExists
-		}
-		session.mu.Lock()
-		reply.RecordIndex = len(session.summary.Records)
-		session.summary.Records = append(session.summary.Records, record)
-		session.staged = append(session.staged, stagedInvocation{
-			arguments: append([]string(nil), call.Arguments...), index: reply.RecordIndex,
-		})
-		session.mu.Unlock()
-		reply.Staged = true
-		reply.Intent = intentText
-		return reply
 	}
 	approved := false
 	var approvalErr error
@@ -441,6 +430,15 @@ func (session *Session) recordOutcome(result outcome) {
 	record.Error = result.Error
 	if result.ExitCode == 0 && result.Error == "" {
 		record.State = "ran"
+		record.ResourceURL = createdIssueURL(result.Stdout)
+		if record.UndoEffect != "" {
+			if record.ResourceURL == "" {
+				record.UndoState = "unavailable"
+				record.UndoError = "real gh stdout did not contain a created issue URL"
+			} else {
+				record.UndoState = "available"
+			}
+		}
 	} else {
 		record.State = "failed"
 	}
@@ -477,12 +475,6 @@ func RunClient(arguments []string, stdin io.Reader, stdout, stderr io.Writer) in
 		return 1
 	}
 	if !reply.Execute {
-		if reply.Staged {
-			fmt.Fprintf(stderr,
-				"unring gh shim: staged %s; the real gh will run only if the session commits\n",
-				reply.Intent)
-			return 0
-		}
 		fmt.Fprintf(stderr, "unring gh shim: invocation not run: %s\n", reply.Reason)
 		return 1
 	}
@@ -502,13 +494,17 @@ func RunClient(arguments []string, stdin io.Reader, stdout, stderr io.Writer) in
 	command := exec.Command(reply.RealGH, arguments...)
 	command.Env = environment
 	command.Stdin = stdin
+	var captured limitedCapture
 	command.Stdout = stdout
+	if reply.RecordIndex >= 0 && !terminalWriter(stdout) {
+		command.Stdout = io.MultiWriter(stdout, &captured)
+	}
 	command.Stderr = stderr
 	runErr := command.Run()
 	exitCode := commandExitCode(runErr)
 	report := outcome{
 		Token: os.Getenv(envToken), RecordIndex: reply.RecordIndex,
-		ExitCode: exitCode,
+		ExitCode: exitCode, Stdout: captured.String(),
 	}
 	if runErr != nil {
 		var exitError *exec.ExitError
@@ -518,6 +514,46 @@ func RunClient(arguments []string, stdin io.Reader, stdout, stderr io.Writer) in
 	}
 	reportOutcome(report)
 	return exitCode
+}
+
+const maximumCapturedGHOutput = 1 << 20
+
+type limitedCapture struct {
+	data []byte
+}
+
+func (capture *limitedCapture) Write(data []byte) (int, error) {
+	remaining := maximumCapturedGHOutput - len(capture.data)
+	if remaining > 0 {
+		if len(data) < remaining {
+			remaining = len(data)
+		}
+		capture.data = append(capture.data, data[:remaining]...)
+	}
+	return len(data), nil
+}
+
+func (capture *limitedCapture) String() string { return string(capture.data) }
+
+func terminalWriter(writer io.Writer) bool {
+	file, ok := writer.(*os.File)
+	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+func createdIssueURL(output string) string {
+	fields := strings.Fields(output)
+	for index := len(fields) - 1; index >= 0; index-- {
+		candidate := strings.Trim(fields[index], "<>[](){}.,;\"'")
+		parsed, err := url.Parse(candidate)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+			continue
+		}
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) == 4 && parts[2] == "issues" && parts[3] != "" {
+			return parsed.String()
+		}
+	}
+	return ""
 }
 
 func reportOutcome(result outcome) {

@@ -216,32 +216,47 @@ func TestInstalledGHReadsPassThroughIdentically(t *testing.T) {
 	}
 }
 
-func TestIssueCreateIsWithheldUntilFinalDecision(t *testing.T) {
+func TestIssueCreateNeedsApprovalAndReturnsOnlyRealResult(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		commit   bool
-		wantRuns string
+		name       string
+		approved   bool
+		wantCode   int
+		wantStdout string
+		wantRuns   string
 	}{
-		{name: "discarded", commit: false, wantRuns: ""},
-		{name: "committed", commit: true, wantRuns: "create\n"},
+		{name: "declined", approved: false, wantCode: 1},
+		{
+			name: "approved", approved: true, wantCode: 0,
+			wantStdout: "https://github.com/acme/widget/issues/123\n",
+			wantRuns:   "create\n",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runLog := filepath.Join(t.TempDir(), "runs")
-			fake := writeFakeGH(t, "printf 'create\\n' >> \""+runLog+"\"\n")
-			session := startTestSession(t, fake, nil)
+			fake := writeFakeGH(t,
+				"printf 'create\\n' >> \""+runLog+"\"\n"+
+					"printf 'https://github.com/acme/widget/issues/123\\n'\n")
+			session := startTestSession(t, fake,
+				func(context.Context, ApprovalRequest) (bool, error) {
+					return test.approved, nil
+				})
 			setClientEnvironment(t, session)
+			var shimOut bytes.Buffer
 			var shimErr bytes.Buffer
 			code := RunClient(
 				[]string{"issue", "create", "--repo", "acme/widget", "--title", "shim issue"},
-				strings.NewReader(""), &bytes.Buffer{}, &shimErr,
+				strings.NewReader(""), &shimOut, &shimErr,
 			)
-			if code != 0 || !strings.Contains(shimErr.String(), "staged") {
-				t.Fatalf("staged create result: code=%d stderr=%q", code, shimErr.String())
+			if code != test.wantCode || shimOut.String() != test.wantStdout {
+				t.Fatalf("create result: code=%d stdout=%q stderr=%q",
+					code, shimOut.String(), shimErr.String())
 			}
-			if _, err := os.Stat(runLog); !os.IsNotExist(err) {
-				t.Fatalf("fake gh ran during the session: %v", err)
+			if !test.approved && (!strings.Contains(shimErr.String(), "cannot be staged honestly") ||
+				shimOut.Len() != 0) {
+				t.Fatalf("declined create contract: stdout=%q stderr=%q",
+					shimOut.String(), shimErr.String())
 			}
-			if err := session.Finalize(context.Background(), test.commit); err != nil {
+			if err := session.Finalize(context.Background(), true); err != nil {
 				t.Fatalf("finalize gh session: %v", err)
 			}
 			data, err := os.ReadFile(runLog)
@@ -252,10 +267,48 @@ func TestIssueCreateIsWithheldUntilFinalDecision(t *testing.T) {
 				t.Fatalf("fake gh runs = %q, want %q", data, test.wantRuns)
 			}
 			records := session.Summary().Records
-			if len(records) != 1 || records[0].Decision != test.name {
+			if len(records) != 1 || records[0].Decision != test.name ||
+				(test.approved && records[0].ResourceURL != strings.TrimSpace(test.wantStdout)) {
 				t.Fatalf("gh summary = %#v", records)
 			}
 		})
+	}
+}
+
+func TestApprovedIssueCreateIsClosedOnDiscard(t *testing.T) {
+	runLog := filepath.Join(t.TempDir(), "runs")
+	fake := writeFakeGH(t, `
+if [ "$1 $2" = "issue close" ]; then
+  printf 'close:%s\n' "$3" >> "`+runLog+`"
+  exit 0
+fi
+printf 'create\n' >> "`+runLog+`"
+printf 'https://github.com/acme/widget/issues/123\n'
+`)
+	session := startTestSession(t, fake,
+		func(context.Context, ApprovalRequest) (bool, error) { return true, nil })
+	setClientEnvironment(t, session)
+	var stdout bytes.Buffer
+	if code := RunClient(
+		[]string{"issue", "create", "--repo", "acme/widget", "--title", "undo me"},
+		strings.NewReader(""), &stdout, &bytes.Buffer{},
+	); code != 0 {
+		t.Fatalf("approved create exit code = %d", code)
+	}
+	if err := session.Finalize(context.Background(), false); err != nil {
+		t.Fatalf("discard compensation: %v", err)
+	}
+	data, err := os.ReadFile(runLog)
+	if err != nil {
+		t.Fatalf("read fake gh log: %v", err)
+	}
+	want := "create\nclose:https://github.com/acme/widget/issues/123\n"
+	if string(data) != want {
+		t.Fatalf("gh create/compensation log = %q, want %q", data, want)
+	}
+	record := session.Summary().Records[0]
+	if record.UndoState != "succeeded" {
+		t.Fatalf("gh compensation record = %#v", record)
 	}
 }
 
