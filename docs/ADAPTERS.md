@@ -88,7 +88,7 @@ Rule fields:
 | `tier` | yes | `stageable` or `needs-approval`. `already-irreversible` is a review description reserved by unring and is rejected in adapter files. |
 | `idempotency_key` | required for `stageable` | CEL string expression. |
 | `response` | required for `stageable` | The response returned without contacting the origin. |
-| `undo` | no | Compensating HTTP request metadata reserved for M8. It is validated and retained but is not executed yet. |
+| `undo` | no | Best-effort compensating HTTP request plus the honest boundary shown in review. It is executed on discard only after the original action really ran. |
 
 `response.status` must be a 2xx status. `response.headers` must include
 `X-Unring-Staged: "true"` and cannot contain hop-by-hop headers.
@@ -113,13 +113,29 @@ a non-2xx response is recorded as an unknown delivery outcome, because the
 origin may have received the request even when unring could not confirm its
 response.
 
-`undo` currently accepts:
+`undo` accepts:
 
 | Field | Required | Meaning |
 |---|---:|---|
 | `method` | yes | Compensating HTTP method. |
-| `url` | yes | Absolute compensating URL; `${...}` placeholders are retained for M8. |
-| `body` | no | Compensating request template retained for M8. |
+| `url` | yes | Absolute compensating URL or a template that resolves to one. |
+| `headers` | no | Headers added to the compensation; hop-by-hop headers are rejected. Original authorization is retained in memory for the live compensation but is never written to audit JSON. |
+| `body` | no | Compensating request template. |
+| `effect` | no | Exact user-facing description of what a successful compensation does. |
+| `still_exists` | no | Exact user-facing description of what remains after partial compensation or if the attempt fails. |
+
+Templates resolve deterministic `${request...}` and `${response...}` fields from
+the original request and the real successful origin response. A missing field is an
+error; unring never guesses a resource identifier. The built-in Slack rule resolves
+the original channel and returned timestamp before calling `chat.delete`. A 2xx
+response is required, and a JSON response containing `ok: false` is failure even when
+the HTTP status is 200.
+
+GitHub illustrates a deliberately partial compensation. REST exposes no issue-delete
+endpoint, so the built-in rule PATCHes the returned issue URL to the closed state.
+The review says that the issue and its history remain. GitHub's GraphQL
+`deleteIssue` requires administrator permission and is not described as ordinary
+undo.
 
 ## CEL environment
 

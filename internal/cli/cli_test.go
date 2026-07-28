@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/hyj28/unring/internal/audit"
+	"github.com/hyj28/unring/internal/ghshim"
 	"github.com/hyj28/unring/internal/httpsproxy"
 	"github.com/hyj28/unring/internal/pgproxy"
 )
@@ -184,6 +185,82 @@ func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T)
 			if !strings.Contains(text, want) {
 				t.Fatalf("%s review missing %q:\n%s", label, want, text)
 			}
+		}
+	}
+}
+
+func TestReviewBeforeDecisionDistinguishesCompensableAndPermanentEffects(t *testing.T) {
+	t.Parallel()
+	postgresSummary := pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}
+	httpsSummary := httpsproxy.Summary{
+		Sealed: true,
+		Requests: []httpsproxy.RequestRecord{
+			{
+				Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+				StatusCode: 200,
+				Undo: &httpsproxy.UndoRecord{
+					Effect:      "delete the Slack message posted by this token",
+					StillExists: "someone may already have read it",
+					State:       "available",
+				},
+			},
+			{
+				Method: "POST", URL: "https://mail.example/send",
+				StatusCode: 202,
+			},
+		},
+	}
+	ghSummary := ghshim.Summary{
+		Sealed: true,
+		Records: []ghshim.Record{{
+			Arguments: []string{"issue", "create", "--title", "boundary"},
+			State:     "ran", UndoEffect: "close the created GitHub issue",
+			StillExists: "the issue and its history remain in a closed state; REST cannot delete it",
+		}},
+	}
+	view := newReviewModelWithExternal(postgresSummary, httpsSummary, ghSummary).View()
+	var plain bytes.Buffer
+	printSummaryWithExternal(&plain, postgresSummary, httpsSummary, ghSummary)
+	for label, text := range map[string]string{"TUI": view, "plain": plain.String()} {
+		for _, want := range []string{
+			"delete the Slack message",
+			"someone may already have read it",
+			"cannot undo",
+			"close the created GitHub issue",
+			"REST cannot delete it",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s review missing %q:\n%s", label, want, text)
+			}
+		}
+	}
+}
+
+func TestFailedCompensationIsProminentAndNamesRemainingEffect(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	printCompensationFailures(&output, httpsproxy.Summary{
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+			Undo: &httpsproxy.UndoRecord{
+				Effect:      "delete the Slack message",
+				StillExists: "the Slack message remains posted",
+				State:       "failed", Error: "Slack returned ok=false",
+			},
+		}},
+	})
+	text := output.String()
+	for _, want := range []string{
+		"DISCARD COMPENSATION FAILED OR WAS IMPOSSIBLE",
+		"not claiming it was undone",
+		"Slack returned ok=false",
+		"WHAT REMAINS: the Slack message remains posted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("failed compensation output missing %q:\n%s", want, text)
 		}
 	}
 }

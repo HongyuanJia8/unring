@@ -124,6 +124,57 @@ func TestReadOnlySessionExitsSilently(t *testing.T) {
 	}
 }
 
+func TestGHCreateRunsOnlyOnCommitAgainstFakeGH(t *testing.T) {
+	binary := buildTestBinary(t)
+	for _, test := range []struct {
+		name     string
+		decision string
+		wantRun  bool
+	}{
+		{name: "discard", decision: "--discard", wantRun: false},
+		{name: "commit", decision: "--commit", wantRun: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connectionString, backendDone := startReviewTestBackend(t, false)
+			runLog := filepath.Join(t.TempDir(), "gh-runs")
+			fakeDirectory := t.TempDir()
+			fakeGH := filepath.Join(fakeDirectory, "gh")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + runLog + "\"\n"
+			if err := os.WriteFile(fakeGH, []byte(script), 0o755); err != nil {
+				t.Fatalf("write fake gh: %v", err)
+			}
+			t.Setenv("DATABASE_URL", connectionString)
+			t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("UNRING_STATE_DIR", t.TempDir())
+			command := exec.Command(
+				binary, "run", test.decision, "--",
+				"/bin/sh", "-c",
+				"gh issue create --repo acme/widget --title 'shim acceptance'",
+			)
+			command.Env = os.Environ()
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("unring gh %s failed: %v\n%s", test.name, err, output)
+			}
+			data, readErr := os.ReadFile(runLog)
+			if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatalf("read fake gh log: %v", readErr)
+			}
+			ran := strings.Contains(string(data), "issue create")
+			if ran != test.wantRun {
+				t.Fatalf("fake gh ran=%v, want %v; log=%q\n%s",
+					ran, test.wantRun, data, output)
+			}
+			if !strings.Contains(string(output), "staged create GitHub issue") {
+				t.Fatalf("gh mutation was not visibly staged:\n%s", output)
+			}
+			if err := <-backendDone; err != nil {
+				t.Fatalf("fake Postgres backend: %v", err)
+			}
+		})
+	}
+}
+
 func TestNonTerminalReviewUsesPlainTextWithoutANSI(t *testing.T) {
 	connectionString, backendDone := startReviewTestBackend(t, true)
 	t.Setenv("DATABASE_URL", connectionString)
@@ -670,7 +721,7 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 				}})
 				backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("170000")}})
 				tag = "SHOW"
-			case query.String == "ROLLBACK":
+			case query.String == "ROLLBACK" || query.String == "COMMIT":
 				status = 'I'
 			case strings.HasPrefix(query.String, "SAVEPOINT ") &&
 				strings.Contains(query.String, "SET LOCAL search_path = pg_catalog"):
@@ -711,7 +762,7 @@ func startReviewTestBackend(t *testing.T, reportSchemaChange bool) (string, <-ch
 				done <- fmt.Errorf("send response for %q: %w", query.String, err)
 				return
 			}
-			if query.String == "ROLLBACK" {
+			if query.String == "ROLLBACK" || query.String == "COMMIT" {
 				return
 			}
 		}

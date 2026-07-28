@@ -8,11 +8,10 @@ what it did and what it is about to do, then you decide: **commit** or **discard
 
 The name comes from *you can't unring a bell*. That is the whole point: now you can.
 
-> **Status: Postgres transactions, HTTPS staging/approval, and audit.** Database
-> activity is transactional. Declarative adapters stage Slack messages and require
-> approval for GitHub issue creation; unknown HTTPS mutations fail closed into the
-> approval path. Compensating undo is not implemented yet. See
-> [ROADMAP.md](ROADMAP.md) for what is built and what is next.
+> **Status: v1 scope complete.** Database activity is transactional. Declarative
+> adapters stage external calls or require approval, unknown mutations fail closed,
+> a per-session `gh` shim covers GitHub CLI traffic, and declared compensations run
+> on discard with their limits shown before the decision.
 
 ## Try the Postgres slice
 
@@ -57,6 +56,16 @@ calls that really ran are shown separately from traffic unring could not interce
 Proxy-aware plain HTTP remains blocked and reported rather than escaping invisibly.
 The complete community adapter format is documented in
 [docs/ADAPTERS.md](docs/ADAPTERS.md).
+
+`gh` is handled without TLS interception. For each run, unring creates a private
+directory, places a `gh` shim there, and prepends that directory only to the wrapped
+child's `PATH`. Confident reads such as `gh issue list` execute the real pre-resolved
+`gh` with unchanged standard streams, exit status, stdin, and terminal. Parsed
+mutations such as `gh issue create` are withheld and shown as structured intent; the
+real command runs only if the whole session commits. Unknown subcommands or flags
+stop for approval with the exact ambiguity rather than being guessed. The directory
+and socket are removed when the session ends; no shell profile or persistent `PATH`
+is changed.
 
 After the child exits, `unring` prints the simple-query batches and asks whether to
 commit or discard. Automation must choose explicitly:
@@ -152,18 +161,33 @@ ability to make any of it permanent without you saying so.
 
 ## Honest limits
 
-- Compensating undo is not implemented yet. The adapter schema retains `undo`
-  declarations for M8, but slice 5 never executes them.
+- Compensating undo is a documented-limits fallback, not the main guarantee. The
+  strongest outcome is a staged call that was discarded and therefore never reached
+  its service. For a call that really ran, review says before the decision whether
+  discard has a declared compensation, what it will attempt, and what may remain.
+  Unring durably records the attempt and never reports success from an HTTP error,
+  transport error, or a Slack `ok: false` response. A failed or impossible
+  compensation makes the session outcome unknown and prominently names the surviving
+  effect.
+- Slack `chat.delete` can delete a message posted by the same bot token. It cannot
+  make a message unseen: someone may already have read or copied it, and permission
+  or service failures can leave it posted.
+- GitHub's REST API cannot delete an issue. Unring's declared compensation closes a
+  created issue; the issue and its history remain visible in the closed state. GitHub
+  has a GraphQL `deleteIssue` mutation, but it requires administrator permission, so
+  unring does not present that as generally available undo.
+- Delivered mail cannot be recalled reliably. Calls with no declared compensation
+  are labeled as effects discard cannot undo.
 - A final commit replays staged HTTPS calls before committing the Postgres
   transaction. If replay fails, unring rolls the database back and reports an unknown
   overall outcome because an earlier staged call may already have reached its origin.
   Declared idempotency keys make service-side retry protection possible, but there is
   no distributed transaction across an HTTP service and Postgres.
-- Go binaries on macOS, including `gh`, do not honor `SSL_CERT_FILE`; Go's
-  `crypto/x509` uses the system keychain. Unring deliberately does not install its CA
-  there. Such a client normally fails the MITM TLS handshake, and unring reports the
-  host in the un-intercepted section and audit log. This is not silent coverage.
-  The planned `gh` PATH shim is M7.
+- Go binaries on macOS do not honor `SSL_CERT_FILE`; Go's `crypto/x509` uses the
+  system keychain. Unring deliberately does not install its CA there. `gh` is covered
+  by the per-session PATH shim described above. Other Go clients may fail the MITM
+  handshake or require explicit CONNECT passthrough and are reported as
+  un-intercepted; this is not silent coverage.
 - A host can be deliberately passed through with
   `UNRING_HTTPS_PASSTHROUGH=host1,host2`. The CONNECT tunnel still uses the loopback
   proxy, but unring cannot see its requests or bodies; the host is therefore shown
@@ -210,9 +234,8 @@ ability to make any of it permanent without you saying so.
   is intended to prevent.
 - Connection options passed directly as child command arguments can bypass injected
   environment variables. This tool guards against accidents, not deliberate bypass.
-- Some effects genuinely cannot be undone: mail that has been delivered, a message
-  someone already read. The value is that most side effects never happen at all;
-  compensation is only the fallback.
+- Some effects genuinely cannot be undone. The value is that most side effects never
+  happen at all; compensation is only the fallback.
 
 ## License
 

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,8 @@ import (
 
 type tlsCertificate = tls.Certificate
 
+const maximumClassifiedBody = 16 << 20
+
 // RequestRecord is one HTTPS request that was actually sent to an origin.
 type RequestRecord struct {
 	Method     string       `json:"method"`
@@ -32,22 +35,37 @@ type RequestRecord struct {
 	Error      string       `json:"error,omitempty"`
 	StartedAt  time.Time    `json:"started_at"`
 	EndedAt    time.Time    `json:"ended_at"`
+	Undo       *UndoRecord  `json:"undo,omitempty"`
+}
+
+// UndoRecord is the declared and observed state of one compensating action.
+// StillExists is shown even after success when compensation is inherently
+// partial, such as closing rather than deleting a GitHub issue.
+type UndoRecord struct {
+	Method      string `json:"method,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Effect      string `json:"effect"`
+	StillExists string `json:"still_exists"`
+	State       string `json:"state"`
+	StatusCode  int    `json:"status_code,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 // StagedRequest is a call withheld from the origin until the final decision.
 type StagedRequest struct {
-	Method           string    `json:"method"`
-	URL              string    `json:"url"`
-	Adapter          string    `json:"adapter"`
-	Rule             string    `json:"rule"`
-	IdempotencyKey   string    `json:"idempotency_key"`
-	SyntheticStatus  int       `json:"synthetic_status"`
-	State            string    `json:"state"`
-	ReplayStatusCode int       `json:"replay_status_code,omitempty"`
-	Error            string    `json:"error,omitempty"`
-	Warning          string    `json:"warning,omitempty"`
-	StagedAt         time.Time `json:"staged_at"`
-	Body             string    `json:"-"`
+	Method           string      `json:"method"`
+	URL              string      `json:"url"`
+	Adapter          string      `json:"adapter"`
+	Rule             string      `json:"rule"`
+	IdempotencyKey   string      `json:"idempotency_key"`
+	SyntheticStatus  int         `json:"synthetic_status"`
+	State            string      `json:"state"`
+	ReplayStatusCode int         `json:"replay_status_code,omitempty"`
+	Error            string      `json:"error,omitempty"`
+	Warning          string      `json:"warning,omitempty"`
+	StagedAt         time.Time   `json:"staged_at"`
+	Body             string      `json:"-"`
+	Undo             *UndoRecord `json:"undo,omitempty"`
 }
 
 // ApprovalRecord is a needs-approval request and the user's decision.
@@ -127,6 +145,7 @@ type Proxy struct {
 	summaryMu sync.Mutex
 	summary   Summary
 	staged    []stagedCall
+	undoCalls []undoCall
 
 	closeOnce sync.Once
 	closeErr  error
@@ -142,6 +161,17 @@ type stagedCall struct {
 	header http.Header
 	body   []byte
 	key    string
+	undo   *adapter.Undo
+	input  adapter.Request
+}
+
+type undoCall struct {
+	method string
+	url    string
+	header http.Header
+	body   []byte
+	target string
+	index  int
 }
 
 // Start binds an HTTPS proxy to an ephemeral loopback port.
@@ -191,7 +221,7 @@ func (proxy *Proxy) Address() string {
 func (proxy *Proxy) Summary() Summary {
 	proxy.summaryMu.Lock()
 	defer proxy.summaryMu.Unlock()
-	return Summary{
+	summary := Summary{
 		Connections:   proxy.summary.Connections,
 		Requests:      append([]RequestRecord(nil), proxy.summary.Requests...),
 		Staged:        append([]StagedRequest(nil), proxy.summary.Staged...),
@@ -200,6 +230,13 @@ func (proxy *Proxy) Summary() Summary {
 		Sealed:        proxy.summary.Sealed,
 		Finalized:     proxy.summary.Finalized,
 	}
+	for index := range summary.Requests {
+		summary.Requests[index].Undo = cloneUndoRecord(summary.Requests[index].Undo)
+	}
+	for index := range summary.Staged {
+		summary.Staged[index].Undo = cloneUndoRecord(summary.Staged[index].Undo)
+	}
+	return summary
 }
 
 // Seal stops new and active proxy connections and freezes the summary.
@@ -255,11 +292,21 @@ func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
 				proxy.summary.Staged[index].State = "discarded"
 			}
 			proxy.staged = nil
+			proxy.summaryMu.Unlock()
+			var discardErrors []error
+			if err := proxy.persistStagedUpdate(); err != nil {
+				discardErrors = append(discardErrors,
+					fmt.Errorf("record discarded staged requests: %w", err))
+			}
+			discardErrors = append(discardErrors, proxy.runUndos(ctx)...)
+			proxy.summaryMu.Lock()
 			proxy.summary.Finalized = true
 			proxy.summaryMu.Unlock()
 			if err := proxy.persistStagedUpdate(); err != nil {
-				proxy.finalizeErr = fmt.Errorf("record discarded staged requests: %w", err)
+				discardErrors = append(discardErrors,
+					fmt.Errorf("record discard compensation outcomes: %w", err))
 			}
+			proxy.finalizeErr = errors.Join(discardErrors...)
 			return
 		}
 		proxy.summaryMu.Unlock()
@@ -293,8 +340,21 @@ func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
 				proxy.summary.Staged[index].State = result.state
 				proxy.summary.Staged[index].Warning = result.warning
 				proxy.summary.Staged[index].Error = errorText(result.err)
+				if result.undoRecord != nil {
+					proxy.summary.Staged[index].Undo = result.undoRecord
+				}
 			}
 			proxy.summaryMu.Unlock()
+			if result.undo != nil || result.undoRecord != nil {
+				if result.undo == nil {
+					result.undo = &undoCall{}
+				}
+				result.undo.target = "staged"
+				result.undo.index = index
+				proxy.summaryMu.Lock()
+				proxy.undoCalls = append(proxy.undoCalls, *result.undo)
+				proxy.summaryMu.Unlock()
+			}
 			if persistErr := proxy.persistStagedUpdate(); persistErr != nil {
 				replayErrors = append(replayErrors, fmt.Errorf(
 					"record staged request %s %s outcome: %w", call.method, call.url, persistErr,
@@ -308,6 +368,11 @@ func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
 		}
 		proxy.summaryMu.Lock()
 		proxy.staged = nil
+		proxy.summaryMu.Unlock()
+		if len(replayErrors) > 0 {
+			replayErrors = append(replayErrors, proxy.runUndos(ctx)...)
+		}
+		proxy.summaryMu.Lock()
 		proxy.summary.Finalized = true
 		proxy.summaryMu.Unlock()
 		if err := proxy.persistStagedUpdate(); err != nil {
@@ -319,10 +384,12 @@ func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
 }
 
 type replayResult struct {
-	status  int
-	state   string
-	warning string
-	err     error
+	status     int
+	state      string
+	warning    string
+	err        error
+	undo       *undoCall
+	undoRecord *UndoRecord
 }
 
 func (proxy *Proxy) replay(ctx context.Context, call stagedCall) replayResult {
@@ -346,7 +413,7 @@ func (proxy *Proxy) replay(ctx context.Context, call stagedCall) replayResult {
 		return replayResult{state: "unknown", err: err}
 	}
 	defer response.Body.Close()
-	_, readErr := io.Copy(io.Discard, response.Body)
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maximumClassifiedBody+1))
 	if response.StatusCode >= 200 && response.StatusCode <= 299 {
 		result := replayResult{status: response.StatusCode, state: "sent"}
 		if readErr != nil {
@@ -354,6 +421,15 @@ func (proxy *Proxy) replay(ctx context.Context, call stagedCall) replayResult {
 				"origin accepted the request with HTTP %d, but reading its response body failed: %v",
 				response.StatusCode, readErr,
 			)
+		}
+		if call.undo != nil {
+			record, undo := proxy.prepareUndo(call.undo, call.input, responseBody)
+			result.undoRecord = record
+			result.undo = undo
+			if undo == nil {
+				result.warning = joinWarning(result.warning,
+					"discard compensation unavailable: "+record.Error)
+			}
 		}
 		return result
 	}
@@ -631,7 +707,6 @@ func (proxy *Proxy) forward(
 	request *http.Request,
 	hostport string,
 ) (bool, error) {
-	const maximumClassifiedBody = 16 << 20
 	body, err := io.ReadAll(io.LimitReader(request.Body, maximumClassifiedBody+1))
 	if request.Body != nil {
 		_ = request.Body.Close()
@@ -692,7 +767,7 @@ func (proxy *Proxy) forward(
 			client, clientReader, request, body, hostport, classification,
 		)
 	case adapter.TierAlreadyIrreversible:
-		return proxy.forwardActual(client, clientReader, request, classification)
+		return proxy.forwardActual(client, clientReader, request, body, classification)
 	default:
 		err := fmt.Errorf("classification returned unsupported tier %q", classification.Tier)
 		proxy.recordUnintercepted(hostport, err.Error()+"; request was blocked")
@@ -753,6 +828,20 @@ func (proxy *Proxy) stage(
 		header: request.Header.Clone(),
 		body:   append([]byte(nil), body...),
 		key:    classification.IdempotencyKey,
+		undo:   classification.Undo,
+		input: adapter.Request{
+			Method: request.Method, URL: cloneURL(request.URL),
+			Header: request.Header.Clone(), Body: append([]byte(nil), body...),
+		},
+	}
+	var undoDisclosure *UndoRecord
+	if classification.Undo != nil {
+		undoDisclosure = &UndoRecord{
+			Method: classification.Undo.Method, URL: classification.Undo.URL,
+			Effect:      undoEffect(classification.Undo),
+			StillExists: undoStillExists(classification.Undo),
+			State:       "not-needed",
+		}
 	}
 	proxy.summaryMu.Lock()
 	proxy.staged = append(proxy.staged, call)
@@ -762,6 +851,7 @@ func (proxy *Proxy) stage(
 		IdempotencyKey:  classification.IdempotencyKey,
 		SyntheticStatus: classification.Response.Status,
 		State:           "pending", StagedAt: started, Body: string(body),
+		Undo: undoDisclosure,
 	})
 	proxy.summaryMu.Unlock()
 	if err := writeProxyResponse(
@@ -827,13 +917,14 @@ func (proxy *Proxy) requestApproval(
 		}, `{"error":"unring approval declined","sent":false}`)
 		return request.Close, err
 	}
-	return proxy.forwardActual(client, clientReader, request, classification)
+	return proxy.forwardActual(client, clientReader, request, body, classification)
 }
 
 func (proxy *Proxy) forwardActual(
 	client io.ReadWriteCloser,
 	clientReader io.Reader,
 	request *http.Request,
+	requestBody []byte,
 	classification adapter.Classification,
 ) (bool, error) {
 	started := time.Now().UTC()
@@ -841,6 +932,10 @@ func (proxy *Proxy) forwardActual(
 		Method: request.Method, URL: request.URL.String(),
 		Tier: classification.Tier, Adapter: classification.Adapter,
 		Rule: classification.Rule, StartedAt: started,
+	}
+	undoInput := adapter.Request{
+		Method: request.Method, URL: cloneURL(request.URL),
+		Header: request.Header.Clone(), Body: append([]byte(nil), requestBody...),
 	}
 	request = request.WithContext(proxy.runCtx)
 	requestedUpgrade := protocolUpgrade(request.Header)
@@ -876,14 +971,24 @@ func (proxy *Proxy) forwardActual(
 	record.StatusCode = response.StatusCode
 	removeHopByHopHeaders(response.Header)
 	closeClient := prepareClientResponse(response, request)
+	var capture boundedCapture
+	response.Body = io.NopCloser(io.TeeReader(response.Body, &capture))
 	if err := response.Write(client); err != nil {
 		record.Error = err.Error()
 		record.EndedAt = time.Now().UTC()
-		proxy.recordRequest(record)
+		if record.StatusCode >= 200 && record.StatusCode <= 299 {
+			proxy.recordRequestWithUndo(record, classification.Undo, undoInput, capture.Bytes())
+		} else {
+			proxy.recordRequest(record)
+		}
 		return true, err
 	}
 	record.EndedAt = time.Now().UTC()
-	proxy.recordRequest(record)
+	if record.StatusCode >= 200 && record.StatusCode <= 299 {
+		proxy.recordRequestWithUndo(record, classification.Undo, undoInput, capture.Bytes())
+	} else {
+		proxy.recordRequest(record)
+	}
 	return closeClient, nil
 }
 
@@ -1097,6 +1202,228 @@ func (proxy *Proxy) recordRequest(record RequestRecord) {
 	proxy.summaryMu.Lock()
 	proxy.summary.Requests = append(proxy.summary.Requests, record)
 	proxy.summaryMu.Unlock()
+}
+
+func (proxy *Proxy) recordRequestWithUndo(
+	record RequestRecord,
+	declaration *adapter.Undo,
+	input adapter.Request,
+	responseBody []byte,
+) {
+	undoRecord, call := proxy.prepareUndo(declaration, input, responseBody)
+	record.Undo = undoRecord
+	proxy.summaryMu.Lock()
+	index := len(proxy.summary.Requests)
+	proxy.summary.Requests = append(proxy.summary.Requests, record)
+	if call != nil {
+		call.target = "request"
+		call.index = index
+		proxy.undoCalls = append(proxy.undoCalls, *call)
+	} else if undoRecord != nil {
+		proxy.undoCalls = append(proxy.undoCalls, undoCall{target: "request", index: index})
+	}
+	proxy.summaryMu.Unlock()
+}
+
+func (proxy *Proxy) prepareUndo(
+	declaration *adapter.Undo,
+	input adapter.Request,
+	responseBody []byte,
+) (*UndoRecord, *undoCall) {
+	if declaration == nil {
+		return nil, nil
+	}
+	record := &UndoRecord{
+		Method: declaration.Method, URL: declaration.URL,
+		Effect: undoEffect(declaration), StillExists: undoStillExists(declaration),
+		State: "unavailable",
+	}
+	rendered, err := adapter.RenderUndo(declaration, input, responseBody)
+	if err != nil {
+		record.Error = err.Error()
+		return record, nil
+	}
+	record.Method = rendered.Method
+	record.URL = rendered.URL
+	record.State = "available"
+	headers := input.Header.Clone()
+	removeHopByHopHeaders(headers)
+	headers.Del("Content-Length")
+	headers.Del("Idempotency-Key")
+	for name, value := range rendered.Headers {
+		headers.Set(name, value)
+	}
+	return record, &undoCall{
+		method: rendered.Method, url: rendered.URL, header: headers,
+		body: []byte(rendered.Body),
+	}
+}
+
+func (proxy *Proxy) runUndos(ctx context.Context) []error {
+	proxy.summaryMu.Lock()
+	calls := append([]undoCall(nil), proxy.undoCalls...)
+	proxy.undoCalls = nil
+	proxy.summaryMu.Unlock()
+
+	var undoErrors []error
+	for _, call := range calls {
+		if call.method == "" || call.url == "" {
+			undoErrors = append(undoErrors, fmt.Errorf(
+				"compensation is unavailable; %s", proxy.undoRemaining(call)))
+			continue
+		}
+		proxy.updateUndo(call, func(record *UndoRecord) {
+			record.State = "undoing"
+			record.Error = ""
+		})
+		if err := proxy.persistStagedUpdate(); err != nil {
+			proxy.updateUndo(call, func(record *UndoRecord) {
+				record.State = "failed"
+				record.Error = "record compensation before sending: " + err.Error()
+			})
+			undoErrors = append(undoErrors, fmt.Errorf(
+				"did not attempt compensation %s; %s: %w",
+				call.method+" "+call.url, proxy.undoRemaining(call), err,
+			))
+			continue
+		}
+
+		status, err := proxy.executeUndo(ctx, call)
+		proxy.updateUndo(call, func(record *UndoRecord) {
+			record.StatusCode = status
+			if err != nil {
+				record.State = "failed"
+				record.Error = err.Error()
+			} else {
+				record.State = "succeeded"
+			}
+		})
+		if persistErr := proxy.persistStagedUpdate(); persistErr != nil {
+			err = errors.Join(err, fmt.Errorf("record compensation outcome: %w", persistErr))
+		}
+		if err != nil {
+			undoErrors = append(undoErrors, fmt.Errorf(
+				"compensation %s failed; %s: %w",
+				call.method+" "+call.url, proxy.undoRemaining(call), err,
+			))
+		}
+	}
+	return undoErrors
+}
+
+func (proxy *Proxy) executeUndo(ctx context.Context, call undoCall) (int, error) {
+	body := io.NopCloser(bytes.NewReader(call.body))
+	request, err := http.NewRequestWithContext(ctx, call.method, call.url, body)
+	if err != nil {
+		return 0, fmt.Errorf("build compensation request: %w", err)
+	}
+	request.ContentLength = int64(len(call.body))
+	request.GetBody = nil
+	request.Header = call.header.Clone()
+	response, err := proxy.transport.RoundTrip(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maximumClassifiedBody+1))
+	if readErr != nil {
+		return response.StatusCode, fmt.Errorf("read compensation response: %w", readErr)
+	}
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return response.StatusCode, fmt.Errorf(
+			"compensation origin returned HTTP %d", response.StatusCode)
+	}
+	var envelope struct {
+		OK *bool `json:"ok"`
+	}
+	if json.Unmarshal(responseBody, &envelope) == nil && envelope.OK != nil && !*envelope.OK {
+		return response.StatusCode, errors.New(
+			"compensation origin returned ok=false despite a successful HTTP status")
+	}
+	return response.StatusCode, nil
+}
+
+func (proxy *Proxy) updateUndo(call undoCall, change func(*UndoRecord)) {
+	proxy.summaryMu.Lock()
+	defer proxy.summaryMu.Unlock()
+	var record *UndoRecord
+	switch call.target {
+	case "request":
+		if call.index < len(proxy.summary.Requests) {
+			record = proxy.summary.Requests[call.index].Undo
+		}
+	case "staged":
+		if call.index < len(proxy.summary.Staged) {
+			record = proxy.summary.Staged[call.index].Undo
+		}
+	}
+	if record != nil {
+		change(record)
+	}
+}
+
+func (proxy *Proxy) undoRemaining(call undoCall) string {
+	proxy.summaryMu.Lock()
+	defer proxy.summaryMu.Unlock()
+	var record *UndoRecord
+	if call.target == "request" && call.index < len(proxy.summary.Requests) {
+		record = proxy.summary.Requests[call.index].Undo
+	}
+	if call.target == "staged" && call.index < len(proxy.summary.Staged) {
+		record = proxy.summary.Staged[call.index].Undo
+	}
+	if record == nil || record.StillExists == "" {
+		return "the original external effect may still exist"
+	}
+	return record.StillExists
+}
+
+func undoEffect(declaration *adapter.Undo) string {
+	if declaration.Effect != "" {
+		return declaration.Effect
+	}
+	return strings.ToLower(declaration.Method) + " the resource using " + declaration.URL
+}
+
+func undoStillExists(declaration *adapter.Undo) string {
+	if declaration.StillExists != "" {
+		return declaration.StillExists
+	}
+	return "if compensation fails, the original external effect remains in the world"
+}
+
+func cloneUndoRecord(record *UndoRecord) *UndoRecord {
+	if record == nil {
+		return nil
+	}
+	clone := *record
+	return &clone
+}
+
+func joinWarning(existing, warning string) string {
+	if existing == "" {
+		return warning
+	}
+	return existing + "; " + warning
+}
+
+type boundedCapture struct {
+	data []byte
+}
+
+func (capture *boundedCapture) Write(data []byte) (int, error) {
+	remaining := maximumClassifiedBody + 1 - len(capture.data)
+	if remaining > 0 {
+		if len(data) < remaining {
+			remaining = len(data)
+		}
+		capture.data = append(capture.data, data[:remaining]...)
+	}
+	return len(data), nil
+}
+
+func (capture *boundedCapture) Bytes() []byte {
+	return append([]byte(nil), capture.data...)
 }
 
 func (proxy *Proxy) recordUnintercepted(host, detail string) {

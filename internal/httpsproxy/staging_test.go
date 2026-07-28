@@ -299,6 +299,178 @@ func TestNon2xxReplayOutcomeIsUnknownNotSendFailed(t *testing.T) {
 	}
 }
 
+func TestSentSlackMessageIsCompensatedWhenCommitFallsBackToDiscard(t *testing.T) {
+	adapters := loadBuiltinAdapters(t)
+	slackURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
+	slackBody := []byte(`{"channel":"C123","text":"compensate me"}`)
+	classification, matched, err := adapters.Classify(adapter.Request{
+		Method: http.MethodPost, URL: slackURL,
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   slackBody,
+	})
+	if err != nil || !matched || classification.Undo == nil {
+		t.Fatalf("classify Slack message = %#v, matched %v, err %v",
+			classification, matched, err)
+	}
+
+	var mu sync.Mutex
+	var requests []recordedRequest
+	transport := testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		mu.Lock()
+		requests = append(requests, recordedRequest{
+			Method: request.Method, URL: request.URL.String(),
+			Header: request.Header.Clone(), body: body,
+		})
+		mu.Unlock()
+		status := http.StatusOK
+		responseBody := `{"ok":true,"ts":"1712345678.000100"}`
+		if request.URL.Host == "failure.example" {
+			status = http.StatusInternalServerError
+			responseBody = `{"error":"failed"}`
+		}
+		if request.URL.Path == "/api/chat.delete" {
+			responseBody = `{"ok":true}`
+		}
+		return &http.Response{
+			StatusCode: status, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(responseBody)), Request: request,
+		}, nil
+	})
+	failureURL, _ := url.Parse("https://failure.example/action")
+	proxy := &Proxy{
+		transport: transport,
+		summary: Summary{Sealed: true, Staged: []StagedRequest{
+			{
+				Method: http.MethodPost, URL: slackURL.String(), State: "pending",
+				Undo: &UndoRecord{
+					Effect:      classification.Undo.Effect,
+					StillExists: classification.Undo.StillExists,
+					State:       "not-needed",
+				},
+			},
+			{Method: http.MethodPost, URL: failureURL.String(), State: "pending"},
+		}},
+		staged: []stagedCall{
+			{
+				method: http.MethodPost, url: slackURL, host: slackURL.Host,
+				header: http.Header{"Content-Type": []string{"application/json"}},
+				body:   slackBody, key: "slack-key", undo: classification.Undo,
+				input: adapter.Request{
+					Method: http.MethodPost, URL: slackURL,
+					Header: http.Header{"Content-Type": []string{"application/json"}},
+					Body:   slackBody,
+				},
+			},
+			{
+				method: http.MethodPost, url: failureURL, host: failureURL.Host,
+				header: make(http.Header), body: []byte(`{}`), key: "failure-key",
+			},
+		},
+	}
+	if err := proxy.Finalize(context.Background(), true); err == nil {
+		t.Fatal("partial commit unexpectedly succeeded")
+	}
+	mu.Lock()
+	gotRequests := append([]recordedRequest(nil), requests...)
+	mu.Unlock()
+	if len(gotRequests) != 3 ||
+		gotRequests[2].URL != "https://slack.com/api/chat.delete" ||
+		!strings.Contains(string(gotRequests[2].body), `"ts":"1712345678.000100"`) {
+		t.Fatalf("recorded origin requests = %#v", gotRequests)
+	}
+	undo := proxy.Summary().Staged[0].Undo
+	if undo == nil || undo.State != "succeeded" || undo.StatusCode != http.StatusOK {
+		t.Fatalf("Slack compensation outcome = %#v", undo)
+	}
+}
+
+func TestFailedUndoNamesWhatStillExists(t *testing.T) {
+	transport := testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body:    io.NopCloser(strings.NewReader(`{"ok":false,"error":"cant_delete"}`)),
+			Request: request,
+		}, nil
+	})
+	proxy := &Proxy{
+		transport: transport,
+		summary: Summary{
+			Sealed: true,
+			Requests: []RequestRecord{{
+				Method: http.MethodPost, URL: "https://slack.com/api/chat.postMessage",
+				StatusCode: http.StatusOK,
+				Undo: &UndoRecord{
+					Method: http.MethodPost, URL: "https://slack.com/api/chat.delete",
+					Effect:      "delete the Slack message",
+					StillExists: "the Slack message remains posted",
+					State:       "available",
+				},
+			}},
+		},
+		undoCalls: []undoCall{{
+			method: http.MethodPost, url: "https://slack.com/api/chat.delete",
+			header: make(http.Header), body: []byte(`{}`), target: "request", index: 0,
+		}},
+	}
+	err := proxy.Finalize(context.Background(), false)
+	if err == nil || !strings.Contains(err.Error(), "the Slack message remains posted") {
+		t.Fatalf("failed undo error = %v", err)
+	}
+	undo := proxy.Summary().Requests[0].Undo
+	if undo.State != "failed" || !strings.Contains(undo.Error, "ok=false") {
+		t.Fatalf("failed undo summary = %#v", undo)
+	}
+}
+
+func TestDiscardDeletesSlackMessageThatReallyRan(t *testing.T) {
+	var recorded recordedRequest
+	transport := testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		recorded = recordedRequest{
+			Method: request.Method, URL: request.URL.String(),
+			Header: request.Header.Clone(), body: body,
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Request: request,
+		}, nil
+	})
+	proxy := &Proxy{
+		transport: transport,
+		summary: Summary{
+			Sealed: true,
+			Requests: []RequestRecord{{
+				Method: http.MethodPost, URL: "https://slack.com/api/chat.postMessage",
+				StatusCode: http.StatusOK,
+				Undo: &UndoRecord{
+					Method: http.MethodPost, URL: "https://slack.com/api/chat.delete",
+					Effect:      "delete the Slack message posted by this token",
+					StillExists: "someone may already have read it",
+					State:       "available",
+				},
+			}},
+		},
+		undoCalls: []undoCall{{
+			method: http.MethodPost, url: "https://slack.com/api/chat.delete",
+			header: http.Header{"Authorization": []string{"Bearer secret"}},
+			body:   []byte(`{"channel":"C123","ts":"1712345678.000100"}`),
+			target: "request", index: 0,
+		}},
+	}
+	if err := proxy.Finalize(context.Background(), false); err != nil {
+		t.Fatalf("Finalize(discard) compensation error: %v", err)
+	}
+	if recorded.URL != "https://slack.com/api/chat.delete" ||
+		recorded.Header.Get("Authorization") != "Bearer secret" ||
+		!strings.Contains(string(recorded.body), `"ts":"1712345678.000100"`) {
+		t.Fatalf("Slack delete request = %#v", recorded)
+	}
+	if undo := proxy.Summary().Requests[0].Undo; undo.State != "succeeded" {
+		t.Fatalf("Slack delete outcome = %#v", undo)
+	}
+}
+
 func TestReplayTransitionsArePublishedIncrementally(t *testing.T) {
 	var snapshots []Summary
 	proxy := &Proxy{
@@ -436,14 +608,7 @@ func startClassifiedProxy(
 	approve func(context.Context, ApprovalRequest) (bool, error),
 ) (*Proxy, *http.Client) {
 	t.Helper()
-	sources, err := adapter.BuiltinSources()
-	if err != nil {
-		t.Fatalf("BuiltinSources() error: %v", err)
-	}
-	adapters, err := adapter.Load(sources...)
-	if err != nil {
-		t.Fatalf("Load(builtins) error: %v", err)
-	}
+	adapters := loadBuiltinAdapters(t)
 	authority, err := EnsureAuthority(t.TempDir())
 	if err != nil {
 		t.Fatalf("EnsureAuthority() error: %v", err)
@@ -467,6 +632,19 @@ func startClassifiedProxy(
 		},
 	}}
 	return proxy, client
+}
+
+func loadBuiltinAdapters(t *testing.T) *adapter.Set {
+	t.Helper()
+	sources, err := adapter.BuiltinSources()
+	if err != nil {
+		t.Fatalf("BuiltinSources() error: %v", err)
+	}
+	adapters, err := adapter.Load(sources...)
+	if err != nil {
+		t.Fatalf("Load(builtins) error: %v", err)
+	}
+	return adapters
 }
 
 func postThroughProxy(t *testing.T, client *http.Client, endpoint string, body []byte) *http.Response {
