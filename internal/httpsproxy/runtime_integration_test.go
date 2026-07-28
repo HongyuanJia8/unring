@@ -390,7 +390,12 @@ func startRuntimeProxy(
 		}
 		return response, err
 	})
-	proxy, err := httpsproxy.Start(authority, httpsproxy.Options{Transport: transport})
+	proxy, err := httpsproxy.Start(authority, httpsproxy.Options{
+		Transport: transport,
+		Approve: func(context.Context, httpsproxy.ApprovalRequest) (bool, error) {
+			return true, nil
+		},
+	})
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}

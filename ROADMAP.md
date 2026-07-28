@@ -71,18 +71,19 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 ## M5 — HTTPS proxy
 
 - [x] M5.1 Local CA generation, stored per-user, injected into the child process only
-- [~] M5.2 MITM proxy: interception, recording, and forwarding are implemented;
-      proxy-aware plain HTTP fails closed and protocol upgrades are explicitly
-      tunneled and reported; classification and staging remain for M6
+- [x] M5.2 MITM proxy: interception, recording, forwarding, classification, and
+      staging are implemented; proxy-aware plain HTTP fails closed and protocol
+      upgrades are explicitly tunneled and reported
 - [x] M5.3 CONNECT passthrough for hosts we cannot MITM, reported as un-intercepted
 
 ## M6 — Adapters
 
-- [ ] M6.1 YAML adapter schema + loader (match / tier / idempotency key / undo)
-- [ ] M6.2 Expression evaluation for conditional rules (CEL vs JSONPath — decide here)
-- [ ] M6.3 GitHub adapter, written in the community format
-- [ ] M6.4 Slack adapter, written in the community format
-- [ ] M6.5 HTTP heuristics for unknown services, defaulting to *needs approval*
+- [x] M6.1 YAML adapter schema + loader (match / tier / idempotency key / undo)
+- [x] M6.2 CEL expression evaluation for conditional rules and idempotency keys
+- [x] M6.3 GitHub adapter, written in the community format
+- [x] M6.4 Slack adapter, written in the community format
+- [x] M6.5 HTTP heuristics for unknown services, defaulting mutations to
+      *needs approval*
 
 ## M7 — `gh` PATH shim
 

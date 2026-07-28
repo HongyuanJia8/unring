@@ -8,10 +8,11 @@ what it did and what it is about to do, then you decide: **commit** or **discard
 
 The name comes from *you can't unring a bell*. That is the whole point: now you can.
 
-> **Status: Postgres transactions plus HTTPS interception and audit.** Database
-> activity is transactional. HTTPS requests are intercepted, recorded, and forwarded
-> immediately in this slice; classification, staging, and undo are not implemented
-> yet. See [ROADMAP.md](ROADMAP.md) for what is built and what is next.
+> **Status: Postgres transactions, HTTPS staging/approval, and audit.** Database
+> activity is transactional. Declarative adapters stage Slack messages and require
+> approval for GitHub issue creation; unknown HTTPS mutations fail closed into the
+> approval path. Compensating undo is not implemented yet. See
+> [ROADMAP.md](ROADMAP.md) for what is built and what is next.
 
 ## Try the Postgres slice
 
@@ -47,11 +48,15 @@ therefore trust both their prior roots and unring's CA without changing trust fo
 user's shell or any other process. If the parent environment requires an upstream
 HTTP or HTTPS proxy, unring honors it when forwarding and for CONNECT passthrough.
 
-Every successfully intercepted HTTPS request is forwarded in this slice and is shown
-under **HTTPS REQUESTS — INTERCEPTED AND ALREADY FORWARDED** in the review. A final
-discard cannot undo such a request; the warning is deliberate. Proxy-aware plain HTTP
-is routed to unring too, but is currently blocked with an HTTP 400 and reported as
-un-intercepted rather than being allowed to escape invisibly.
+Intercepted HTTPS requests are classified by ordinary YAML adapters, then conservative
+HTTP heuristics. Stageable calls do not reach their origin: the client receives an
+explicitly marked synthetic response, and the review shows the call under
+**PENDING HTTPS — WILL BE SENT IF YOU COMMIT**. Needs-approval calls stop while unring
+asks; a decline guarantees the request is not sent. Safe-method requests and approved
+calls that really ran are shown separately from traffic unring could not intercept.
+Proxy-aware plain HTTP remains blocked and reported rather than escaping invisibly.
+The complete community adapter format is documented in
+[docs/ADAPTERS.md](docs/ADAPTERS.md).
 
 After the child exits, `unring` prints the simple-query batches and asks whether to
 commit or discard. Automation must choose explicitly:
@@ -147,9 +152,13 @@ ability to make any of it permanent without you saying so.
 
 ## Honest limits
 
-- HTTPS classification, staging, and compensation are not implemented yet. Every
-  HTTPS request that unring successfully intercepts is forwarded immediately, so an
-  external effect may already have happened when the review appears.
+- Compensating undo is not implemented yet. The adapter schema retains `undo`
+  declarations for M8, but slice 5 never executes them.
+- A final commit replays staged HTTPS calls before committing the Postgres
+  transaction. If replay fails, unring rolls the database back and reports an unknown
+  overall outcome because an earlier staged call may already have reached its origin.
+  Declared idempotency keys make service-side retry protection possible, but there is
+  no distributed transaction across an HTTP service and Postgres.
 - Go binaries on macOS, including `gh`, do not honor `SSL_CERT_FILE`; Go's
   `crypto/x509` uses the system keychain. Unring deliberately does not install its CA
   there. Such a client normally fails the MITM TLS handshake, and unring reports the

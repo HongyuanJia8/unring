@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +29,24 @@ func TestMainHelp(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "unring run") {
 		t.Fatalf("help output did not mention run: %s", stdout.String())
+	}
+}
+
+func TestLoadAdaptersFailsLoudlyForMalformedUserFile(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "malformed-community-adapter.yaml")
+	if err := os.WriteFile(filename, []byte(`
+version: 1
+name: malformed
+rules:
+  - name: missing-match
+    tier: stageable
+`), 0o600); err != nil {
+		t.Fatalf("write malformed adapter: %v", err)
+	}
+	_, err := loadAdapters(filename)
+	if err == nil || !strings.Contains(err.Error(), filename) ||
+		!strings.Contains(err.Error(), "match.hosts") {
+		t.Fatalf("loadAdapters() error = %v", err)
 	}
 }
 
@@ -125,6 +144,110 @@ func TestReviewReportsForwardedAndUninterceptedHTTPSSeparately(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("HTTPS review missing %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T) {
+	t.Parallel()
+	httpsSummary := httpsproxy.Summary{
+		Sealed: true,
+		Staged: []httpsproxy.StagedRequest{{
+			Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+			Adapter: "slack", Rule: "post-message", State: "pending",
+			IdempotencyKey: "slack-message:abc", Body: `{"text":"later"}`,
+		}},
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "POST", URL: "https://api.github.com/repos/acme/widget/issues",
+			StatusCode: 201,
+		}},
+		Unintercepted: []httpsproxy.UninterceptedItem{{
+			Host: "opaque.example:443", Detail: "CONNECT tunnel was passed through",
+		}},
+	}
+	postgresSummary := pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}
+
+	view := newReviewModelWithHTTPS(postgresSummary, httpsSummary).View()
+	var plain bytes.Buffer
+	printSummaryWithHTTPS(&plain, postgresSummary, httpsSummary)
+	for label, text := range map[string]string{"TUI": view, "plain": plain.String()} {
+		for _, want := range []string{
+			"PENDING HTTPS — WILL BE SENT IF YOU COMMIT",
+			"slack.com/api/chat.postMessage",
+			"HTTPS REQUESTS —",
+			"api.github.com/repos/acme/widget/issues",
+			"UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC",
+			"opaque.example:443",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s review missing %q:\n%s", label, want, text)
+			}
+		}
+	}
+}
+
+func TestStagedReplayTransitionsArePersistedImmediatelyToAudit(t *testing.T) {
+	store, err := audit.OpenStoreAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStoreAt() error: %v", err)
+	}
+	session, err := store.Begin([]string{"agent"}, time.Now())
+	if err != nil {
+		t.Fatalf("Begin() error: %v", err)
+	}
+	id := session.Snapshot().ID
+	update := stagedAuditUpdater(session)
+
+	summary := httpsproxy.Summary{Sealed: true, Staged: []httpsproxy.StagedRequest{
+		{Method: "POST", URL: "https://slack.com/one", State: "sent"},
+		{Method: "POST", URL: "https://slack.com/two", State: "sending"},
+		{Method: "POST", URL: "https://slack.com/three", State: "pending"},
+	}}
+	if err := update(summary); err != nil {
+		t.Fatalf("persist replay transition: %v", err)
+	}
+	loaded, err := store.Load(id)
+	if err != nil {
+		t.Fatalf("Load() after transition: %v", err)
+	}
+	states := []string{
+		loaded.HTTPS.Staged[0].State,
+		loaded.HTTPS.Staged[1].State,
+		loaded.HTTPS.Staged[2].State,
+	}
+	if states[0] != "sent" || states[1] != "sending" || states[2] != "pending" {
+		t.Fatalf("durable replay states = %v", states)
+	}
+}
+
+func TestPartialCommitOutcomeListsSentUnknownAndDatabaseRollback(t *testing.T) {
+	var output bytes.Buffer
+	printPartialCommitOutcome(&output, httpsproxy.Summary{Staged: []httpsproxy.StagedRequest{
+		{Method: "POST", URL: "https://slack.com/one", State: "sent", ReplayStatusCode: 200},
+		{Method: "POST", URL: "https://slack.com/two", State: "unknown", ReplayStatusCode: 500,
+			Error: "origin returned HTTP 500; delivery outcome is unknown"},
+		{Method: "POST", URL: "https://slack.com/three", State: "sent", ReplayStatusCode: 200},
+	}}, nil)
+	text := output.String()
+	for _, want := range []string{
+		"COMMIT DID NOT COMPLETE",
+		"[sent] POST https://slack.com/one",
+		"[unknown] POST https://slack.com/two",
+		"[sent] POST https://slack.com/three",
+		"Postgres transaction: DISCARDED",
+		"requested commit became a rollback",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("partial commit report missing %q:\n%s", want, text)
+		}
+	}
+
+	output.Reset()
+	printPartialCommitOutcome(&output, httpsproxy.Summary{}, errors.New("backend lost"))
+	if !strings.Contains(output.String(), "Postgres transaction: UNKNOWN") {
+		t.Fatalf("unconfirmed rollback was overstated:\n%s", output.String())
 	}
 }
 
