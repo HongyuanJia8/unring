@@ -183,6 +183,33 @@ func TestAnalyzeClientSQLMarksUncountableEffects(t *testing.T) {
 	}
 }
 
+func TestAnalyzeClientSQLMarksServerSideCodeForRuntimeAccountingChecks(t *testing.T) {
+	t.Parallel()
+	for _, sql := range []string{
+		"DO $$ BEGIN TRUNCATE example; END $$",
+		"CALL purge_all()",
+	} {
+		statements, err := analyzeClientSQL(sql)
+		if err != nil {
+			t.Fatalf("analyzeClientSQL(%q): %v", sql, err)
+		}
+		if len(statements) != 1 || statements[0].SummaryRisk == "" {
+			t.Fatalf("analyzeClientSQL(%q) = %#v, want unconditional UNKNOWN risk", sql, statements)
+		}
+	}
+
+	statements, err := analyzeClientSQL("SELECT maintenance.purge_all(), count(*) FROM example")
+	if err != nil {
+		t.Fatalf("analyze function calls: %v", err)
+	}
+	if len(statements) != 1 || len(statements[0].FunctionCalls) != 2 {
+		t.Fatalf("function references = %#v, want purge_all and count", statements)
+	}
+	if !statements[0].ReadOnly {
+		t.Fatalf("SELECT was made non-read-only before PostgreSQL volatility lookup: %#v", statements[0])
+	}
+}
+
 func TestAnalyzeClientSQLCapturesTruncateRelationSemantics(t *testing.T) {
 	t.Parallel()
 	statements, err := analyzeClientSQL(`TRUNCATE ONLY app.one, "Odd Name" * CASCADE`)
@@ -197,6 +224,10 @@ func TestAnalyzeClientSQLCapturesTruncateRelationSemantics(t *testing.T) {
 	if first.IncludeDescendants || first.Relation.Schema != "app" || first.Relation.Name != "one" ||
 		!second.IncludeDescendants || second.Relation.Name != "Odd Name" {
 		t.Fatalf("TRUNCATE targets = %#v", statements[0].TruncateTargets)
+	}
+	restart, err := analyzeClientSQL("TRUNCATE example RESTART IDENTITY")
+	if err != nil || len(restart) != 1 || !restart[0].TruncateRestart {
+		t.Fatalf("RESTART IDENTITY analysis = %#v, %v", restart, err)
 	}
 }
 

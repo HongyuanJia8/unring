@@ -172,6 +172,186 @@ CREATE TABLE %s (id integer); INSERT INTO %s VALUES (1), (2), (3), (4)`,
 	})
 }
 
+func TestTruncateInsideUninspectedSQLIsNeverReportedAsCleanZeroIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	direct := connectTest(t, ctx, config)
+	defer direct.Close(ctx)
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	table := "unring_hidden_truncate_" + suffix
+	function := "unring_hidden_truncate_fn_" + suffix
+	procedure := "unring_hidden_truncate_proc_" + suffix
+	execTest(t, ctx, direct, fmt.Sprintf(`
+CREATE TABLE %s (id integer);
+INSERT INTO %s SELECT generate_series(1, 5);
+CREATE FUNCTION %s() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN TRUNCATE %s; END
+$$;
+CREATE PROCEDURE %s() LANGUAGE plpgsql AS $$
+BEGIN TRUNCATE %s; END
+$$`, table, table, function, table, procedure, table))
+	cleanupCompletenessSQL(t, config, fmt.Sprintf(
+		"DROP TABLE IF EXISTS %s CASCADE; DROP FUNCTION IF EXISTS %s(); DROP PROCEDURE IF EXISTS %s()",
+		table, function, procedure))
+
+	tests := []struct {
+		name string
+		sql  string
+	}{
+		{name: "DO block", sql: fmt.Sprintf("DO $$ BEGIN TRUNCATE %s; END $$", table)},
+		{name: "function selected", sql: "SELECT " + function + "()"},
+		{name: "procedure called", sql: "CALL " + procedure + "()"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			proxy := startTruncateTestProxy(t, ctx, config)
+			client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+			execTest(t, ctx, client, test.sql)
+			_ = client.Close(ctx)
+			if err := proxy.Seal(ctx); err != nil {
+				t.Fatalf("Seal(): %v", err)
+			}
+			summary := proxy.Summary()
+			if summary.Changes.Complete || !summary.HasReviewableActivity() ||
+				!strings.Contains(summary.Changes.Error, "cannot inspect") {
+				t.Fatalf("uninspected TRUNCATE looked like a clean zero-row session: %#v", summary)
+			}
+			if err := proxy.Finalize(ctx, DecisionCommit); err == nil {
+				t.Fatal("commit accepted an uninspected TRUNCATE")
+			}
+			if got := scalarTest(t, ctx, direct, "SELECT count(*) FROM "+table); got != "5" {
+				t.Fatalf("forced discard left %s rows, want 5", got)
+			}
+		})
+	}
+}
+
+func TestVolatileFunctionSelectIsNotInterleavedAsReadOnlyIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	direct := connectTest(t, ctx, config)
+	defer direct.Close(ctx)
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	table := "unring_volatile_truncate_" + suffix
+	function := "unring_volatile_truncate_fn_" + suffix
+	execTest(t, ctx, direct, fmt.Sprintf(`
+CREATE TABLE %s (id integer);
+INSERT INTO %s VALUES (1), (2), (3);
+CREATE FUNCTION %s() RETURNS void LANGUAGE plpgsql VOLATILE AS $$
+BEGIN TRUNCATE %s; END
+$$`, table, table, function, table))
+	cleanupCompletenessSQL(t, config, fmt.Sprintf(
+		"DROP TABLE IF EXISTS %s CASCADE; DROP FUNCTION IF EXISTS %s()", table, function))
+
+	proxy := startTruncateTestProxy(t, ctx, config)
+	first := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+	second := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+	execTest(t, ctx, first, "BEGIN")
+	if _, err := second.Exec(ctx, "SELECT "+function+"()").ReadAll(); err == nil ||
+		!strings.Contains(err.Error(), "55P03") {
+		t.Fatalf("volatile function interleave error = %v, want SQLSTATE 55P03", err)
+	}
+	execTest(t, ctx, first, "ROLLBACK")
+	_ = first.Close(ctx)
+	_ = second.Close(ctx)
+	if got := scalarTest(t, ctx, direct, "SELECT count(*) FROM "+table); got != "3" {
+		t.Fatalf("rejected volatile function left %s rows, want 3", got)
+	}
+}
+
+func TestTruncateRestartIdentityHasNoFalseSequenceEffectIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	direct := connectTest(t, ctx, config)
+	defer direct.Close(ctx)
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	table := "unring_truncate_restart_" + suffix
+	execTest(t, ctx, direct, fmt.Sprintf(
+		"CREATE TABLE %s (id serial PRIMARY KEY); INSERT INTO %s DEFAULT VALUES; INSERT INTO %s DEFAULT VALUES; INSERT INTO %s DEFAULT VALUES",
+		table, table, table, table))
+	cleanupCompletenessSQL(t, config, "DROP TABLE IF EXISTS "+table+" CASCADE")
+
+	t.Run("successful reset is transactional", func(t *testing.T) {
+		proxy := startTruncateTestProxy(t, ctx, config)
+		client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+		execTest(t, ctx, client, "TRUNCATE "+table+" RESTART IDENTITY")
+		_ = client.Close(ctx)
+		if err := proxy.Seal(ctx); err != nil {
+			t.Fatalf("Seal(): %v", err)
+		}
+		summary := proxy.Summary()
+		assertTruncateRows(t, summary, map[string]int64{"public." + table: 3})
+		if len(summary.NonTransactional) != 0 {
+			t.Fatalf("transactional identity reset reported as non-transactional: %#v", summary.NonTransactional)
+		}
+		if err := proxy.Finalize(ctx, DecisionRollback); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+	})
+
+	t.Run("savepoint rollback restores suppression state", func(t *testing.T) {
+		proxy := startTruncateTestProxy(t, ctx, config)
+		client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+		execTest(t, ctx, client, "BEGIN; SAVEPOINT before_reset; TRUNCATE "+table+
+			" RESTART IDENTITY; ROLLBACK TO SAVEPOINT before_reset; COMMIT")
+		_ = client.Close(ctx)
+		if err := proxy.Seal(ctx); err != nil {
+			t.Fatalf("Seal(): %v", err)
+		}
+		summary := proxy.Summary()
+		if !summary.Changes.Complete || len(summary.Changes.Rows) != 0 ||
+			len(summary.NonTransactional) != 0 || summary.HasReviewableActivity() {
+			t.Fatalf("rolled-back identity reset remained reviewable: %#v", summary)
+		}
+		if err := proxy.Finalize(ctx, DecisionRollback); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+	})
+
+	t.Run("transaction rollback leaves no sticky warning", func(t *testing.T) {
+		proxy := startTruncateTestProxy(t, ctx, config)
+		client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+		execTest(t, ctx, client, "BEGIN; TRUNCATE "+table+" RESTART IDENTITY; ROLLBACK")
+		_ = client.Close(ctx)
+		if err := proxy.Seal(ctx); err != nil {
+			t.Fatalf("Seal(): %v", err)
+		}
+		summary := proxy.Summary()
+		if !summary.Changes.Complete || len(summary.Changes.Rows) != 0 ||
+			len(summary.NonTransactional) != 0 || summary.HasReviewableActivity() {
+			t.Fatalf("rolled-back identity reset remained reviewable: %#v", summary)
+		}
+		if err := proxy.Finalize(ctx, DecisionRollback); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+	})
+
+	t.Run("real advance after rolled-back reset is still reported", func(t *testing.T) {
+		proxy := startTruncateTestProxy(t, ctx, config)
+		client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+		execTest(t, ctx, client, "BEGIN; SAVEPOINT before_reset; TRUNCATE "+table+
+			" RESTART IDENTITY; ROLLBACK TO SAVEPOINT before_reset; INSERT INTO "+table+
+			" DEFAULT VALUES; ROLLBACK")
+		_ = client.Close(ctx)
+		if err := proxy.Seal(ctx); err != nil {
+			t.Fatalf("Seal(): %v", err)
+		}
+		summary := proxy.Summary()
+		if len(summary.NonTransactional) == 0 || !summary.HasReviewableActivity() {
+			t.Fatalf("real sequence advance was hidden by reset suppression: %#v", summary)
+		}
+		if err := proxy.Finalize(ctx, DecisionRollback); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+	})
+}
+
 func startTruncateTestProxy(t *testing.T, ctx context.Context, config *pgconn.Config) *Proxy {
 	t.Helper()
 	proxy, err := Start(ctx, config)

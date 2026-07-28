@@ -395,7 +395,33 @@ func (p *Proxy) reconcileRowChangesLocked(keep bool) {
 }
 
 func (p *Proxy) prepareStatementRiskLocked(statement *clientStatement) {
-	if statement == nil || statement.SummaryRisk != "" || statement.SummaryTarget == nil {
+	if statement == nil {
+		return
+	}
+	if statement.SummaryRisk != "" && !statement.ReadOnly {
+		return
+	}
+	if len(statement.FunctionCalls) > 0 {
+		volatile, err := p.hasVolatileFunctionLocked(statement.FunctionCalls)
+		if err != nil {
+			if statement.SummaryRisk == "" {
+				statement.SummaryRisk = "unring could not determine whether a called function can execute uninspected SQL: " + err.Error()
+			}
+			statement.ReadOnly = false
+			return
+		}
+		if volatile {
+			if statement.SummaryRisk == "" {
+				statement.SummaryRisk = "a volatile function can execute SQL that unring cannot inspect for exact row accounting"
+			}
+			statement.ReadOnly = false
+			return
+		}
+	}
+	if statement.SummaryRisk != "" {
+		return
+	}
+	if statement.SummaryTarget == nil {
 		return
 	}
 	rows, err := p.internalRowsLocked(`
@@ -421,6 +447,44 @@ SELECT c.relkind::text,
 	if string(rows[0][1]) == "true" {
 		statement.SummaryRisk = "deferrable constraint triggers may perform additional writes at COMMIT, after the review decision"
 		statement.RiskRequiresRows = true
+	}
+}
+
+func (p *Proxy) hasVolatileFunctionLocked(references []functionReference) (bool, error) {
+	conditions := make([]string, 0, len(references))
+	for _, reference := range references {
+		condition := "p.proname = " + quoteSQLLiteral(reference.Name)
+		if reference.Schema == "" {
+			condition += " AND pg_function_is_visible(p.oid)"
+		} else {
+			condition += " AND n.nspname = " + quoteSQLLiteral(reference.Schema)
+		}
+		if reference.Catalog != "" {
+			condition += " AND current_database() = " + quoteSQLLiteral(reference.Catalog)
+		}
+		conditions = append(conditions, "("+condition+")")
+	}
+	rows, err := p.internalRowsLocked(`
+SELECT EXISTS (
+  SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE p.provolatile = 'v' AND p.prokind IN ('f', 'w')
+     AND (` + strings.Join(conditions, " OR ") + `)
+)::text`)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] == nil {
+		return false, fmt.Errorf("PostgreSQL returned malformed function-volatility metadata")
+	}
+	switch string(rows[0][0]) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("PostgreSQL returned invalid function-volatility metadata")
 	}
 }
 
@@ -477,18 +541,130 @@ SELECT format('%I.%I', n.nspname, c.relname)
 	if err != nil {
 		return err
 	}
-	p.summaryMu.Lock()
-	defer p.summaryMu.Unlock()
+	locked := make([]string, 0, len(rows))
 	for _, row := range rows {
 		if len(row) != 1 || row[0] == nil {
 			return fmt.Errorf("postgres returned malformed sequence-lock information")
 		}
-		name := string(row[0])
+		locked = append(locked, string(row[0]))
+	}
+	stale := make([]string, 0)
+	for _, name := range locked {
+		if suppression, exists := p.sequenceSuppressions[name]; exists && suppression.Stale {
+			stale = append(stale, name)
+		}
+	}
+	states, err := p.captureSequenceStatesLocked(stale)
+	if err != nil {
+		return err
+	}
+	p.summaryMu.Lock()
+	defer p.summaryMu.Unlock()
+	for _, name := range locked {
+		if suppression, exists := p.sequenceSuppressions[name]; exists &&
+			(!suppression.Stale || suppression.State == states[name]) {
+			continue
+		}
 		if _, existedAtStart := p.catalogInitial["sequence\x00"+name]; existedAtStart {
 			p.sequenceEffects[name] = struct{}{}
 		}
 	}
 	return nil
+}
+
+type sequenceSuppression struct {
+	// A successful RESTART IDENTITY works on a transactional sequence
+	// relfilenode, so its RowExclusiveLock is not evidence of a non-transactional
+	// nextval. PostgreSQL can retain that lock after a savepoint rollback; Stale
+	// suppressions compare the restored sequence state so a later real advance
+	// is still reported.
+	Stale bool
+	State string
+}
+
+func (p *Proxy) suppressRestartedSequencesLocked(relations []uint32) error {
+	if len(relations) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(relations))
+	for _, oid := range relations {
+		values = append(values, strconv.FormatUint(uint64(oid), 10)+"::oid")
+	}
+	rows, err := p.internalRowsLocked(`
+SELECT format('%I.%I', n.nspname, s.relname)
+  FROM pg_depend d
+  JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+  JOIN pg_namespace n ON n.oid = s.relnamespace
+ WHERE d.classid = 'pg_class'::regclass
+   AND d.refclassid = 'pg_class'::regclass
+   AND d.deptype IN ('a', 'i')
+   AND d.refobjid IN (` + strings.Join(values, ", ") + `)
+ ORDER BY 1`)
+	if err != nil {
+		return err
+	}
+	if p.sequenceSuppressions == nil {
+		p.sequenceSuppressions = make(map[string]sequenceSuppression)
+	}
+	for _, row := range rows {
+		if len(row) != 1 || row[0] == nil {
+			return fmt.Errorf("PostgreSQL returned malformed restarted-sequence metadata")
+		}
+		p.sequenceSuppressions[string(row[0])] = sequenceSuppression{}
+	}
+	return nil
+}
+
+func captureSequenceStateQuery(name string) string {
+	return "SELECT " + quoteSQLLiteral(name) + ", last_value::text, is_called::text FROM " + name
+}
+
+func (p *Proxy) captureSequenceStatesLocked(names []string) (map[string]string, error) {
+	states := make(map[string]string, len(names))
+	if len(names) == 0 {
+		return states, nil
+	}
+	queries := make([]string, 0, len(names))
+	for _, name := range names {
+		queries = append(queries, captureSequenceStateQuery(name))
+	}
+	rows, err := p.internalRowsLocked(strings.Join(queries, " UNION ALL "))
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if len(row) != 3 || row[0] == nil || row[1] == nil || row[2] == nil {
+			return nil, fmt.Errorf("PostgreSQL returned malformed sequence-state information")
+		}
+		states[string(row[0])] = string(row[1]) + "\x00" + string(row[2])
+	}
+	return states, nil
+}
+
+func cloneSequenceSuppressions(source map[string]sequenceSuppression) map[string]sequenceSuppression {
+	clone := make(map[string]sequenceSuppression, len(source))
+	for name, suppression := range source {
+		clone[name] = suppression
+	}
+	return clone
+}
+
+func (p *Proxy) restoreSequenceSuppressionsLocked(snapshot map[string]sequenceSuppression) {
+	rolledBack := make([]string, 0)
+	for name := range p.sequenceSuppressions {
+		if _, existed := snapshot[name]; !existed {
+			rolledBack = append(rolledBack, name)
+		}
+	}
+	p.sequenceSuppressions = cloneSequenceSuppressions(snapshot)
+	states, err := p.captureSequenceStatesLocked(rolledBack)
+	if err != nil {
+		p.setRowLedgerError(fmt.Errorf("capture rolled-back identity-reset state: %w", err))
+		return
+	}
+	for _, name := range rolledBack {
+		p.sequenceSuppressions[name] = sequenceSuppression{Stale: true, State: states[name]}
+	}
 }
 
 func (p *Proxy) applyRowStatsLocked(current rowStatsSnapshot, keep bool) {

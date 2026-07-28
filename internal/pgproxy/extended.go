@@ -54,6 +54,7 @@ func (p *Proxy) startExtended(client *clientState) {
 	}
 	client.cycleRows = cloneRowLedger(p.rowLedger)
 	client.cycleUncertainBase = len(p.uncertainEffects)
+	client.cycleSequenceSuppressions = cloneSequenceSuppressions(p.sequenceSuppressions)
 }
 
 func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
@@ -341,9 +342,13 @@ func (p *Proxy) rotateExtendedCycleSavepointLocked(client *clientState, create b
 			p.restoreUncertainEffectsLocked(client.cycleUncertainBase)
 		}
 		p.reconcileRowChangesLocked(keep && len(client.cycleUncertain) == 0)
+		if !keep {
+			p.restoreSequenceSuppressionsLocked(client.cycleSequenceSuppressions)
+		}
 		client.cycleUncertain = nil
 		client.cycleRows = nil
 		client.cycleUncertainBase = 0
+		client.cycleSequenceSuppressions = nil
 		client.cycleSavepoint = ""
 	}
 	if !create {
@@ -355,6 +360,7 @@ func (p *Proxy) rotateExtendedCycleSavepointLocked(client *clientState, create b
 	}
 	client.cycleRows = cloneRowLedger(p.rowLedger)
 	client.cycleUncertainBase = len(p.uncertainEffects)
+	client.cycleSequenceSuppressions = cloneSequenceSuppressions(p.sequenceSuppressions)
 	return nil
 }
 
@@ -537,6 +543,9 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 		p.restoreUncertainEffectsLocked(client.cycleUncertainBase)
 	}
 	p.reconcileRowChangesLocked(keepRows && len(client.cycleUncertain) == 0)
+	if !keepRows {
+		p.restoreSequenceSuppressionsLocked(client.cycleSequenceSuppressions)
+	}
 	if client.extendedFailed && client.pendingEscape == nil &&
 		client.transactionSavepoint != "" {
 		client.transactionFailed = true
@@ -548,6 +557,7 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 	client.cycleUncertain = nil
 	client.cycleRows = nil
 	client.cycleUncertainBase = 0
+	client.cycleSequenceSuppressions = nil
 
 	if client.pendingEscape != nil {
 		statement := *client.pendingEscape

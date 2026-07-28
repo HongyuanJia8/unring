@@ -171,20 +171,21 @@ type Proxy struct {
 	clientWG  sync.WaitGroup
 	acceptWG  sync.WaitGroup
 
-	summaryMu           sync.Mutex
-	connections         int
-	queries             []QueryRecord
-	irreversibleActions []IrreversibleAction
-	unintercepted       []UninterceptedItem
-	changes             ChangeSummary
-	sealedSummary       bool
-	catalogInitial      catalogSnapshot
-	rowStats            rowStatsSnapshot
-	rowLedger           rowLedgerSnapshot
-	rowLedgerErr        error
-	uncertainEffects    []string
-	sequenceEffects     map[string]struct{}
-	serverVersion       int
+	summaryMu            sync.Mutex
+	connections          int
+	queries              []QueryRecord
+	irreversibleActions  []IrreversibleAction
+	unintercepted        []UninterceptedItem
+	changes              ChangeSummary
+	sealedSummary        bool
+	catalogInitial       catalogSnapshot
+	rowStats             rowStatsSnapshot
+	rowLedger            rowLedgerSnapshot
+	rowLedgerErr         error
+	uncertainEffects     []string
+	sequenceEffects      map[string]struct{}
+	sequenceSuppressions map[string]sequenceSuppression
+	serverVersion        int
 
 	finishMu sync.Mutex
 	finished bool
@@ -275,6 +276,7 @@ func StartWithOptions(ctx context.Context, config *pgconn.Config, options Option
 	}
 	p.rowLedger = make(rowLedgerSnapshot)
 	p.sequenceEffects = make(map[string]struct{})
+	p.sequenceSuppressions = make(map[string]sequenceSuppression)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

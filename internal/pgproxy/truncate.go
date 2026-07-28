@@ -9,8 +9,13 @@ import (
 
 // truncateEffect is captured while every relation PostgreSQL can truncate is
 // protected by ACCESS EXCLUSIVE. Counts are for physical ordinary tables;
-// partitioned parents have no rows of their own and are intentionally omitted.
-type truncateEffect map[uint32]RowChange
+// partitioned parents have no rows of their own and are intentionally omitted
+// from Rows. Relations retains the full reviewed closure solely to identify
+// owned sequences reset by RESTART IDENTITY.
+type truncateEffect struct {
+	Rows      map[uint32]RowChange
+	Relations []uint32
+}
 
 type truncateRelation struct {
 	OID                   uint32
@@ -21,7 +26,7 @@ type truncateRelation struct {
 	HasTruncateTrigger    bool
 }
 
-func (p *Proxy) prepareTruncateEffectLocked(statement clientStatement) (truncateEffect, error) {
+func (p *Proxy) prepareTruncateEffectLocked(statement clientStatement) (*truncateEffect, error) {
 	if len(statement.TruncateTargets) == 0 {
 		return nil, nil
 	}
@@ -44,7 +49,7 @@ func (p *Proxy) prepareTruncateEffectLocked(statement clientStatement) (truncate
 	return effect, nil
 }
 
-func (p *Proxy) captureTruncateEffectLocked(statement clientStatement) (truncateEffect, error) {
+func (p *Proxy) captureTruncateEffectLocked(statement clientStatement) (*truncateEffect, error) {
 	lockTargets := make([]string, 0, len(statement.TruncateTargets))
 	for _, target := range statement.TruncateTargets {
 		name := target.Relation.regclassName()
@@ -120,8 +125,12 @@ func (p *Proxy) captureTruncateEffectLocked(statement clientStatement) (truncate
 			relation.OID, relation.Name,
 		))
 	}
+	relationOIDs := make([]uint32, 0, len(relations))
+	for _, relation := range relations {
+		relationOIDs = append(relationOIDs, relation.OID)
+	}
 	if len(queries) == 0 {
-		return truncateEffect{}, nil
+		return &truncateEffect{Rows: make(map[uint32]RowChange), Relations: relationOIDs}, nil
 	}
 	rows, err := p.internalRowsLocked(strings.Join(queries, " UNION ALL ") + " ORDER BY 1")
 	if err != nil {
@@ -131,7 +140,10 @@ func (p *Proxy) captureTruncateEffectLocked(statement clientStatement) (truncate
 	for _, relation := range relations {
 		byOID[relation.OID] = relation
 	}
-	effect := make(truncateEffect, len(rows))
+	effect := &truncateEffect{
+		Rows:      make(map[uint32]RowChange, len(rows)),
+		Relations: relationOIDs,
+	}
 	for _, row := range rows {
 		if len(row) != 2 || row[0] == nil || row[1] == nil {
 			return nil, fmt.Errorf("PostgreSQL returned a malformed exact TRUNCATE count")
@@ -142,7 +154,7 @@ func (p *Proxy) captureTruncateEffectLocked(statement clientStatement) (truncate
 		if oidErr != nil || countErr != nil || count < 0 || !exists {
 			return nil, fmt.Errorf("PostgreSQL returned an invalid exact TRUNCATE count")
 		}
-		effect[relation.OID] = RowChange{Table: relation.Name, Deleted: count}
+		effect.Rows[relation.OID] = RowChange{Table: relation.Name, Deleted: count}
 	}
 	return effect, nil
 }
@@ -252,7 +264,7 @@ func (p *Proxy) readTruncateRelationsLocked(query string) ([]truncateRelation, e
 	return relations, nil
 }
 
-func (p *Proxy) reconcileTruncateLocked(effect truncateEffect, keep bool) {
+func (p *Proxy) reconcileTruncateLocked(effect *truncateEffect, keep bool, restartIdentity bool) {
 	if !keep || effect == nil || p.rowStats == nil {
 		p.reconcileRowChangesLocked(false)
 		return
@@ -267,12 +279,12 @@ func (p *Proxy) reconcileTruncateLocked(effect truncateEffect, keep bool) {
 	filteredBefore := make(rowStatsSnapshot, len(p.rowStats))
 	filteredCurrent := make(rowStatsSnapshot, len(current))
 	for oid, before := range p.rowStats {
-		if _, truncated := effect[oid]; !truncated {
+		if _, truncated := effect.Rows[oid]; !truncated {
 			filteredBefore[oid] = before
 		}
 	}
 	for oid, after := range current {
-		if _, truncated := effect[oid]; !truncated {
+		if _, truncated := effect.Rows[oid]; !truncated {
 			filteredCurrent[oid] = after
 		}
 	}
@@ -283,12 +295,18 @@ func (p *Proxy) reconcileTruncateLocked(effect truncateEffect, keep bool) {
 		return
 	}
 	p.rowStats = current
-	for oid, exact := range effect {
+	for oid, exact := range effect.Rows {
 		change := p.rowLedger[oid]
 		change.Table = exact.Table
 		change.Deleted += exact.Deleted
 		if change.Inserted != 0 || change.Updated != 0 || change.Deleted != 0 {
 			p.rowLedger[oid] = change
+		}
+	}
+	if restartIdentity {
+		if err := p.suppressRestartedSequencesLocked(effect.Relations); err != nil {
+			p.setRowLedgerError(fmt.Errorf("identify transactionally reset sequences: %w", err))
+			return
 		}
 	}
 	if err := p.captureSequenceUsageLocked(); err != nil {

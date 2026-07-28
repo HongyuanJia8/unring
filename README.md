@@ -239,7 +239,15 @@ ability to make any of it permanent without you saying so.
   partitioned parents are reported per leaf partition.
 - That exactness has a visible cost: a normally fast `TRUNCATE` now scans every
   affected table and can take as long as a full table scan. unring sends the client a
-  PostgreSQL notice before counting; there is no approximate fast mode. If an exact
+  PostgreSQL notice before counting; there is no approximate fast mode. Acquiring the
+  required `ACCESS EXCLUSIVE` locks can also wait indefinitely behind another database
+  session (even an idle transaction that has read one affected table). While it waits,
+  the shared backend is occupied, so every other client connected to that unring session
+  waits too; PostgreSQL's normal lock-wait behavior and cancellation apply.
+- Exact TRUNCATE accounting applies when `TRUNCATE` is the parsed top-level statement.
+  A `DO` block, procedure call, or volatile function call can execute SQL hidden inside
+  server-side code; unring cannot inspect that body and therefore reports the successful
+  statement as `UNKNOWN` instead of claiming that zero rows changed. If an exact
   count cannot be proven — for example, a foreign table is involved, row-level
   security hides rows, the role cannot run `COUNT(*)`, or an enabled `ON TRUNCATE`
   trigger could change the effect — the successful statement remains explicitly

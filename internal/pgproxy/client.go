@@ -8,10 +8,11 @@ import (
 )
 
 type clientSavepoint struct {
-	clientName  string
-	backendName string
-	rows        rowLedgerSnapshot
-	uncertain   int
+	clientName           string
+	backendName          string
+	rows                 rowLedgerSnapshot
+	uncertain            int
+	sequenceSuppressions map[string]sequenceSuppression
 }
 
 type preparedStatement struct {
@@ -30,22 +31,24 @@ type clientState struct {
 	id      uint64
 	backend *pgproto3.Backend
 
-	locked             bool
-	extended           bool
-	extendedFailed     bool
-	cycleSavepoint     string
-	pendingEscape      *clientStatement
-	rollbackCycle      bool
-	cycleUncertain     []string
-	cycleRows          rowLedgerSnapshot
-	cycleUncertainBase int
-	lastError          string
+	locked                    bool
+	extended                  bool
+	extendedFailed            bool
+	cycleSavepoint            string
+	pendingEscape             *clientStatement
+	rollbackCycle             bool
+	cycleUncertain            []string
+	cycleRows                 rowLedgerSnapshot
+	cycleUncertainBase        int
+	cycleSequenceSuppressions map[string]sequenceSuppression
+	lastError                 string
 
-	transactionSavepoint string
-	transactionFailed    bool
-	transactionRows      rowLedgerSnapshot
-	transactionUncertain int
-	savepoints           []clientSavepoint
+	transactionSavepoint            string
+	transactionFailed               bool
+	transactionRows                 rowLedgerSnapshot
+	transactionUncertain            int
+	transactionSequenceSuppressions map[string]sequenceSuppression
+	savepoints                      []clientSavepoint
 
 	prepared map[string]*preparedStatement
 	portals  map[string]*portal
@@ -129,12 +132,14 @@ func (p *Proxy) cleanupClient(client *clientState) {
 			p.restoreRowLedgerLocked(client.cycleRows)
 			p.restoreUncertainEffectsLocked(client.cycleUncertainBase)
 			p.reconcileRowChangesLocked(false)
+			p.restoreSequenceSuppressionsLocked(client.cycleSequenceSuppressions)
 		}
 		client.extended = false
 		client.cycleSavepoint = ""
 		client.cycleUncertain = nil
 		client.cycleRows = nil
 		client.cycleUncertainBase = 0
+		client.cycleSequenceSuppressions = nil
 	}
 
 	if client.transactionSavepoint != "" {
@@ -146,6 +151,7 @@ func (p *Proxy) cleanupClient(client *clientState) {
 			p.restoreRowLedgerLocked(client.transactionRows)
 			p.restoreUncertainEffectsLocked(client.transactionUncertain)
 			p.reconcileRowChangesLocked(false)
+			p.restoreSequenceSuppressionsLocked(client.transactionSequenceSuppressions)
 		}
 		p.clearClientTransaction(client)
 	}
