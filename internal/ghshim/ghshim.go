@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/hyj28/unring/internal/adapter"
 	"golang.org/x/term"
 )
@@ -80,21 +81,28 @@ type Options struct {
 
 // Session owns one private shim directory and its IPC listener.
 type Session struct {
-	directory    string
-	socket       string
-	token        string
-	realGH       string
-	originalPath string
-	listener     net.Listener
-	adapters     *adapter.Set
-	approve      func(context.Context, ApprovalRequest) (bool, error)
-	stdin        io.Reader
-	stdout       io.Writer
-	stderr       io.Writer
+	directory                  string
+	socket                     string
+	token                      string
+	realGH                     string
+	originalPath               string
+	originalNetworkEnvironment []string
+	listener                   net.Listener
+	adapters                   *adapter.Set
+	approve                    func(context.Context, ApprovalRequest) (bool, error)
+	stdin                      io.Reader
+	stdout                     io.Writer
+	stderr                     io.Writer
+	approvalContext            context.Context
+	cancelApprovals            context.CancelFunc
+	serveDone                  chan struct{}
+	sealedDone                 chan struct{}
 
 	mu           sync.Mutex
 	summary      Summary
 	wg           sync.WaitGroup
+	sealOnce     sync.Once
+	sealErr      error
 	finalizeOnce sync.Once
 	finalizeErr  error
 }
@@ -106,12 +114,13 @@ type request struct {
 }
 
 type response struct {
-	Execute      bool   `json:"execute"`
-	PassThrough  bool   `json:"pass_through"`
-	RecordIndex  int    `json:"record_index"`
-	Reason       string `json:"reason,omitempty"`
-	RealGH       string `json:"real_gh"`
-	OriginalPath string `json:"original_path"`
+	Execute                    bool     `json:"execute"`
+	PassThrough                bool     `json:"pass_through"`
+	RecordIndex                int      `json:"record_index"`
+	Reason                     string   `json:"reason,omitempty"`
+	RealGH                     string   `json:"real_gh"`
+	OriginalPath               string   `json:"original_path"`
+	OriginalNetworkEnvironment []string `json:"original_network_environment,omitempty"`
 }
 
 type outcome struct {
@@ -166,11 +175,15 @@ func Start(options Options) (*Session, error) {
 		_ = listener.Close()
 		return nil, fmt.Errorf("create gh shim token: %w", err)
 	}
+	approvalContext, cancelApprovals := context.WithCancel(context.Background())
 	session := &Session{
 		directory: directory, socket: socket, token: hex.EncodeToString(secret[:]),
 		realGH: realGH, originalPath: os.Getenv("PATH"), listener: listener,
 		adapters: options.Adapters, approve: options.Approve,
 		stdin: options.Stdin, stdout: options.Stdout, stderr: options.Stderr,
+		originalNetworkEnvironment: selectedEnvironment(os.Environ(), directNetworkEnvironmentKeys),
+		approvalContext:            approvalContext, cancelApprovals: cancelApprovals,
+		serveDone: make(chan struct{}), sealedDone: make(chan struct{}),
 	}
 	cleanup = false
 	go session.serve()
@@ -210,22 +223,37 @@ func (session *Session) Summary() Summary {
 	return Summary{Records: append([]Record(nil), session.summary.Records...), Sealed: session.summary.Sealed}
 }
 
-// Seal stops accepting shim calls after the child exits.
-func (session *Session) Seal() error {
-	err := session.listener.Close()
-	session.wg.Wait()
-	session.mu.Lock()
-	session.summary.Sealed = true
-	session.mu.Unlock()
-	if errors.Is(err, net.ErrClosed) {
-		return nil
+// Seal stops accepting shim calls after the child exits and cancels approval
+// requests that can no longer be serviced by the child supervisor.
+func (session *Session) Seal(ctx context.Context) error {
+	session.sealOnce.Do(func() {
+		session.cancelApprovals()
+		session.sealErr = session.listener.Close()
+		if errors.Is(session.sealErr, net.ErrClosed) {
+			session.sealErr = nil
+		}
+		go func() {
+			<-session.serveDone
+			session.wg.Wait()
+			session.mu.Lock()
+			session.summary.Sealed = true
+			session.mu.Unlock()
+			close(session.sealedDone)
+		}()
+	})
+	select {
+	case <-session.sealedDone:
+		return session.sealErr
+	case <-ctx.Done():
+		return errors.Join(session.sealErr, ctx.Err())
 	}
-	return err
 }
 
 // Close removes the ephemeral shim directory.
 func (session *Session) Close() error {
-	_ = session.Seal()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_ = session.Seal(ctx)
+	cancel()
 	return os.RemoveAll(session.directory)
 }
 
@@ -256,14 +284,16 @@ func (session *Session) Finalize(ctx context.Context, commit bool) error {
 			record := session.summary.Records[index]
 			session.mu.Unlock()
 			if record.ResourceURL == "" {
-				err := errors.New("real gh succeeded but its stdout did not contain a created issue URL")
+				err := errors.New("unring could not capture a created issue URL from the invocation's stdout")
 				session.updateUndo(index, "unavailable", err)
 				undoErrors = append(undoErrors, fmt.Errorf(
 					"cannot %s; %s: %w", record.UndoEffect, record.StillExists, err))
 				continue
 			}
 			command := exec.CommandContext(ctx, session.realGH, "issue", "close", record.ResourceURL)
-			command.Env = clientEnvironment(os.Environ(), session.originalPath)
+			command.Env = clientEnvironment(
+				os.Environ(), session.originalPath, session.originalNetworkEnvironment,
+			)
 			command.Stdin = nil
 			command.Stdout = session.stdout
 			command.Stderr = session.stderr
@@ -292,6 +322,7 @@ func (session *Session) updateUndo(index int, state string, err error) {
 }
 
 func (session *Session) serve() {
+	defer close(session.serveDone)
 	for {
 		connection, err := session.listener.Accept()
 		if err != nil {
@@ -328,7 +359,9 @@ func (session *Session) handle(connection net.Conn) {
 
 func (session *Session) decide(call request) response {
 	reply := response{
-		RealGH: session.realGH, OriginalPath: session.originalPath, RecordIndex: -1,
+		RealGH: session.realGH, OriginalPath: session.originalPath,
+		OriginalNetworkEnvironment: append([]string(nil), session.originalNetworkEnvironment...),
+		RecordIndex:                -1,
 	}
 	if call.Token != session.token {
 		reply.Reason = "gh shim authentication failed"
@@ -383,7 +416,7 @@ func (session *Session) decide(call request) response {
 	approved := false
 	var approvalErr error
 	if session.approve != nil {
-		approved, approvalErr = session.approve(context.Background(), ApprovalRequest{
+		approved, approvalErr = session.approve(session.approvalContext, ApprovalRequest{
 			Invocation: "gh " + strings.Join(call.Arguments, " "),
 			Intent:     intentText, Reason: reason,
 		})
@@ -428,13 +461,15 @@ func (session *Session) recordOutcome(result outcome) {
 	record := &session.summary.Records[result.RecordIndex]
 	record.ExitCode = result.ExitCode
 	record.Error = result.Error
-	if result.ExitCode == 0 && result.Error == "" {
+	if result.Error != "" {
+		record.State = "not-run"
+	} else if result.ExitCode == 0 {
 		record.State = "ran"
 		record.ResourceURL = createdIssueURL(result.Stdout)
 		if record.UndoEffect != "" {
 			if record.ResourceURL == "" {
 				record.UndoState = "unavailable"
-				record.UndoError = "real gh stdout did not contain a created issue URL"
+				record.UndoError = "unring could not capture a created issue URL from the invocation's stdout"
 			} else {
 				record.UndoState = "available"
 			}
@@ -479,10 +514,17 @@ func RunClient(arguments []string, stdin io.Reader, stdout, stderr io.Writer) in
 		return 1
 	}
 	if reply.RealGH == "" {
-		fmt.Fprintln(stderr, "unring gh shim: real gh was not found before the session PATH was injected")
+		message := "real gh was not found before the session PATH was injected"
+		fmt.Fprintln(stderr, "unring gh shim: "+message)
+		reportOutcome(outcome{
+			Token: os.Getenv(envToken), RecordIndex: reply.RecordIndex,
+			ExitCode: 127, Error: message,
+		})
 		return 127
 	}
-	environment := clientEnvironment(os.Environ(), reply.OriginalPath)
+	environment := clientEnvironment(
+		os.Environ(), reply.OriginalPath, reply.OriginalNetworkEnvironment,
+	)
 	if reply.PassThrough {
 		if input, ok := stdin.(*os.File); ok && input == os.Stdin &&
 			stdout == os.Stdout && stderr == os.Stderr {
@@ -495,12 +537,14 @@ func RunClient(arguments []string, stdin io.Reader, stdout, stderr io.Writer) in
 	command.Env = environment
 	command.Stdin = stdin
 	var captured limitedCapture
-	command.Stdout = stdout
-	if reply.RecordIndex >= 0 && !terminalWriter(stdout) {
-		command.Stdout = io.MultiWriter(stdout, &captured)
-	}
 	command.Stderr = stderr
-	runErr := command.Run()
+	var runErr error
+	if reply.RecordIndex >= 0 {
+		runErr = runWithCapturedStdout(command, stdout, &captured)
+	} else {
+		command.Stdout = stdout
+		runErr = command.Run()
+	}
 	exitCode := commandExitCode(runErr)
 	report := outcome{
 		Token: os.Getenv(envToken), RecordIndex: reply.RecordIndex,
@@ -535,9 +579,42 @@ func (capture *limitedCapture) Write(data []byte) (int, error) {
 
 func (capture *limitedCapture) String() string { return string(capture.data) }
 
-func terminalWriter(writer io.Writer) bool {
-	file, ok := writer.(*os.File)
-	return ok && term.IsTerminal(int(file.Fd()))
+func runWithCapturedStdout(command *exec.Cmd, stdout io.Writer, capture *limitedCapture) error {
+	file, terminal := stdout.(*os.File)
+	if !terminal || !term.IsTerminal(int(file.Fd())) {
+		command.Stdout = io.MultiWriter(stdout, capture)
+		return command.Run()
+	}
+
+	master, slave, err := pty.Open()
+	if err != nil {
+		return fmt.Errorf("create transparent terminal output capture: %w", err)
+	}
+	defer master.Close()
+	if _, err := term.MakeRaw(int(slave.Fd())); err != nil {
+		_ = slave.Close()
+		return fmt.Errorf("configure transparent terminal output capture: %w", err)
+	}
+	if err := pty.InheritSize(file, slave); err != nil {
+		_ = slave.Close()
+		return fmt.Errorf("copy terminal size for output capture: %w", err)
+	}
+	command.Stdout = slave
+	copyDone := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(io.MultiWriter(stdout, capture), master)
+		if errors.Is(copyErr, syscall.EIO) {
+			copyErr = nil
+		}
+		copyDone <- copyErr
+	}()
+	runErr := command.Run()
+	_ = slave.Close()
+	copyErr := <-copyDone
+	if copyErr != nil {
+		return errors.Join(runErr, fmt.Errorf("copy real gh terminal output: %w", copyErr))
+	}
+	return runErr
 }
 
 func createdIssueURL(output string) string {
@@ -567,18 +644,44 @@ func reportOutcome(result outcome) {
 	_ = json.NewDecoder(connection).Decode(&acknowledgment)
 }
 
-func clientEnvironment(base []string, originalPath string) []string {
+var directNetworkEnvironmentKeys = []string{
+	"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+	"ALL_PROXY", "all_proxy", "FTP_PROXY", "ftp_proxy",
+	"NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
+	"NO_PROXY", "no_proxy",
+}
+
+func selectedEnvironment(base []string, keys []string) []string {
+	selected := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		selected[key] = true
+	}
+	var result []string
+	for _, entry := range base {
+		key, _, found := strings.Cut(entry, "=")
+		if found && selected[key] {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+func clientEnvironment(base []string, originalPath string, originalNetwork []string) []string {
 	remove := map[string]bool{
 		envMarker: true, envSocket: true, envToken: true,
 		envRealGH: true, envOriginalPath: true, "PATH": true,
 	}
-	result := make([]string, 0, len(base)+1)
+	for _, key := range directNetworkEnvironmentKeys {
+		remove[key] = true
+	}
+	result := make([]string, 0, len(base)+len(originalNetwork)+1)
 	for _, entry := range base {
 		key, _, found := strings.Cut(entry, "=")
 		if !found || !remove[key] {
 			result = append(result, entry)
 		}
 	}
+	result = append(result, originalNetwork...)
 	return append(result, "PATH="+originalPath)
 }
 

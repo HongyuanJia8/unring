@@ -369,9 +369,6 @@ func (proxy *Proxy) Finalize(ctx context.Context, commit bool) error {
 		proxy.summaryMu.Lock()
 		proxy.staged = nil
 		proxy.summaryMu.Unlock()
-		if len(replayErrors) > 0 {
-			replayErrors = append(replayErrors, proxy.runUndos(ctx)...)
-		}
 		proxy.summaryMu.Lock()
 		proxy.summary.Finalized = true
 		proxy.summaryMu.Unlock()

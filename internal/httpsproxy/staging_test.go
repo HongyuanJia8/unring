@@ -299,7 +299,7 @@ func TestNon2xxReplayOutcomeIsUnknownNotSendFailed(t *testing.T) {
 	}
 }
 
-func TestSentSlackMessageIsCompensatedWhenCommitFallsBackToDiscard(t *testing.T) {
+func TestSentSlackMessageIsNotCompensatedAfterPartialCommit(t *testing.T) {
 	adapters := loadBuiltinAdapters(t)
 	slackURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
 	slackBody := []byte(`{"channel":"C123","text":"compensate me"}`)
@@ -374,14 +374,65 @@ func TestSentSlackMessageIsCompensatedWhenCommitFallsBackToDiscard(t *testing.T)
 	mu.Lock()
 	gotRequests := append([]recordedRequest(nil), requests...)
 	mu.Unlock()
-	if len(gotRequests) != 3 ||
-		gotRequests[2].URL != "https://slack.com/api/chat.delete" ||
-		!strings.Contains(string(gotRequests[2].body), `"ts":"1712345678.000100"`) {
+	if len(gotRequests) != 2 {
 		t.Fatalf("recorded origin requests = %#v", gotRequests)
 	}
 	undo := proxy.Summary().Staged[0].Undo
-	if undo == nil || undo.State != "succeeded" || undo.StatusCode != http.StatusOK {
-		t.Fatalf("Slack compensation outcome = %#v", undo)
+	if undo == nil || undo.State != "available" || undo.StatusCode != 0 {
+		t.Fatalf("commit path changed Slack compensation state = %#v", undo)
+	}
+}
+
+func TestCommitFailureDoesNotCompensateApprovedForwardedRequest(t *testing.T) {
+	issueURL := "https://api.github.com/repos/acme/widget/issues/123"
+	failureURL, _ := url.Parse("https://failure.example/action")
+	var requests []recordedRequest
+	transport := testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		requests = append(requests, recordedRequest{
+			Method: request.Method, URL: request.URL.String(), body: body,
+		})
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":"failed"}`)), Request: request,
+		}, nil
+	})
+	proxy := &Proxy{
+		transport: transport,
+		summary: Summary{
+			Sealed: true,
+			Requests: []RequestRecord{{
+				Method: http.MethodPost, URL: issueURL, StatusCode: http.StatusCreated,
+				Undo: &UndoRecord{
+					Method: http.MethodPatch, URL: issueURL,
+					Effect:      "close the created GitHub issue",
+					StillExists: "the GitHub issue remains visible in history",
+					State:       "available",
+				},
+			}},
+			Staged: []StagedRequest{{
+				Method: http.MethodPost, URL: failureURL.String(), State: "pending",
+			}},
+		},
+		staged: []stagedCall{{
+			method: http.MethodPost, url: failureURL, host: failureURL.Host,
+			header: make(http.Header), body: []byte(`{}`), key: "failure-key",
+		}},
+		undoCalls: []undoCall{{
+			method: http.MethodPatch, url: issueURL, header: make(http.Header),
+			body: []byte(`{"state":"closed"}`), target: "request", index: 0,
+		}},
+	}
+
+	if err := proxy.Finalize(context.Background(), true); err == nil {
+		t.Fatal("partial commit unexpectedly succeeded")
+	}
+	if len(requests) != 1 || requests[0].URL != failureURL.String() {
+		t.Fatalf("commit path sent discard compensation: %#v", requests)
+	}
+	undo := proxy.Summary().Requests[0].Undo
+	if undo == nil || undo.State != "available" || undo.StatusCode != 0 {
+		t.Fatalf("approved request compensation changed on commit = %#v", undo)
 	}
 }
 

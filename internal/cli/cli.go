@@ -355,7 +355,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		auditError = joinErrorText(auditError, result.Err)
 	}
 
-	ghSealErr := ghSession.Seal()
+	ghSealContext, ghSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ghSealErr := ghSession.Seal(ghSealContext)
+	ghSealCancel()
 	ghSummary := ghSession.Summary()
 
 	httpsSealContext, httpsSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -603,6 +605,13 @@ func printPartialCommitOutcome(
 		}
 		if request.Error != "" {
 			fmt.Fprintf(output, "    Error: %s\n", request.Error)
+		}
+	}
+	if len(summary.Requests) > 0 {
+		fmt.Fprintln(output,
+			"Already-forwarded HTTPS requests remain as sent. Commit never runs discard compensation:")
+		for _, request := range summary.Requests {
+			fmt.Fprintf(output, "  - %s %s\n", request.Method, request.URL)
 		}
 	}
 	if postgresFinalizeErr == nil {
@@ -1020,7 +1029,7 @@ func printSummaryWithExternal(
 	}
 
 	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
-	if !summary.FullyReversible || len(httpsSummary.Requests) > 0 || ghHasRun(ghSummary) {
+	if !summary.FullyReversible || len(httpsSummary.Requests) > 0 || ghMayHaveExternalEffect(ghSummary) {
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		fmt.Fprintln(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE")
 		fmt.Fprintln(output, "Unring cannot guarantee every recorded effect can be undone by discarding.")

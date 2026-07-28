@@ -4,16 +4,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/hyj28/unring/internal/adapter"
+	"github.com/hyj28/unring/internal/childenv"
 )
 
 func TestReadPassThroughPreservesStdinStreamsAndExitCode(t *testing.T) {
@@ -309,6 +314,223 @@ printf 'https://github.com/acme/widget/issues/123\n'
 	record := session.Summary().Records[0]
 	if record.UndoState != "succeeded" {
 		t.Fatalf("gh compensation record = %#v", record)
+	}
+}
+
+func TestApprovedIssueCreateCapturesURLWithTerminalStdout(t *testing.T) {
+	runLog := filepath.Join(t.TempDir(), "runs")
+	fake := writeFakeGH(t, `
+if [ "$1 $2" = "issue close" ]; then
+  printf 'close:%s\n' "$3" >> "`+runLog+`"
+  exit 0
+fi
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  printf 'create did not receive terminal stdin/stdout\n' >&2
+  exit 91
+fi
+printf 'create\n' >> "`+runLog+`"
+printf 'https://github.com/acme/widget/issues/456\n'
+`)
+	session := startTestSession(t, fake,
+		func(context.Context, ApprovalRequest) (bool, error) { return true, nil })
+	setClientEnvironment(t, session)
+	terminal, peer, err := pty.Open()
+	if err != nil {
+		t.Fatalf("open production-shaped terminal: %v", err)
+	}
+	defer terminal.Close()
+	if code := RunClient(
+		[]string{"issue", "create", "--repo", "acme/widget", "--title", "tty undo"},
+		peer, peer, peer,
+	); code != 0 {
+		_ = peer.Close()
+		output, _ := io.ReadAll(terminal)
+		t.Fatalf("terminal-attached create exit code = %d, output=%q", code, output)
+	}
+	record := session.Summary().Records[0]
+	if record.ResourceURL != "https://github.com/acme/widget/issues/456" ||
+		record.UndoState != "available" {
+		t.Fatalf("terminal-attached create record = %#v", record)
+	}
+	if err := session.Finalize(context.Background(), false); err != nil {
+		t.Fatalf("terminal-attached discard compensation: %v", err)
+	}
+	_ = peer.Close()
+	output, readErr := io.ReadAll(terminal)
+	if readErr != nil && !errors.Is(readErr, syscall.EIO) {
+		t.Fatalf("read terminal output: %v", readErr)
+	}
+	if !bytes.Contains(output, []byte("https://github.com/acme/widget/issues/456")) {
+		t.Fatalf("real gh terminal output was not forwarded: %q", output)
+	}
+	data, err := os.ReadFile(runLog)
+	if err != nil {
+		t.Fatalf("read terminal create/close log: %v", err)
+	}
+	want := "create\nclose:https://github.com/acme/widget/issues/456\n"
+	if string(data) != want {
+		t.Fatalf("terminal create/compensation log = %q, want %q", data, want)
+	}
+}
+
+func TestReadPassThroughRestoresDirectNetworkEnvironment(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(response, "network-read-ok\n")
+	}))
+	defer origin.Close()
+
+	for _, key := range directNetworkEnvironmentKeys {
+		value := ""
+		switch key {
+		case "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+			"ALL_PROXY", "all_proxy", "FTP_PROXY", "ftp_proxy":
+			value = "http://parent-proxy.invalid:8080"
+		case "NO_PROXY", "no_proxy":
+			value = "127.0.0.1,localhost"
+		}
+		t.Setenv(key, value)
+	}
+	fake := writeFakeGH(t,
+		"exec \""+os.Args[0]+"\" -test.run=^TestGHNetworkOriginHelper$\n")
+	session := startTestSession(t, fake, func(context.Context, ApprovalRequest) (bool, error) {
+		t.Fatal("network read unexpectedly requested approval")
+		return false, nil
+	})
+	caPath := filepath.Join(t.TempDir(), "unring-ca.pem")
+	if err := os.WriteFile(caPath, []byte("test ca\n"), 0o600); err != nil {
+		t.Fatalf("write test CA: %v", err)
+	}
+	childEnvironment, err := childenv.HTTPS(
+		session.Environment(os.Environ()), "127.0.0.1:65530", caPath,
+	)
+	if err != nil {
+		t.Fatalf("build production child HTTPS environment: %v", err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestRunClientNetworkReadHelper$")
+	command.Env = append(childEnvironment,
+		"UNRING_GH_NETWORK_CLIENT=1",
+		"UNRING_GH_NETWORK_ORIGIN="+origin.URL,
+	)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("networked gh read through production exec path: %v\nstdout=%q\nstderr=%q",
+			err, stdout.String(), stderr.String())
+	}
+	if stdout.String() != "network-read-ok\n" || stderr.Len() != 0 {
+		t.Fatalf("networked gh read output: stdout=%q stderr=%q",
+			stdout.String(), stderr.String())
+	}
+}
+
+func TestRunClientNetworkReadHelper(t *testing.T) {
+	if os.Getenv("UNRING_GH_NETWORK_CLIENT") != "1" {
+		return
+	}
+	os.Exit(RunClient([]string{"issue", "list", "--repo", "acme/widget"},
+		os.Stdin, os.Stdout, os.Stderr))
+}
+
+func TestGHNetworkOriginHelper(t *testing.T) {
+	origin := os.Getenv("UNRING_GH_NETWORK_ORIGIN")
+	if origin == "" {
+		return
+	}
+	for _, key := range directNetworkEnvironmentKeys {
+		want := ""
+		switch key {
+		case "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+			"ALL_PROXY", "all_proxy", "FTP_PROXY", "ftp_proxy":
+			want = "http://parent-proxy.invalid:8080"
+		case "NO_PROXY", "no_proxy":
+			want = "127.0.0.1,localhost"
+		}
+		if got := os.Getenv(key); got != want {
+			fmt.Fprintf(os.Stderr, "%s=%q, want restored value %q\n", key, got, want)
+			os.Exit(92)
+		}
+	}
+	response, err := http.Get(origin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "network request failed: %v\n", err)
+		os.Exit(93)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(os.Stdout, response.Body); err != nil {
+		fmt.Fprintf(os.Stderr, "copy network response: %v\n", err)
+		os.Exit(94)
+	}
+}
+
+func TestMissingRealGHIsRecordedAsNotRun(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	sources, err := adapter.BuiltinSources()
+	if err != nil {
+		t.Fatalf("load built-in adapters: %v", err)
+	}
+	adapters, err := adapter.Load(sources...)
+	if err != nil {
+		t.Fatalf("load built-in adapter set: %v", err)
+	}
+	session, err := Start(Options{
+		Adapters: adapters, Executable: os.Args[0],
+		Approve: func(context.Context, ApprovalRequest) (bool, error) { return true, nil },
+	})
+	if err != nil {
+		t.Fatalf("start gh session without real gh: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	setClientEnvironment(t, session)
+	var stderr bytes.Buffer
+	code := RunClient(
+		[]string{"issue", "create", "--repo", "acme/widget", "--title", "not run"},
+		strings.NewReader(""), &bytes.Buffer{}, &stderr,
+	)
+	if code != 127 {
+		t.Fatalf("missing real gh exit code = %d, stderr=%q", code, stderr.String())
+	}
+	record := session.Summary().Records[0]
+	if record.Decision != "approved" || record.State != "not-run" ||
+		!strings.Contains(record.Error, "real gh was not found") {
+		t.Fatalf("missing real gh record = %#v", record)
+	}
+}
+
+func TestSealCancelsApprovalThatHasNoReceiver(t *testing.T) {
+	approvalStarted := make(chan struct{})
+	fake := writeFakeGH(t, "exit 0\n")
+	session := startTestSession(t, fake,
+		func(ctx context.Context, _ ApprovalRequest) (bool, error) {
+			close(approvalStarted)
+			<-ctx.Done()
+			return false, ctx.Err()
+		})
+	setClientEnvironment(t, session)
+	clientDone := make(chan int, 1)
+	go func() {
+		clientDone <- RunClient(
+			[]string{"issue", "create", "--repo", "acme/widget", "--title", "late"},
+			strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{},
+		)
+	}()
+	select {
+	case <-approvalStarted:
+	case <-time.After(time.Second):
+		t.Fatal("approval did not start")
+	}
+	sealContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := session.Seal(sealContext); err != nil {
+		t.Fatalf("Seal blocked on orphaned approval: %v", err)
+	}
+	select {
+	case code := <-clientDone:
+		if code == 0 {
+			t.Fatal("canceled orphaned approval returned success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shim client remained blocked after Seal")
 	}
 }
 

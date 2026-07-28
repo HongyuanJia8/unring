@@ -159,7 +159,8 @@ func newReviewModelWithExternal(
 	for _, record := range ghSummary.Records {
 		section := "GH APPROVALS — NOT RUN"
 		detail := "This gh invocation did not run."
-		if record.State == "ran" || record.State == "failed" || record.State == "approved" {
+		switch record.State {
+		case "ran", "failed":
 			section = "GH MUTATIONS — ALREADY RAN"
 			detail = "This gh invocation ran outside a transaction."
 			if record.UndoEffect != "" {
@@ -168,15 +169,26 @@ func newReviewModelWithExternal(
 			if record.StillExists != "" {
 				detail += " Honest limit: " + record.StillExists + "."
 			}
+		case "approved":
+			section = "GH MUTATIONS — EXECUTION OUTCOME UNCONFIRMED"
+			detail = "Approval was granted, but unring received no execution outcome. " +
+				"The invocation may or may not have run; unring will not assume success."
+			if record.StillExists != "" {
+				detail += " Possible external remainder: " + record.StillExists + "."
+			}
 		}
 		title := fmt.Sprintf("[%s] gh %s", record.State, strings.Join(record.Arguments, " "))
 		if record.UndoEffect != "" {
-			if record.UndoState == "available" {
+			switch record.UndoState {
+			case "available":
 				title += fmt.Sprintf(" [discard: %s; limit: %s]",
 					record.UndoEffect, record.StillExists)
-			} else {
+			case "failed", "unavailable", "succeeded":
 				title += fmt.Sprintf(" [discard compensation %s: %s; remains: %s]",
 					record.UndoState, record.UndoError, record.StillExists)
+			default:
+				title += fmt.Sprintf(" [discard compensation not yet available; limit: %s]",
+					record.StillExists)
 			}
 		}
 		model.items = append(model.items, reviewItem{
@@ -255,7 +267,7 @@ func (model reviewModel) View() string {
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
 	if !model.summary.FullyReversible || len(model.https.Requests) > 0 ||
-		ghHasRun(model.gh) {
+		ghMayHaveExternalEffect(model.gh) {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
 		output.WriteString("Unring cannot guarantee every recorded effect can be undone by discarding.\n")
@@ -398,7 +410,7 @@ func undoReviewDetail(undo *httpsproxy.UndoRecord) string {
 	}
 }
 
-func ghHasRun(summary ghshim.Summary) bool {
+func ghMayHaveExternalEffect(summary ghshim.Summary) bool {
 	for _, record := range summary.Records {
 		if record.State == "ran" || record.State == "failed" || record.State == "approved" {
 			return true
