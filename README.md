@@ -75,6 +75,25 @@ Proxy-aware plain HTTP remains blocked and reported rather than escaping invisib
 The complete community adapter format is documented in
 [docs/ADAPTERS.md](docs/ADAPTERS.md).
 
+An agent must be able to reach its own model API before it can do any work. For the
+three named agent commands, unring therefore forwards only these exact control-plane
+requests without approval:
+
+| Wrapped command | Deliberately ungated model requests |
+|---|---|
+| `claude` | `POST https://api.anthropic.com/v1/messages` |
+| `codex` | `POST https://api.openai.com/v1/responses`; `POST` or WebSocket `GET` to `https://chatgpt.com/backend-api/codex/responses` |
+| `opencode` | `POST` to `/zen/v1/responses` or `/zen/v1/chat/completions` on `opencode.ai`, `/v1/messages` on `api.anthropic.com`, and `/v1/responses` or `/v1/chat/completions` on `api.openai.com` |
+
+The match is enabled only when the wrapped executable's basename is the listed agent,
+and it is exact on method, hostname, and path. Custom providers, gateways, other
+paths on those hosts, and genuinely unknown services still use the normal fail-closed
+classification. Because the proxy cannot distinguish an agent's own request from a
+descendant process using the same endpoint, the exemption applies to the whole wrapped
+process tree for those exact requests. Every match is labeled **AGENT CONTROL PLANE —
+FORWARDED WITHOUT GATING** in the JSON audit and in any session review that is otherwise
+needed. Control-plane calls alone do not manufacture a commit/discard prompt.
+
 `gh` is handled without TLS interception. For each run, unring creates a private
 directory, places a `gh` shim there, and prepends that directory only to the wrapped
 child's `PATH`. Enumerated reads such as `gh --version`, `gh auth status`,
@@ -168,6 +187,11 @@ Your agent is not running against a simulation. Database statements really execu
 inside a transaction the agent shares across every connection it opens — so it reads
 back its own writes, gets real results, and real errors. What it does not get is the
 ability to make any of it permanent without you saying so.
+
+One commit/discard decision always applies to the whole session; partial commit is not
+available. Keeping database changes while withholding one related external action
+would create states that are difficult to reason about—for example, committing
+`notified_at` while the corresponding mail was never sent.
 
 ## Design commitments
 

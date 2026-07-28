@@ -2,6 +2,7 @@ package pgproxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -282,6 +283,73 @@ func TestZeroRowUpdateIsReadOnlyIntegration(t *testing.T) {
 	}
 	if summary.HasReviewableActivity() {
 		t.Fatalf("zero-row update requires review: %#v", summary)
+	}
+}
+
+func TestClientCancelReachesSharedBackendIntegration(t *testing.T) {
+	connectionString := testpostgres.Start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	config := parseTestConfig(t, connectionString)
+	direct := connectTest(t, ctx, config)
+	defer direct.Close(ctx)
+
+	proxy, err := Start(ctx, config)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	defer proxy.Close()
+	client := connectTest(t, ctx, proxyTestConfig(t, proxy.Address(), config))
+	defer client.Close(ctx)
+
+	queryDone := make(chan error, 1)
+	go func() {
+		_, queryErr := client.Exec(ctx, "SELECT pg_sleep(30)").ReadAll()
+		queryDone <- queryErr
+	}()
+
+	activeDeadline := time.Now().Add(5 * time.Second)
+	for {
+		active := scalarTest(t, ctx, direct, `
+SELECT count(*)::text
+FROM pg_stat_activity
+WHERE state = 'active' AND query = 'SELECT pg_sleep(30)'`)
+		if active != "0" {
+			break
+		}
+		if time.Now().After(activeDeadline) {
+			t.Fatal("sleeping query did not become active")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancelContext, cancelRequest := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := client.CancelRequest(cancelContext); err != nil {
+		cancelRequest()
+		t.Fatalf("CancelRequest(): %v", err)
+	}
+	cancelRequest()
+
+	select {
+	case queryErr := <-queryDone:
+		var postgresError *pgconn.PgError
+		if !errors.As(queryErr, &postgresError) || postgresError.Code != "57014" {
+			t.Fatalf("cancelled query error = %v, want SQLSTATE 57014", queryErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled query remained blocked")
+	}
+	if got := scalarTest(t, ctx, client, "SELECT 1"); got != "1" {
+		t.Fatalf("query after cancellation = %q, want 1", got)
+	}
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	if err := proxy.Seal(ctx); err != nil {
+		t.Fatalf("Seal(): %v", err)
+	}
+	if summary := proxy.Summary(); len(summary.Unintercepted) != 0 {
+		t.Fatalf("handled cancellation was reported as un-intercepted: %#v", summary.Unintercepted)
 	}
 }
 

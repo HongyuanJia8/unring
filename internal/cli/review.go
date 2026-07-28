@@ -139,6 +139,14 @@ func newReviewModelWithExternal(
 		}
 		section := "HTTPS REQUESTS — ALREADY FORWARDED; DISCARD CANNOT UNDO"
 		detail := "This request was intercepted and forwarded. No compensation is declared; any external effect remains after discard."
+		switch request.Disposition {
+		case httpsproxy.RequestDispositionSafeRead:
+			section = "HTTPS SAFE READS — OBSERVED AND FORWARDED"
+			detail = "Unring classified this safe-method request as read-only. It was recorded for audit but creates no irreversible-effect warning."
+		case httpsproxy.RequestDispositionControlPlane:
+			section = "AGENT CONTROL PLANE — FORWARDED WITHOUT GATING"
+			detail = "This enumerated model request was deliberately not gated so the wrapped agent could function. It remains visible in the session record."
+		}
 		if request.Undo != nil {
 			section = "HTTPS REQUESTS — DISCARD COMPENSATION"
 			detail = undoReviewDetail(request.Undo)
@@ -147,7 +155,8 @@ func newReviewModelWithExternal(
 		if request.Undo != nil {
 			title += fmt.Sprintf(" [discard: %s; limit: %s]",
 				request.Undo.Effect, request.Undo.StillExists)
-		} else {
+		} else if request.Disposition != httpsproxy.RequestDispositionSafeRead &&
+			request.Disposition != httpsproxy.RequestDispositionControlPlane {
 			title += " [discard cannot undo this]"
 		}
 		model.items = append(model.items, reviewItem{
@@ -266,7 +275,7 @@ func (model reviewModel) View() string {
 	var output strings.Builder
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
-	if !model.summary.FullyReversible || len(model.https.Requests) > 0 ||
+	if !model.summary.FullyReversible || model.https.HasForwardedEffects() ||
 		ghMayHaveExternalEffect(model.gh) {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")

@@ -517,6 +517,33 @@ func TestClientCancellationReleasesPendingIrreversibleApproval(t *testing.T) {
 	}
 }
 
+func TestCancelRequestRoutesOnlyToMatchingActiveClient(t *testing.T) {
+	t.Parallel()
+	proxy := &Proxy{
+		cancelClients: map[cancelKey]uint64{
+			{processID: 11, secretKey: 22}: 7,
+		},
+		activeCancels: make(map[uint64]func(context.Context) error),
+	}
+	delivered := 0
+	proxy.activeCancels[7] = func(context.Context) error {
+		delivered++
+		return nil
+	}
+	proxy.handleCancelRequest(&pgproto3.CancelRequest{ProcessID: 11, SecretKey: 99})
+	if delivered != 0 {
+		t.Fatal("invalid cancellation secret reached the active backend")
+	}
+	proxy.handleCancelRequest(&pgproto3.CancelRequest{ProcessID: 11, SecretKey: 22})
+	if delivered != 1 {
+		t.Fatalf("matching cancellation deliveries = %d, want 1", delivered)
+	}
+	if summary := proxy.Summary(); len(summary.Unintercepted) != 0 {
+		t.Fatalf("handled cancellation was reported as un-intercepted: %#v",
+			summary.Unintercepted)
+	}
+}
+
 func TestClientDisconnectCancelsWorkWhileHandlerIsBusy(t *testing.T) {
 	t.Parallel()
 

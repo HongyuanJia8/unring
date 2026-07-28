@@ -24,18 +24,32 @@ type tlsCertificate = tls.Certificate
 
 const maximumClassifiedBody = 16 << 20
 
+const (
+	// RequestDispositionSafeRead marks a forwarded request whose HTTP method is
+	// safe. It is retained for auditability but does not require a final
+	// commit/discard decision.
+	RequestDispositionSafeRead = "safe-read"
+	// RequestDispositionControlPlane marks an enumerated agent model request
+	// that unring deliberately forwards without gating so the agent can run.
+	RequestDispositionControlPlane = "agent-control-plane"
+	// RequestDispositionApproved marks a mutation that was forwarded only
+	// after the user approved it.
+	RequestDispositionApproved = "approved"
+)
+
 // RequestRecord is one HTTPS request that was actually sent to an origin.
 type RequestRecord struct {
-	Method     string       `json:"method"`
-	URL        string       `json:"url"`
-	Tier       adapter.Tier `json:"tier,omitempty"`
-	Adapter    string       `json:"adapter,omitempty"`
-	Rule       string       `json:"rule,omitempty"`
-	StatusCode int          `json:"status_code,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	StartedAt  time.Time    `json:"started_at"`
-	EndedAt    time.Time    `json:"ended_at"`
-	Undo       *UndoRecord  `json:"undo,omitempty"`
+	Method      string       `json:"method"`
+	URL         string       `json:"url"`
+	Tier        adapter.Tier `json:"tier,omitempty"`
+	Adapter     string       `json:"adapter,omitempty"`
+	Rule        string       `json:"rule,omitempty"`
+	Disposition string       `json:"disposition,omitempty"`
+	StatusCode  int          `json:"status_code,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	StartedAt   time.Time    `json:"started_at"`
+	EndedAt     time.Time    `json:"ended_at"`
+	Undo        *UndoRecord  `json:"undo,omitempty"`
 }
 
 // UndoRecord is the declared and observed state of one compensating action.
@@ -108,19 +122,34 @@ type Summary struct {
 	Finalized     bool                `json:"finalized"`
 }
 
-// HasReviewableActivity reports whether any HTTPS coverage or forwarding was observed.
+// HasReviewableActivity reports whether HTTPS activity requires a final
+// decision or a coverage warning.
 func (summary Summary) HasReviewableActivity() bool {
-	return !summary.Sealed || len(summary.Requests) > 0 || len(summary.Staged) > 0 ||
+	return !summary.Sealed || summary.HasForwardedEffects() || len(summary.Staged) > 0 ||
 		len(summary.Approvals) > 0 || len(summary.Unintercepted) > 0
+}
+
+// HasForwardedEffects reports whether a forwarded HTTPS request may have
+// changed external state. Safe reads and enumerated agent control-plane calls
+// remain in the audit without manufacturing a review or reversibility warning.
+func (summary Summary) HasForwardedEffects() bool {
+	for _, request := range summary.Requests {
+		if request.Disposition != RequestDispositionSafeRead &&
+			request.Disposition != RequestDispositionControlPlane {
+			return true
+		}
+	}
+	return false
 }
 
 // Options configures upstream forwarding and explicit CONNECT passthrough.
 type Options struct {
-	Transport       http.RoundTripper
-	PassthroughHost func(host string) bool
-	Adapters        *adapter.Set
-	Approve         func(context.Context, ApprovalRequest) (bool, error)
-	StagedUpdated   func(Summary) error
+	Transport         http.RoundTripper
+	PassthroughHost   func(host string) bool
+	AgentControlPlane func(*http.Request) bool
+	Adapters          *adapter.Set
+	Approve           func(context.Context, ApprovalRequest) (bool, error)
+	StagedUpdated     func(Summary) error
 }
 
 // Proxy intercepts HTTPS CONNECT connections on loopback.
@@ -130,6 +159,7 @@ type Proxy struct {
 	server        *http.Server
 	transport     http.RoundTripper
 	passthrough   func(string) bool
+	controlPlane  func(*http.Request) bool
 	adapters      *adapter.Set
 	approve       func(context.Context, ApprovalRequest) (bool, error)
 	stagedUpdated func(Summary) error
@@ -194,8 +224,9 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 	}
 	proxy := &Proxy{
 		authority: authority, listener: listener, transport: transport,
-		passthrough: options.PassthroughHost, adapters: options.Adapters,
-		approve: options.Approve, stagedUpdated: options.StagedUpdated,
+		passthrough: options.PassthroughHost, controlPlane: options.AgentControlPlane,
+		adapters: options.Adapters,
+		approve:  options.Approve, stagedUpdated: options.StagedUpdated,
 		connections: make(map[net.Conn]struct{}),
 	}
 	proxy.runCtx, proxy.cancel = context.WithCancel(context.Background())
@@ -737,7 +768,18 @@ func (proxy *Proxy) forward(
 	request.Body = io.NopCloser(bytes.NewReader(body))
 	request.ContentLength = int64(len(body))
 
-	classification, matched, err := proxy.classify(request, body)
+	classification := adapter.Classification{}
+	matched := false
+	if proxy.controlPlane != nil && proxy.controlPlane(request) {
+		classification = adapter.Classification{
+			Tier: adapter.TierAlreadyIrreversible,
+			Rule: RequestDispositionControlPlane,
+		}
+		matched = true
+	}
+	if !matched {
+		classification, matched, err = proxy.classify(request, body)
+	}
 	if err != nil {
 		proxy.recordUnintercepted(hostport,
 			"adapter classification failed and the request was blocked: "+err.Error())
@@ -928,7 +970,8 @@ func (proxy *Proxy) forwardActual(
 	record := RequestRecord{
 		Method: request.Method, URL: request.URL.String(),
 		Tier: classification.Tier, Adapter: classification.Adapter,
-		Rule: classification.Rule, StartedAt: started,
+		Rule: classification.Rule, Disposition: forwardedDisposition(classification),
+		StartedAt: started,
 	}
 	undoInput := adapter.Request{
 		Method: request.Method, URL: cloneURL(request.URL),
@@ -955,8 +998,13 @@ func (proxy *Proxy) forwardActual(
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusSwitchingProtocols {
+		var controlPlaneRecord *RequestRecord
+		if record.Disposition == RequestDispositionControlPlane {
+			controlPlaneRecord = &record
+		}
 		return proxy.forwardUpgrade(
 			client, clientReader, request, response, request.URL.Host, requestedUpgrade,
+			controlPlaneRecord,
 		)
 	}
 	if requestedUpgrade != "" {
@@ -987,6 +1035,19 @@ func (proxy *Proxy) forwardActual(
 		proxy.recordRequest(record)
 	}
 	return closeClient, nil
+}
+
+func forwardedDisposition(classification adapter.Classification) string {
+	switch classification.Rule {
+	case "safe-http-method":
+		return RequestDispositionSafeRead
+	case RequestDispositionControlPlane:
+		return RequestDispositionControlPlane
+	}
+	if classification.Tier == adapter.TierNeedsApproval {
+		return RequestDispositionApproved
+	}
+	return ""
 }
 
 func writeProxyResponse(
@@ -1024,6 +1085,7 @@ func (proxy *Proxy) forwardUpgrade(
 	response *http.Response,
 	hostport string,
 	requestedUpgrade string,
+	controlPlaneRecord *RequestRecord,
 ) (bool, error) {
 	responseUpgrade := protocolUpgrade(response.Header)
 	if requestedUpgrade == "" || responseUpgrade == "" ||
@@ -1058,10 +1120,16 @@ func (proxy *Proxy) forwardUpgrade(
 		return true, fmt.Errorf("write HTTP protocol upgrade response: %w", err)
 	}
 
-	proxy.recordUnintercepted(hostport, fmt.Sprintf(
-		"HTTP protocol upgrade to %q was tunneled without payload interception",
-		responseUpgrade,
-	))
+	if controlPlaneRecord != nil {
+		controlPlaneRecord.StatusCode = response.StatusCode
+		controlPlaneRecord.EndedAt = time.Now().UTC()
+		proxy.recordRequest(*controlPlaneRecord)
+	} else {
+		proxy.recordUnintercepted(hostport, fmt.Sprintf(
+			"HTTP protocol upgrade to %q was tunneled without payload interception",
+			responseUpgrade,
+		))
+	}
 	return true, relayUpgrade(client, clientReader, upstream)
 }
 

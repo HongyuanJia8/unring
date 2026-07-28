@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +37,41 @@ func TestMainHelp(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("help wrote stderr: %s", stderr.String())
+	}
+}
+
+func TestAgentControlPlaneRulesAreNarrowAndEnumerated(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		command string
+		method  string
+		target  string
+		want    bool
+	}{
+		{command: "claude", method: "POST", target: "https://api.anthropic.com/v1/messages", want: true},
+		{command: "claude", method: "POST", target: "https://api.anthropic.com/v1/files", want: false},
+		{command: "claude", method: "POST", target: "https://api.openai.com/v1/responses", want: false},
+		{command: "codex", method: "POST", target: "https://api.openai.com/v1/responses", want: true},
+		{command: "codex", method: "GET", target: "https://chatgpt.com/backend-api/codex/responses", want: true},
+		{command: "codex", method: "POST", target: "https://chatgpt.com/backend-api/other", want: false},
+		{command: "opencode", method: "POST", target: "https://opencode.ai/zen/v1/responses", want: true},
+		{command: "curl", method: "POST", target: "https://api.anthropic.com/v1/messages", want: false},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.command+"_"+test.method+"_"+test.target, func(t *testing.T) {
+			matcher := configuredAgentControlPlane([]string{"/usr/local/bin/" + test.command})
+			parsed, err := url.Parse(test.target)
+			if err != nil {
+				t.Fatalf("parse target: %v", err)
+			}
+			request := &http.Request{Method: test.method, URL: parsed}
+			got := matcher != nil && matcher(request)
+			if got != test.want {
+				t.Fatalf("configuredAgentControlPlane(%q)(%s %s) = %t, want %t",
+					test.command, test.method, test.target, got, test.want)
+			}
+		})
 	}
 }
 
@@ -202,6 +239,44 @@ func TestReviewReportsForwardedAndUninterceptedHTTPSSeparately(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("HTTPS review missing %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestPlainReviewSeparatesSafeAndControlPlaneTrafficWithoutWarning(t *testing.T) {
+	t.Parallel()
+	postgresSummary := pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}
+	httpsSummary := httpsproxy.Summary{
+		Sealed: true,
+		Requests: []httpsproxy.RequestRecord{
+			{
+				Method: "GET", URL: "https://example.com/read", StatusCode: 200,
+				Disposition: httpsproxy.RequestDispositionSafeRead,
+			},
+			{
+				Method: "POST", URL: "https://api.anthropic.com/v1/messages", StatusCode: 200,
+				Disposition: httpsproxy.RequestDispositionControlPlane,
+			},
+		},
+	}
+	var output bytes.Buffer
+	printSummaryWithHTTPS(&output, postgresSummary, httpsSummary)
+	text := output.String()
+	for _, want := range []string{
+		"One decision applies to the whole session; partial commit is not available.",
+		"notified_at set when its mail was never sent",
+		"HTTPS SAFE READS — OBSERVED AND FORWARDED",
+		"AGENT CONTROL PLANE — FORWARDED WITHOUT GATING",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("plain review missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") ||
+		strings.Contains(text, "discard cannot undo this") {
+		t.Fatalf("safe/control-plane traffic manufactured an irreversible warning:\n%s", text)
 	}
 }
 

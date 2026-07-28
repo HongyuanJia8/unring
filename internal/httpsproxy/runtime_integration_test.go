@@ -227,6 +227,109 @@ socket.on("error", error => { console.error(error.message); process.exit(2); });
 	}
 }
 
+func TestCurlSafeReadDoesNotRequireReviewIntegration(t *testing.T) {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skipf("curl unavailable: %v", err)
+	}
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(response, "read-only")
+	}))
+	defer origin.Close()
+	proxy, environment, targetAddress := startRuntimeProxy(t, origin)
+
+	output := runCurl(t, curl, environment, nil, "https://"+targetAddress+"/read")
+	if string(output) != "read-only" {
+		t.Fatalf("curl output = %q, want read-only", output)
+	}
+	sealContext, sealCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer sealCancel()
+	if err := proxy.Seal(sealContext); err != nil {
+		t.Fatalf("Seal() error: %v", err)
+	}
+	summary := proxy.Summary()
+	if len(summary.Requests) != 1 ||
+		summary.Requests[0].Disposition != httpsproxy.RequestDispositionSafeRead ||
+		summary.HasReviewableActivity() {
+		t.Fatalf("child HTTPS GET manufactured reviewable activity: %#v", summary)
+	}
+}
+
+func TestCurlAgentControlPlanePostIsForwardedAndVisibleIntegration(t *testing.T) {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skipf("curl unavailable: %v", err)
+	}
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/v1/messages" {
+			t.Errorf("origin request = %s %s", request.Method, request.URL.Path)
+		}
+		response.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(response, "model-response")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse origin URL: %v", err)
+	}
+	targetAddress := net.JoinHostPort("api.anthropic.com", originURL.Port())
+	upstream := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "tcp", originURL.Host)
+		},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Isolated httptest origin only.
+		},
+	}
+	authority, err := httpsproxy.EnsureAuthority(t.TempDir())
+	if err != nil {
+		t.Fatalf("EnsureAuthority() error: %v", err)
+	}
+	approvalCalls := 0
+	proxy, err := httpsproxy.Start(authority, httpsproxy.Options{
+		Transport: upstream,
+		AgentControlPlane: func(request *http.Request) bool {
+			return request.Method == http.MethodPost &&
+				request.URL.Hostname() == "api.anthropic.com" &&
+				request.URL.Path == "/v1/messages"
+		},
+		Approve: func(context.Context, httpsproxy.ApprovalRequest) (bool, error) {
+			approvalCalls++
+			return false, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+	environment, err := childenv.HTTPS(os.Environ(), proxy.Address(), authority.CertificatePath)
+	if err != nil {
+		t.Fatalf("build child environment: %v", err)
+	}
+
+	output := runCurl(t, curl, environment, []byte(`{"model":"claude"}`),
+		"--request", "POST", "--data-binary", "@-",
+		"https://"+targetAddress+"/v1/messages")
+	if string(output) != "model-response" {
+		t.Fatalf("control-plane response = %q, want model-response", output)
+	}
+	sealContext, sealCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer sealCancel()
+	if err := proxy.Seal(sealContext); err != nil {
+		t.Fatalf("Seal() error: %v", err)
+	}
+	summary := proxy.Summary()
+	if approvalCalls != 0 || len(summary.Approvals) != 0 ||
+		len(summary.Requests) != 1 ||
+		summary.Requests[0].Disposition != httpsproxy.RequestDispositionControlPlane ||
+		summary.Requests[0].StatusCode != http.StatusAccepted ||
+		summary.HasReviewableActivity() {
+		t.Fatalf("control-plane POST was gated, hidden, or made reviewable: %#v", summary)
+	}
+}
+
 func TestPlainHTTPCurlCannotEscapeUnreportedIntegration(t *testing.T) {
 	curl, err := exec.LookPath("curl")
 	if err != nil {
