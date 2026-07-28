@@ -72,12 +72,27 @@ func TestExtendedProtocolORMAndPreparedStatementCollisionsIntegration(t *testing
 	if err := second.Close(ctx); err != nil {
 		t.Fatalf("close second ORM client: %v", err)
 	}
-	inspector := connectTest(t, ctx, proxyConfig)
-	if got := scalarTest(t, ctx, inspector, "SELECT count(*) FROM pg_prepared_statements"); got != "0" {
-		t.Fatalf("client teardown left %s backend prepared statements, want 0", got)
+	if err := proxy.Seal(ctx); err != nil {
+		t.Fatalf("wait for client handlers and protocol-object cleanup with Seal: %v", err)
 	}
-	if err := inspector.Close(ctx); err != nil {
-		t.Fatalf("close prepared-statement inspector: %v", err)
+	proxy.queryMu.Lock()
+	preparedRows, preparedErr := proxy.internalRowsLocked(
+		"SELECT name, statement FROM pg_prepared_statements ORDER BY name",
+	)
+	proxy.queryMu.Unlock()
+	if preparedErr != nil {
+		t.Fatalf("inspect backend prepared statements after Seal completed cleanup: %v", preparedErr)
+	}
+	if len(preparedRows) != 0 {
+		prepared := make([]string, 0, len(preparedRows))
+		for _, row := range preparedRows {
+			prepared = append(prepared, fmt.Sprintf("%q => %q", row[0], row[1]))
+		}
+		t.Fatalf(
+			"after Seal waited for all client handlers and protocol-object cleanup, "+
+				"backend still had %d prepared statements for session prefix %q: %s; want none",
+			len(preparedRows), proxy.savepointPrefix, strings.Join(prepared, ", "),
+		)
 	}
 
 	if err := proxy.Finalize(ctx, DecisionRollback); err != nil {
