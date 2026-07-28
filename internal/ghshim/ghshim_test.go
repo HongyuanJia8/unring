@@ -339,13 +339,22 @@ printf 'https://github.com/acme/widget/issues/456\n'
 		t.Fatalf("open production-shaped terminal: %v", err)
 	}
 	defer terminal.Close()
+	var terminalOutput bytes.Buffer
+	terminalReadDone := make(chan error, 1)
+	go func() {
+		_, readErr := io.Copy(&terminalOutput, terminal)
+		if errors.Is(readErr, syscall.EIO) {
+			readErr = nil
+		}
+		terminalReadDone <- readErr
+	}()
 	if code := RunClient(
 		[]string{"issue", "create", "--repo", "acme/widget", "--title", "tty undo"},
 		peer, peer, peer,
 	); code != 0 {
 		_ = peer.Close()
-		output, _ := io.ReadAll(terminal)
-		t.Fatalf("terminal-attached create exit code = %d, output=%q", code, output)
+		<-terminalReadDone
+		t.Fatalf("terminal-attached create exit code = %d, output=%q", code, terminalOutput.String())
 	}
 	record := session.Summary().Records[0]
 	if record.ResourceURL != "https://github.com/acme/widget/issues/456" ||
@@ -356,12 +365,11 @@ printf 'https://github.com/acme/widget/issues/456\n'
 		t.Fatalf("terminal-attached discard compensation: %v", err)
 	}
 	_ = peer.Close()
-	output, readErr := io.ReadAll(terminal)
-	if readErr != nil && !errors.Is(readErr, syscall.EIO) {
+	if readErr := <-terminalReadDone; readErr != nil {
 		t.Fatalf("read terminal output: %v", readErr)
 	}
-	if !bytes.Contains(output, []byte("https://github.com/acme/widget/issues/456")) {
-		t.Fatalf("real gh terminal output was not forwarded: %q", output)
+	if !bytes.Contains(terminalOutput.Bytes(), []byte("https://github.com/acme/widget/issues/456")) {
+		t.Fatalf("real gh terminal output was not forwarded: %q", terminalOutput.String())
 	}
 	data, err := os.ReadFile(runLog)
 	if err != nil {
@@ -461,6 +469,11 @@ func TestGHNetworkOriginHelper(t *testing.T) {
 		fmt.Fprintf(os.Stderr, "copy network response: %v\n", err)
 		os.Exit(94)
 	}
+	if err := response.Body.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "close network response: %v\n", err)
+		os.Exit(95)
+	}
+	os.Exit(0)
 }
 
 func TestMissingRealGHIsRecordedAsNotRun(t *testing.T) {
