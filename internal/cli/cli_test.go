@@ -28,8 +28,65 @@ func TestMainHelp(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Main(help) exit code = %d, want 0; stderr: %s", exitCode, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "unring run") {
-		t.Fatalf("help output did not mention run: %s", stdout.String())
+	for _, want := range []string{"unring run", "DATABASE_URL", "PostgreSQL 14", "commit or discard"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("help output did not mention %q: %s", want, stdout.String())
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("help wrote stderr: %s", stderr.String())
+	}
+}
+
+func TestMainVersion(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr bytes.Buffer
+	if exitCode := Main([]string{"--version"}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("Main(--version) exit code = %d; stderr: %s", exitCode, stderr.String())
+	}
+	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "unring ") || stderr.Len() != 0 {
+		t.Fatalf("version output stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestRunHelpIsUsefulAndSuccessful(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr bytes.Buffer
+	if exitCode := Main([]string{"run", "--help"}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("Main(run --help) exit code = %d; stderr: %s", exitCode, stderr.String())
+	}
+	for _, want := range []string{"--commit", "--discard", "<command>"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("run help did not mention %q: %s", want, stderr.String())
+		}
+	}
+}
+
+func TestMissingDatabaseURLIsActionable(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	_, err := parseBackendConfig()
+	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL is not set") ||
+		!strings.Contains(err.Error(), "postgresql://") {
+		t.Fatalf("missing DATABASE_URL error = %v", err)
+	}
+}
+
+func TestUnreachableDatabaseErrorIsActionable(t *testing.T) {
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+	t.Setenv("DATABASE_URL", "postgresql://postgres@127.0.0.1:1/postgres?sslmode=disable")
+	var stdout, stderr bytes.Buffer
+	exitCode := Main(
+		[]string{"run", "--discard", "--", "true"},
+		strings.NewReader(""), &stdout, &stderr,
+	)
+	if exitCode != internalErrorExitCode {
+		t.Fatalf("unreachable database exit = %d, want %d; stderr: %s",
+			exitCode, internalErrorExitCode, stderr.String())
+	}
+	for _, want := range []string{"start postgres session", "DATABASE_URL", "reachability", "PostgreSQL 14"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("unreachable database error did not mention %q: %s", want, stderr.String())
+		}
 	}
 }
 

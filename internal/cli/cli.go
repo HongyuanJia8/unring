@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -48,6 +49,9 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
+	case "version", "-v", "--version":
+		fmt.Fprintln(stdout, versionString())
+		return 0
 	default:
 		if isNamedAlias(args[0]) || resolvesOnPath(args[0]) {
 			runArgs := append([]string{"--", args[0]}, args[1:]...)
@@ -66,8 +70,15 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	forceDiscard := flags.Bool("discard", false, "discard without prompting")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: unring run [--commit | --discard] -- <command> [args...]")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "Run a command with database and supported HTTPS effects held for review.")
+		fmt.Fprintln(stderr, "Options:")
+		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return usageExitCode
 	}
 	if *forceCommit && *forceDiscard {
@@ -262,6 +273,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	if err != nil {
 		auditError = err.Error()
 		fmt.Fprintf(stderr, "unring: start postgres session: %v\n", err)
+		fmt.Fprintln(stderr,
+			"unring: check DATABASE_URL, database reachability and credentials, and that the server is PostgreSQL 14 or newer")
 		return internalErrorExitCode
 	}
 
@@ -822,6 +835,12 @@ func resolvesOnPath(name string) bool {
 
 func parseBackendConfig() (*pgconn.Config, error) {
 	connectionString := os.Getenv("DATABASE_URL")
+	if strings.TrimSpace(connectionString) == "" {
+		return nil, errors.New(
+			"DATABASE_URL is not set; point it at the real PostgreSQL database, for example " +
+				"postgresql://user:password@localhost/database",
+		)
+	}
 	config, err := pgconn.ParseConfig(connectionString)
 	if err != nil {
 		return nil, fmt.Errorf("read real Postgres connection settings: %w", err)
@@ -1283,12 +1302,54 @@ func pastTense(decision pgproxy.Decision) string {
 }
 
 func printUsage(output io.Writer) {
+	fmt.Fprintln(output, "unring holds an agent's PostgreSQL and supported HTTPS side effects for review")
+	fmt.Fprintln(output, "and then applies one decision: commit or discard.")
+	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  unring run [--commit | --discard] -- <command> [args...]")
 	fmt.Fprintln(output, "  unring log [--json] [session-id]")
 	fmt.Fprintln(output, "  unring <command-on-PATH> [--] [args...]")
 	fmt.Fprintln(output, "  unring claude|codex|opencode [--] [args...]")
+	fmt.Fprintln(output, "  unring --version")
 	fmt.Fprintln(output)
-	fmt.Fprintln(output, "The child inherits PostgreSQL connection settings that point only it at")
-	fmt.Fprintln(output, "unring's loopback proxy. Without a terminal, the safe default is discard.")
+	fmt.Fprintln(output, "First run:")
+	fmt.Fprintln(output, "  export DATABASE_URL='postgresql://user:password@localhost/database'")
+	fmt.Fprintln(output, "  unring run -- psql")
+	fmt.Fprintln(output, "  unring claude")
+	fmt.Fprintln(output)
+	fmt.Fprintln(output, "PostgreSQL 14 or newer is required. The wrapped child alone receives loopback")
+	fmt.Fprintln(output, "database/proxy settings. Without a terminal, the safe default is discard; use")
+	fmt.Fprintln(output, "--commit or --discard for automation. Run 'unring run --help' for run options.")
+}
+
+func versionString() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unring devel"
+	}
+	version := info.Main.Version
+	if version == "" || version == "(devel)" {
+		version = "devel"
+	}
+	var revision string
+	modified := false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if revision != "" {
+		version += " (" + revision
+		if modified {
+			version += ", modified"
+		}
+		version += ")"
+	}
+	return "unring " + version
 }

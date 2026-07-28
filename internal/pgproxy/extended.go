@@ -50,7 +50,11 @@ func (p *Proxy) startExtended(client *clientState) {
 	client.cycleSavepoint = client.nextObjectName(p.savepointPrefix, "x")
 	if _, err := p.internalQueryLocked("SAVEPOINT " + client.cycleSavepoint); err != nil {
 		p.markFatal(fmt.Errorf("start extended-query cycle: %w", err))
+		return
 	}
+	client.cycleRows = cloneRowLedger(p.rowLedger)
+	client.cycleUncertainBase = len(p.uncertainEffects)
+	client.cycleSequenceSuppressions = cloneSequenceSuppressions(p.sequenceSuppressions)
 }
 
 func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
@@ -106,6 +110,7 @@ func (p *Proxy) extendedParse(client *clientState, message *pgproto3.Parse) {
 		query:       message.Query,
 		statement:   statement,
 		synthetic: statement.Kind != statementRegular || statement.Irreversible != "" ||
+			len(statement.TruncateTargets) > 0 ||
 			statement.Refusal != "",
 	}
 	if prepared.synthetic {
@@ -160,7 +165,7 @@ func (p *Proxy) extendedBind(client *clientState, message *pgproto3.Bind) {
 	if prepared.synthetic {
 		if len(message.Parameters) != 0 {
 			p.extendedLocalError(client, "08P01",
-				"transaction-control and irreversible statements do not accept bind parameters")
+				"this unring-managed statement does not accept bind parameters")
 			return
 		}
 		client.portals[message.DestinationPortal] = bound
@@ -332,9 +337,18 @@ func (p *Proxy) rotateExtendedCycleSavepointLocked(client *clientState, create b
 			for _, detail := range client.cycleUncertain {
 				p.addUncertainEffectLocked(detail)
 			}
+		} else {
+			p.restoreRowLedgerLocked(client.cycleRows)
+			p.restoreUncertainEffectsLocked(client.cycleUncertainBase)
 		}
 		p.reconcileRowChangesLocked(keep && len(client.cycleUncertain) == 0)
+		if !keep {
+			p.restoreSequenceSuppressionsLocked(client.cycleSequenceSuppressions)
+		}
 		client.cycleUncertain = nil
+		client.cycleRows = nil
+		client.cycleUncertainBase = 0
+		client.cycleSequenceSuppressions = nil
 		client.cycleSavepoint = ""
 	}
 	if !create {
@@ -344,6 +358,9 @@ func (p *Proxy) rotateExtendedCycleSavepointLocked(client *clientState, create b
 	if _, err := p.internalQueryLocked("SAVEPOINT " + client.cycleSavepoint); err != nil {
 		return fmt.Errorf("restore extended-query savepoint after transaction control: %w", err)
 	}
+	client.cycleRows = cloneRowLedger(p.rowLedger)
+	client.cycleUncertainBase = len(p.uncertainEffects)
+	client.cycleSequenceSuppressions = cloneSequenceSuppressions(p.sequenceSuppressions)
 	return nil
 }
 
@@ -521,8 +538,14 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 		for _, detail := range client.cycleUncertain {
 			p.addUncertainEffectLocked(detail)
 		}
+	} else {
+		p.restoreRowLedgerLocked(client.cycleRows)
+		p.restoreUncertainEffectsLocked(client.cycleUncertainBase)
 	}
 	p.reconcileRowChangesLocked(keepRows && len(client.cycleUncertain) == 0)
+	if !keepRows {
+		p.restoreSequenceSuppressionsLocked(client.cycleSequenceSuppressions)
+	}
 	if client.extendedFailed && client.pendingEscape == nil &&
 		client.transactionSavepoint != "" {
 		client.transactionFailed = true
@@ -532,6 +555,9 @@ func (p *Proxy) finishExtendedCycleLocked(client *clientState, sendReady bool) e
 	client.rollbackCycle = false
 	client.cycleSavepoint = ""
 	client.cycleUncertain = nil
+	client.cycleRows = nil
+	client.cycleUncertainBase = 0
+	client.cycleSequenceSuppressions = nil
 
 	if client.pendingEscape != nil {
 		statement := *client.pendingEscape

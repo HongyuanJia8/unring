@@ -44,6 +44,7 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 	batchSavepoint := ""
 	var batchRows rowLedgerSnapshot
 	batchUncertain := 0
+	var batchSequenceSuppressions map[string]sequenceSuppression
 	if client.transactionSavepoint == "" && len(statements) > 1 && allRegularStatements(statements) {
 		batchSavepoint = client.nextObjectName(p.savepointPrefix, "b")
 		if _, err := p.internalQueryLocked("SAVEPOINT " + batchSavepoint); err != nil {
@@ -52,6 +53,7 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 		}
 		batchRows = cloneRowLedger(p.rowLedger)
 		batchUncertain = len(p.uncertainEffects)
+		batchSequenceSuppressions = cloneSequenceSuppressions(p.sequenceSuppressions)
 	}
 
 	record := QueryRecord{SQL: sql}
@@ -82,6 +84,7 @@ func (p *Proxy) relayQuery(client *clientState, sql string) {
 			p.restoreRowLedgerLocked(batchRows)
 			p.restoreUncertainEffectsLocked(batchUncertain)
 			p.reconcileRowChangesLocked(false)
+			p.restoreSequenceSuppressionsLocked(batchSequenceSuppressions)
 		}
 	}
 	p.recordQuery(record)
@@ -155,6 +158,7 @@ func (p *Proxy) executeStatementLocked(
 	if statement.Kind != statementRegular {
 		return p.executeTransactionControlLocked(client, statement)
 	}
+	p.prepareStatementRiskLocked(&statement)
 	if p.escapeLeaseHeldByOther(client) {
 		p.sendStatementError(client, "55P03",
 			"another client is running an approved non-transactional statement; unring cannot safely interleave this statement",
@@ -170,7 +174,6 @@ func (p *Proxy) executeStatementLocked(
 		}
 		statement.RollbackAfter = true
 	}
-	p.prepareStatementRiskLocked(&statement)
 	if statement.Irreversible != "" {
 		return p.executeIrreversibleLocked(client, statement)
 	}
@@ -232,6 +235,7 @@ func (p *Proxy) executeTransactionControlLocked(
 			p.restoreRowLedgerLocked(client.transactionRows)
 			p.restoreUncertainEffectsLocked(client.transactionUncertain)
 			p.reconcileRowChangesLocked(false)
+			p.restoreSequenceSuppressionsLocked(client.transactionSequenceSuppressions)
 		}
 		p.clearClientTransaction(client)
 		if statement.Chain {
@@ -257,6 +261,7 @@ func (p *Proxy) executeTransactionControlLocked(
 		p.restoreRowLedgerLocked(client.transactionRows)
 		p.restoreUncertainEffectsLocked(client.transactionUncertain)
 		p.reconcileRowChangesLocked(false)
+		p.restoreSequenceSuppressionsLocked(client.transactionSequenceSuppressions)
 		p.clearClientTransaction(client)
 		if statement.Chain {
 			if err := p.beginClientTransactionLocked(client); err != nil {
@@ -278,8 +283,9 @@ func (p *Proxy) executeTransactionControlLocked(
 		}
 		client.savepoints = append(client.savepoints, clientSavepoint{
 			clientName: statement.Savepoint, backendName: backendName,
-			rows:      cloneRowLedger(p.rowLedger),
-			uncertain: len(p.uncertainEffects),
+			rows:                 cloneRowLedger(p.rowLedger),
+			uncertain:            len(p.uncertainEffects),
+			sequenceSuppressions: cloneSequenceSuppressions(p.sequenceSuppressions),
 		})
 		client.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SAVEPOINT")})
 		return []string{"SAVEPOINT"}, false
@@ -305,6 +311,7 @@ func (p *Proxy) executeTransactionControlLocked(
 		p.restoreRowLedgerLocked(client.savepoints[index].rows)
 		p.restoreUncertainEffectsLocked(client.savepoints[index].uncertain)
 		p.reconcileRowChangesLocked(false)
+		p.restoreSequenceSuppressionsLocked(client.savepoints[index].sequenceSuppressions)
 		client.savepoints = client.savepoints[:index+1]
 		client.transactionFailed = false
 		client.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")})
@@ -343,6 +350,7 @@ func (p *Proxy) beginClientTransactionLocked(client *clientState) error {
 	client.transactionSavepoint = name
 	client.transactionRows = cloneRowLedger(p.rowLedger)
 	client.transactionUncertain = len(p.uncertainEffects)
+	client.transactionSequenceSuppressions = cloneSequenceSuppressions(p.sequenceSuppressions)
 	p.activeTransaction = client.id
 	client.transactionFailed = false
 	client.savepoints = nil
@@ -357,6 +365,7 @@ func (p *Proxy) clearClientTransaction(client *clientState) {
 	client.transactionFailed = false
 	client.transactionRows = nil
 	client.transactionUncertain = 0
+	client.transactionSequenceSuppressions = nil
 	client.savepoints = nil
 }
 
@@ -407,6 +416,20 @@ func (p *Proxy) executeRegularLocked(
 	if _, err := p.internalQueryLocked("SAVEPOINT " + savepoint); err != nil {
 		p.markFatal(fmt.Errorf("create query savepoint: %w", err))
 		return nil, true
+	}
+	var truncateEffect *truncateEffect
+	if len(statement.TruncateTargets) > 0 {
+		client.backend.Send(&pgproto3.NoticeResponse{
+			Severity: "NOTICE", Code: "00000",
+			Message: "unring is scanning every affected table before TRUNCATE to report an exact row count; large tables can make this take as long as a full table scan",
+		})
+		_ = client.backend.Flush()
+		var err error
+		truncateEffect, err = p.prepareTruncateEffectLocked(statement)
+		if err != nil {
+			statement.SummaryRisk = "TRUNCATE row count is UNKNOWN: " + err.Error()
+			statement.RiskRequiresRows = false
+		}
 	}
 
 	p.frontend.Send(&pgproto3.Query{String: statement.SQL})
@@ -484,7 +507,11 @@ complete:
 	if riskApplies {
 		p.addUncertainEffectLocked(statement.SummaryRisk)
 	}
-	p.reconcileRowChangesLocked(keep && !riskApplies)
+	if len(statement.TruncateTargets) > 0 && truncateEffect != nil {
+		p.reconcileTruncateLocked(truncateEffect, keep && !riskApplies, statement.TruncateRestart)
+	} else {
+		p.reconcileRowChangesLocked(keep && !riskApplies)
+	}
 	if transactionBlockError != nil {
 		statement.Irreversible = transactionBlockError.Message
 		return p.executeIrreversibleLocked(client, statement)

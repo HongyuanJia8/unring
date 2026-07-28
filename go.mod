@@ -10,6 +10,7 @@ require (
 	github.com/pganalyze/pg_query_go/v6 v6.2.2
 	golang.org/x/sys v0.36.0
 	golang.org/x/term v0.31.0
+	google.golang.org/protobuf v1.34.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -36,5 +37,4 @@ require (
 	golang.org/x/text v0.24.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
-	google.golang.org/protobuf v1.34.2 // indirect
 )

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 type statementKind uint8
@@ -35,6 +36,21 @@ type clientStatement struct {
 	SummaryRisk      string
 	SummaryTarget    *relationReference
 	RiskRequiresRows bool
+	TruncateTargets  []truncateTarget
+	TruncateCascade  bool
+	TruncateRestart  bool
+	FunctionCalls    []functionReference
+}
+
+type functionReference struct {
+	Catalog string
+	Schema  string
+	Name    string
+}
+
+type truncateTarget struct {
+	Relation           relationReference
+	IncludeDescendants bool
 }
 
 type relationReference struct {
@@ -104,6 +120,8 @@ func analyzeClientSQL(sql string) ([]clientStatement, error) {
 		statement.Irreversible = irreversibleReason(node)
 		statement.LockTargets, statement.LockOperation = maintenanceLockTargets(node)
 		statement.SummaryRisk, statement.SummaryTarget = summaryRisk(node, statement.SQL)
+		statement.TruncateTargets, statement.TruncateCascade, statement.TruncateRestart = truncateDetails(node.GetTruncateStmt())
+		statement.FunctionCalls = functionReferences(node)
 		statement.ReadOnly = readOnlySelect(node.GetSelectStmt())
 		if node.GetDiscardStmt() != nil &&
 			node.GetDiscardStmt().GetTarget() == pg_query.DiscardMode_DISCARD_ALL {
@@ -149,8 +167,10 @@ func maintenanceLockTargets(node *pg_query.Node) ([]relationReference, string) {
 
 func summaryRisk(node *pg_query.Node, sql string) (string, *relationReference) {
 	switch {
-	case node.GetTruncateStmt() != nil:
-		return "TRUNCATE resets PostgreSQL's transaction row counters; exact affected-row counts are unavailable", nil
+	case node.GetDoStmt() != nil:
+		return "DO can execute SQL inside a procedural block that unring cannot inspect for exact row accounting", nil
+	case node.GetCallStmt() != nil:
+		return "CALL can execute SQL inside a procedure that unring cannot inspect for exact row accounting", nil
 	case node.GetRefreshMatViewStmt() != nil:
 		return "REFRESH MATERIALIZED VIEW rewrites through a transient relation; exact affected-row counts are unavailable", nil
 	case node.GetAlterSubscriptionStmt() != nil:
@@ -174,6 +194,73 @@ func summaryRisk(node *pg_query.Node, sql string) (string, *relationReference) {
 		return "", &refs[0]
 	}
 	return "", nil
+}
+
+func functionReferences(node *pg_query.Node) []functionReference {
+	if node == nil {
+		return nil
+	}
+	seen := make(map[functionReference]struct{})
+	var references []functionReference
+	var visit func(protoreflect.Message)
+	visit = func(message protoreflect.Message) {
+		if call, ok := message.Interface().(*pg_query.FuncCall); ok {
+			parts := make([]string, 0, len(call.GetFuncname()))
+			for _, raw := range call.GetFuncname() {
+				value := raw.GetString_()
+				if value == nil || value.GetSval() == "" {
+					parts = nil
+					break
+				}
+				parts = append(parts, value.GetSval())
+			}
+			if len(parts) > 0 && len(parts) <= 3 {
+				reference := functionReference{Name: parts[len(parts)-1]}
+				if len(parts) >= 2 {
+					reference.Schema = parts[len(parts)-2]
+				}
+				if len(parts) == 3 {
+					reference.Catalog = parts[0]
+				}
+				if _, exists := seen[reference]; !exists {
+					seen[reference] = struct{}{}
+					references = append(references, reference)
+				}
+			}
+		}
+		message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+			if field.IsList() && field.Kind() == protoreflect.MessageKind {
+				list := value.List()
+				for index := 0; index < list.Len(); index++ {
+					visit(list.Get(index).Message())
+				}
+			} else if field.Kind() == protoreflect.MessageKind && message.Has(field) {
+				visit(value.Message())
+			}
+			return true
+		})
+	}
+	visit(node.ProtoReflect())
+	return references
+}
+
+func truncateDetails(statement *pg_query.TruncateStmt) ([]truncateTarget, bool, bool) {
+	if statement == nil {
+		return nil, false, false
+	}
+	targets := make([]truncateTarget, 0, len(statement.GetRelations()))
+	for _, node := range statement.GetRelations() {
+		relation := node.GetRangeVar()
+		refs := rangeVarReferences(relation)
+		if len(refs) != 1 {
+			continue
+		}
+		targets = append(targets, truncateTarget{
+			Relation: refs[0], IncludeDescendants: relation.GetInh(),
+		})
+	}
+	return targets, statement.GetBehavior() == pg_query.DropBehavior_DROP_CASCADE,
+		statement.GetRestartSeqs()
 }
 
 func containsLargeObjectMutation(sql string) bool {
