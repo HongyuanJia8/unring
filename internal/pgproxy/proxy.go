@@ -37,6 +37,9 @@ var ErrTransactionLost = errors.New(
 const (
 	minimumPostgresMajor   = 14
 	minimumPostgresVersion = minimumPostgresMajor * 10000
+
+	InterceptionActive        = "active"
+	InterceptionNotConfigured = "not_configured"
 )
 
 // QueryRecord is a compact account of one client query batch.
@@ -117,8 +120,9 @@ type Options struct {
 
 // Summary is a point-in-time copy of the session activity.
 type Summary struct {
-	Connections int           `json:"connections"`
-	Queries     []QueryRecord `json:"queries"`
+	InterceptionStatus string        `json:"interception_status"`
+	Connections        int           `json:"connections"`
+	Queries            []QueryRecord `json:"queries"`
 	// FullyReversible is false exactly when IrreversibleActions is non-empty.
 	// Other coverage and accounting warnings are represented separately.
 	FullyReversible     bool                     `json:"fully_reversible"`
@@ -376,6 +380,7 @@ func (p *Proxy) Summary() Summary {
 	// local refusals have their own fields and must not counterfeit this stamp.
 	fullyReversible := len(actions) == 0
 	return Summary{
+		InterceptionStatus:  InterceptionActive,
 		Connections:         p.connections,
 		Queries:             queries,
 		FullyReversible:     fullyReversible,

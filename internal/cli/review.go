@@ -275,6 +275,7 @@ func (model reviewModel) View() string {
 	var output strings.Builder
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
+	printStructuralBlindSpots(&output)
 	if !model.summary.FullyReversible || model.https.HasForwardedEffects() ||
 		ghMayHaveExternalEffect(model.gh) {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
