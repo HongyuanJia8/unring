@@ -34,6 +34,7 @@ type reviewModel struct {
 	expanded map[int]bool
 	cursor   int
 	offset   int
+	width    int
 	height   int
 	decision pgproxy.Decision
 	decided  bool
@@ -54,7 +55,7 @@ func newReviewModelWithExternal(
 ) reviewModel {
 	model := reviewModel{
 		summary: summary, https: httpsSummary, gh: ghSummary,
-		expanded: make(map[int]bool), height: 24,
+		expanded: make(map[int]bool), width: defaultReviewWidth, height: 24,
 		decision: pgproxy.DecisionRollback,
 	}
 	for _, item := range summary.Unintercepted {
@@ -213,6 +214,7 @@ func (model reviewModel) Init() tea.Cmd { return nil }
 
 func (model reviewModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	if size, ok := message.(tea.WindowSizeMsg); ok {
+		model.width = size.Width
 		model.height = size.Height
 		model.adjustOffset()
 		return model, nil
@@ -261,7 +263,14 @@ func (model *reviewModel) adjustOffset() {
 }
 
 func (model reviewModel) pageSize() int {
-	size := model.height - 14
+	overhead := 20
+	if model.hasIrreversibilityWarning() {
+		overhead += 5
+	}
+	if model.uninterceptedCount() > 0 {
+		overhead += 5
+	}
+	size := model.height - overhead
 	if size < 4 {
 		return 4
 	}
@@ -275,14 +284,14 @@ func (model reviewModel) View() string {
 	var output strings.Builder
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
-	if !model.summary.FullyReversible || model.https.HasForwardedEffects() ||
-		ghMayHaveExternalEffect(model.gh) {
+	printStructuralBlindSpots(&output, model.width)
+	if model.hasIrreversibilityWarning() {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
 		output.WriteString("Unring cannot guarantee every recorded effect can be undone by discarding.\n")
 		output.WriteString("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 	}
-	uninterceptedCount := len(model.summary.Unintercepted) + len(model.https.Unintercepted)
+	uninterceptedCount := model.uninterceptedCount()
 	if uninterceptedCount > 0 {
 		output.WriteString("\n================================================================\n")
 		fmt.Fprintf(&output, "!!! INTERCEPTION/COVERAGE WARNING: %d UNCLASSIFIED ITEM(S) !!!\n",
@@ -352,12 +361,55 @@ func (model reviewModel) View() string {
 	if end < len(model.items) {
 		fmt.Fprintf(&output, "... %d review items below ...\n", len(model.items)-end)
 	}
+	decisionLine := "\nUp/down: select  Enter/space: expand  c: commit  d: discard\n"
 	if model.decided {
-		fmt.Fprintf(&output, "\nDecision: %s\n", model.decision)
-		return output.String()
+		decisionLine = fmt.Sprintf("\nDecision: %s\n", model.decision)
 	}
-	output.WriteString("\nUp/down: select  Enter/space: expand  c: commit  d: discard\n")
-	return output.String()
+	view := output.String() + decisionLine
+	if renderedLineCount(view) > model.height {
+		return model.compactOverflowView(output.String(), decisionLine)
+	}
+	return view
+}
+
+func (model reviewModel) compactOverflowView(body, decisionLine string) string {
+	var header strings.Builder
+	writeWrappedLine(&header,
+		"UNRING SESSION REVIEW — one decision; partial commit is unavailable.",
+		"", "", model.width)
+	if model.hasIrreversibilityWarning() {
+		header.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
+	}
+	if count := model.uninterceptedCount(); count > 0 {
+		fmt.Fprintf(&header,
+			"!!! INTERCEPTION/COVERAGE WARNING: %d UNCLASSIFIED ITEM(S) !!!\n", count)
+	}
+	printStructuralBlindSpots(&header, model.width)
+
+	decisionLine = strings.TrimSpace(decisionLine)
+	bodyLines := strings.Split(strings.TrimSpace(body), "\n")
+	for len(bodyLines) > 0 {
+		candidate := header.String() + "\n" + strings.Join(bodyLines, "\n") +
+			"\n" + decisionLine + "\n"
+		if renderedLineCount(candidate) <= model.height {
+			return candidate
+		}
+		bodyLines = bodyLines[1:]
+	}
+	return header.String() + decisionLine + "\n"
+}
+
+func (model reviewModel) hasIrreversibilityWarning() bool {
+	return !model.summary.FullyReversible || model.https.HasForwardedEffects() ||
+		ghMayHaveExternalEffect(model.gh)
+}
+
+func (model reviewModel) uninterceptedCount() int {
+	return len(model.summary.Unintercepted) + len(model.https.Unintercepted)
+}
+
+func renderedLineCount(view string) int {
+	return len(strings.Split(view, "\n"))
 }
 
 func reviewDecisionWithSignal(

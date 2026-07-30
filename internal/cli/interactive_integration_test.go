@@ -101,7 +101,7 @@ func TestCommitFlagCannotOverrideSignaledChild(t *testing.T) {
 	}
 }
 
-func TestReadOnlySessionExitsSilently(t *testing.T) {
+func TestReadOnlySessionPrintsOnlyQuietDisclosure(t *testing.T) {
 	connectionString, backendDone := startReviewTestBackend(t, false)
 	t.Setenv("DATABASE_URL", connectionString)
 
@@ -112,12 +112,24 @@ func TestReadOnlySessionExitsSilently(t *testing.T) {
 	}
 	command := exec.Command(binary, "run", "--", truePath)
 	command.Env = os.Environ()
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("read-only unring run failed: %v\n%s", err, output)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("read-only unring run failed: %v\nstdout: %s\nstderr: %s",
+			err, stdout.String(), stderr.String())
 	}
-	if len(output) != 0 {
-		t.Fatalf("read-only unring run emitted output: %q", output)
+	if got := stdout.String(); got != "" {
+		t.Fatalf("read-only unring run wrote stdout: %q", got)
+	}
+	if got, want := stderr.String(), quietSessionDisclosure+"\n"; got != want {
+		t.Fatalf("read-only unring stderr = %q, want %q", got, want)
+	}
+	for _, unwanted := range []string{"UNRING SESSION REVIEW", "Commit or discard?", "Up/down:"} {
+		if strings.Contains(stderr.String(), unwanted) {
+			t.Fatalf("read-only unring disclosure included %q: %q", unwanted, stderr.String())
+		}
 	}
 	if err := <-backendDone; err != nil {
 		t.Fatalf("fake Postgres backend: %v", err)
@@ -192,6 +204,7 @@ func TestGHVersionPassesThroughWithoutApproval(t *testing.T) {
 	text := string(output)
 	if !strings.Contains(text, "fake-gh-version") ||
 		!strings.Contains(text, "fake-gh-diagnostic") ||
+		!strings.Contains(text, quietSessionDisclosure) ||
 		strings.Contains(text, "needs approval") ||
 		strings.Contains(text, "UNRING SESSION REVIEW") {
 		t.Fatalf("gh --version was not transparent:\n%s", text)

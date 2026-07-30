@@ -21,6 +21,18 @@ import (
 
 const recordVersion = 1
 
+var structuralBlindSpots = []string{
+	"SSH traffic, including git push over SSH, and direct-to-IP or raw-socket connections",
+	"clients that ignore proxy or PATH settings, including unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS",
+}
+
+// StructuralBlindSpots returns the fixed disclosure recorded for every
+// session. These channels never reach an unring interception point, so their
+// absence from observed traffic is not evidence that they were unused.
+func StructuralBlindSpots() []string {
+	return append([]string(nil), structuralBlindSpots...)
+}
+
 // Approval records the user's answer to an irreversible-action prompt.
 type Approval struct {
 	Kind      string    `json:"kind"`
@@ -56,6 +68,7 @@ type Record struct {
 	GH            ghshim.Summary     `json:"gh"`
 	Approvals     []Approval         `json:"irreversible_actions"`
 	Unintercepted []Unintercepted    `json:"unintercepted"`
+	BlindSpots    []string           `json:"structural_blind_spots"`
 }
 
 // Store owns the on-disk audit log beneath unring's per-user state directory.
@@ -132,9 +145,11 @@ func NewRecord(command []string, now time.Time) (Record, error) {
 		Decision:  "discard",
 		Outcome:   "pending",
 		Postgres: pgproxy.Summary{
-			FullyReversible: true,
-			Changes:         pgproxy.ChangeSummary{Complete: false, Error: "session not sealed"},
+			InterceptionStatus: "not_started",
+			FullyReversible:    true,
+			Changes:            pgproxy.ChangeSummary{Complete: false, Error: "session not sealed"},
 		},
+		BlindSpots: StructuralBlindSpots(),
 	}, nil
 }
 

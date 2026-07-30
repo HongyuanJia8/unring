@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hyj28/unring/internal/adapter"
 	"github.com/hyj28/unring/internal/audit"
 	"github.com/hyj28/unring/internal/childenv"
@@ -35,7 +36,61 @@ import (
 const (
 	internalErrorExitCode = 1
 	usageExitCode         = 2
+	defaultReviewWidth    = 80
+
+	quietSessionDisclosure = "unring: nothing intercepted. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
 )
+
+type postgresSession interface {
+	Address() string
+	Done() <-chan struct{}
+	Err() error
+	Summary() pgproxy.Summary
+	Seal(context.Context) error
+	Finalize(context.Context, pgproxy.Decision) error
+	Close() error
+}
+
+type unconfiguredPostgresSession struct {
+	done chan struct{}
+}
+
+func newUnconfiguredPostgresSession() *unconfiguredPostgresSession {
+	return &unconfiguredPostgresSession{done: make(chan struct{})}
+}
+
+func (session *unconfiguredPostgresSession) Address() string {
+	return ""
+}
+
+func (session *unconfiguredPostgresSession) Done() <-chan struct{} {
+	return session.done
+}
+
+func (session *unconfiguredPostgresSession) Err() error {
+	return nil
+}
+
+func (session *unconfiguredPostgresSession) Summary() pgproxy.Summary {
+	return pgproxy.Summary{
+		InterceptionStatus: pgproxy.InterceptionNotConfigured,
+		FullyReversible:    true,
+		Changes:            pgproxy.ChangeSummary{Complete: true},
+		Sealed:             true,
+	}
+}
+
+func (session *unconfiguredPostgresSession) Seal(context.Context) error {
+	return nil
+}
+
+func (session *unconfiguredPostgresSession) Finalize(context.Context, pgproxy.Decision) error {
+	return nil
+}
+
+func (session *unconfiguredPostgresSession) Close() error {
+	return nil
+}
 
 // Main runs the CLI and returns the desired process exit code.
 func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -73,7 +128,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: unring run [--commit | --discard] -- <command> [args...]")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Run a command with database and supported HTTPS effects held for review.")
+		fmt.Fprintln(stderr,
+			"Run one bounded command with optional PostgreSQL and supported HTTPS effects held for review.")
 		fmt.Fprintln(stderr, "Options:")
 		flags.PrintDefaults()
 	}
@@ -105,7 +161,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 
-	var proxy *pgproxy.Proxy
+	var proxy postgresSession
 	var httpsProxy *httpsproxy.Proxy
 	var ghSession *ghshim.Session
 	var finalized bool
@@ -170,13 +226,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		}
 	}()
 
-	backendConfig, err := parseBackendConfig()
+	backendConfig, databaseConfigured, err := parseOptionalBackendConfig()
 	if err != nil {
 		auditError = err.Error()
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
-
 	adapterSet, err := loadAdapters(os.Getenv("UNRING_ADAPTERS"))
 	if err != nil {
 		auditError = err.Error()
@@ -232,45 +287,51 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: start per-session gh shim: %v\n", err)
 		return internalErrorExitCode
 	}
-	proxy, err = pgproxy.StartWithOptions(ctx, backendConfig, pgproxy.Options{
-		Approve: func(approvalContext context.Context, request pgproxy.ApprovalRequest) (bool, error) {
-			reply := make(chan runner.ApprovalResult, 1)
-			work := runner.ApprovalRequest{
-				Decide: func() (bool, error) {
-					return promptIrreversibleApproval(stdin, stdout, request), nil
-				},
-				Reply: reply,
-			}
-			select {
-			case approvalRequests <- work:
-			case <-approvalContext.Done():
-				return false, approvalContext.Err()
-			}
-			select {
-			case result := <-reply:
-				decision := "declined"
-				if result.Approved {
-					decision = "approved"
+	if databaseConfigured {
+		startedProxy, startErr := pgproxy.StartWithOptions(ctx, backendConfig, pgproxy.Options{
+			Approve: func(approvalContext context.Context, request pgproxy.ApprovalRequest) (bool, error) {
+				reply := make(chan runner.ApprovalResult, 1)
+				work := runner.ApprovalRequest{
+					Decide: func() (bool, error) {
+						return promptIrreversibleApproval(stdin, stdout, request), nil
+					},
+					Reply: reply,
 				}
-				approvalError := ""
-				if result.Err != nil {
-					decision = "error"
-					approvalError = result.Err.Error()
+				select {
+				case approvalRequests <- work:
+				case <-approvalContext.Done():
+					return false, approvalContext.Err()
 				}
-				if err := auditSession.Update(func(record *audit.Record) {
-					record.Approvals = append(record.Approvals, audit.Approval{
-						Kind: "postgres", Statement: request.SQL, Reason: request.Reason,
-						Decision: decision, Error: approvalError, Time: time.Now().UTC(),
-					})
-				}); err != nil {
-					return false, fmt.Errorf("record irreversible-action decision: %w", err)
+				select {
+				case result := <-reply:
+					decision := "declined"
+					if result.Approved {
+						decision = "approved"
+					}
+					approvalError := ""
+					if result.Err != nil {
+						decision = "error"
+						approvalError = result.Err.Error()
+					}
+					if err := auditSession.Update(func(record *audit.Record) {
+						record.Approvals = append(record.Approvals, audit.Approval{
+							Kind: "postgres", Statement: request.SQL, Reason: request.Reason,
+							Decision: decision, Error: approvalError, Time: time.Now().UTC(),
+						})
+					}); err != nil {
+						return false, fmt.Errorf("record irreversible-action decision: %w", err)
+					}
+					return result.Approved, result.Err
+				case <-approvalContext.Done():
+					return false, approvalContext.Err()
 				}
-				return result.Approved, result.Err
-			case <-approvalContext.Done():
-				return false, approvalContext.Err()
-			}
-		},
-	})
+			},
+		})
+		err = startErr
+		if startErr == nil {
+			proxy = startedProxy
+		}
+	}
 	cancel()
 	if err != nil {
 		auditError = err.Error()
@@ -336,11 +397,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 
-	childEnvironment, err := childenv.Postgres(os.Environ(), proxy.Address(), backendConfig)
-	if err != nil {
-		auditError = err.Error()
-		fmt.Fprintf(stderr, "unring: build child environment: %v\n", err)
-		return internalErrorExitCode
+	childEnvironment := os.Environ()
+	if databaseConfigured {
+		childEnvironment, err = childenv.Postgres(
+			childEnvironment, proxy.Address(), backendConfig,
+		)
+		if err != nil {
+			auditError = err.Error()
+			fmt.Fprintf(stderr, "unring: build child environment: %v\n", err)
+			return internalErrorExitCode
+		}
 	}
 	childEnvironment, err = childenv.HTTPS(
 		childEnvironment, httpsProxy.Address(), authority.CertificatePath,
@@ -356,6 +422,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signalChannel)
 
+	if !databaseConfigured {
+		// Assign the no-op database session only when every startup step has
+		// succeeded and the child is about to run. Earlier failures must retain
+		// the audit record's not_started outcome.
+		proxy = newUnconfiguredPostgresSession()
+	}
 	result := runner.Run(runner.Options{
 		Command:   command,
 		Env:       childEnvironment,
@@ -417,6 +489,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		!httpsSummary.HasReviewableActivity() && !ghSummary.HasReviewableActivity() {
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
+		}
+		if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+			printCoverageOnlyReview(stdout, summary)
+		} else {
+			fmt.Fprintln(stderr, quietSessionDisclosure)
 		}
 		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		ghFinalizeErr := ghSession.Finalize(finalizeContext, false)
@@ -903,6 +980,17 @@ func parseBackendConfig() (*pgconn.Config, error) {
 	return config, nil
 }
 
+func parseOptionalBackendConfig() (*pgconn.Config, bool, error) {
+	if strings.TrimSpace(os.Getenv("DATABASE_URL")) == "" {
+		return nil, false, nil
+	}
+	config, err := parseBackendConfig()
+	if err != nil {
+		return nil, true, err
+	}
+	return config, true, nil
+}
+
 func promptDecision(input io.Reader, output io.Writer) pgproxy.Decision {
 	if !isTerminal(input) {
 		fmt.Fprintln(output, "No interactive terminal; defaulting to discard. Use --commit to commit.")
@@ -1112,27 +1200,33 @@ func printSummaryWithExternal(
 		fmt.Fprintln(output, "Unring cannot guarantee every recorded effect can be undone by discarding.")
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 	}
+	printStructuralBlindSpots(output, defaultReviewWidth)
 	writeChangeSummary(output, summary)
 	fmt.Fprintln(output, "\nSTATEMENTS")
-	fmt.Fprintf(output, "  Connections: %d (one shared backend transaction)\n", summary.Connections)
-	fmt.Fprintf(output, "  Query batches: %d", len(summary.Queries))
-	if failed > 0 {
-		fmt.Fprintf(output, " (%d failed)", failed)
-	}
-	fmt.Fprintln(output)
-
-	for _, query := range summary.Queries {
-		status := "ok"
-		if query.Failed {
-			status = "error"
-		}
-		fmt.Fprintf(output, "  - [%s] %s", status, compactSQL(query.SQL))
-		if len(query.CommandTags) > 0 {
-			fmt.Fprintf(output, " -> %s", strings.Join(query.CommandTags, ", "))
+	if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+		fmt.Fprintln(output,
+			"  PostgreSQL statements were not intercepted and cannot appear in this review.")
+	} else {
+		fmt.Fprintf(output, "  Connections: %d (one shared backend transaction)\n", summary.Connections)
+		fmt.Fprintf(output, "  Query batches: %d", len(summary.Queries))
+		if failed > 0 {
+			fmt.Fprintf(output, " (%d failed)", failed)
 		}
 		fmt.Fprintln(output)
-		if query.Error != "" {
-			fmt.Fprintf(output, "    Error: %s\n", query.Error)
+
+		for _, query := range summary.Queries {
+			status := "ok"
+			if query.Failed {
+				status = "error"
+			}
+			fmt.Fprintf(output, "  - [%s] %s", status, compactSQL(query.SQL))
+			if len(query.CommandTags) > 0 {
+				fmt.Fprintf(output, " -> %s", strings.Join(query.CommandTags, ", "))
+			}
+			fmt.Fprintln(output)
+			if query.Error != "" {
+				fmt.Fprintf(output, "    Error: %s\n", query.Error)
+			}
 		}
 	}
 	if len(summary.NonTransactional) > 0 {
@@ -1325,6 +1419,14 @@ func printUndoDisclosure(output io.Writer, undo *httpsproxy.UndoRecord) {
 }
 
 func writeChangeSummary(output io.Writer, summary pgproxy.Summary) {
+	if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+		fmt.Fprintln(output, "\nDATABASE")
+		fmt.Fprintln(output,
+			"  NOT INTERCEPTED — no database traffic was intercepted because DATABASE_URL was unset or blank.")
+		fmt.Fprintln(output,
+			"  This is a coverage statement, not evidence that the child did not access a database.")
+		return
+	}
 	fmt.Fprintln(output, "\nDATA CHANGES (reported by PostgreSQL for the sealed transaction)")
 	if !summary.Changes.Complete {
 		fmt.Fprintf(output, "  UNKNOWN — the change summary is incomplete: %s\n", summary.Changes.Error)
@@ -1347,6 +1449,54 @@ func writeChangeSummary(output io.Writer, summary pgproxy.Summary) {
 			fmt.Fprintf(output, "  - %s %s %s\n", change.Action, change.Kind, change.Object)
 		}
 	}
+}
+
+func printCoverageOnlyReview(output io.Writer, summary pgproxy.Summary) {
+	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
+	if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+		writeChangeSummary(output, summary)
+	}
+	printStructuralBlindSpots(output, defaultReviewWidth)
+}
+
+func printStructuralBlindSpots(output io.Writer, width int) {
+	fmt.Fprintln(output)
+	writeWrappedLine(output, "STRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE", "", "", width)
+	writeWrappedLine(output, "SSH traffic, including git push over SSH.", "  - ", "    ", width)
+	writeWrappedLine(output, "direct-to-IP and raw-socket connections.", "  - ", "    ", width)
+	writeWrappedLine(output,
+		"Clients that ignore proxy or PATH settings leave no record.", "  - ", "    ", width)
+	writeWrappedLine(output,
+		"Unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS.",
+		"  - ", "    ", width)
+}
+
+func writeWrappedLine(
+	output io.Writer,
+	text string,
+	firstPrefix string,
+	continuationPrefix string,
+	width int,
+) {
+	if width <= 0 {
+		width = defaultReviewWidth
+	}
+	line := firstPrefix
+	for _, word := range strings.Fields(text) {
+		separator := ""
+		if line != firstPrefix {
+			separator = " "
+		}
+		candidate := line + separator + word
+		if line != firstPrefix && ansi.StringWidth(candidate) > width {
+			fmt.Fprintln(output, line)
+			line = continuationPrefix + word
+			firstPrefix = continuationPrefix
+			continue
+		}
+		line = candidate
+	}
+	fmt.Fprintln(output, line)
 }
 
 func affectedRows(tags []string) string {
@@ -1396,6 +1546,10 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "unring holds an agent's PostgreSQL and supported HTTPS side effects for review")
 	fmt.Fprintln(output, "and then applies one decision: commit or discard.")
 	fmt.Fprintln(output)
+	fmt.Fprintln(output, "Primary workflow (one bounded agent task that exits):")
+	fmt.Fprintln(output, "  unring run -- claude -p 'Implement one bounded task, then stop'")
+	fmt.Fprintln(output, "  unring run -- <one-shot-agent-command> [args...]")
+	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  unring run [--commit | --discard] -- <command> [args...]")
 	fmt.Fprintln(output, "  unring log [--json] [session-id]")
@@ -1403,14 +1557,17 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  unring claude|codex|opencode [--] [args...]")
 	fmt.Fprintln(output, "  unring --version")
 	fmt.Fprintln(output)
-	fmt.Fprintln(output, "First run:")
+	fmt.Fprintln(output, "Optional PostgreSQL coverage:")
 	fmt.Fprintln(output, "  export DATABASE_URL='postgresql://user:password@localhost/database'")
-	fmt.Fprintln(output, "  unring run -- psql")
-	fmt.Fprintln(output, "  unring claude")
+	fmt.Fprintln(output, "  unring run -- <one-shot-agent-command>")
 	fmt.Fprintln(output)
-	fmt.Fprintln(output, "PostgreSQL 14 or newer is required. The wrapped child alone receives loopback")
-	fmt.Fprintln(output, "database/proxy settings. Without a terminal, the safe default is discard; use")
-	fmt.Fprintln(output, "--commit or --discard for automation. Run 'unring run --help' for run options.")
+	fmt.Fprintln(output, "DATABASE_URL may be unset; HTTPS, gh, and audit interception still run, while")
+	fmt.Fprintln(output, "the review says PostgreSQL was not intercepted. A nonblank DATABASE_URL must")
+	fmt.Fprintln(output, "parse and reach PostgreSQL 14 or newer or the child will not start.")
+	fmt.Fprintln(output)
+	fmt.Fprintln(output, "Keep database-backed runs bounded: the shared transaction remains open for the")
+	fmt.Fprintln(output, "whole child lifetime, holding locks and delaying cleanup. Without a terminal,")
+	fmt.Fprintln(output, "the safe default is discard; use --commit or --discard for automation.")
 }
 
 func versionString() string {

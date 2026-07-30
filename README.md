@@ -2,6 +2,10 @@
 
 > **Make everything your agent does undoable.**
 
+> **Current scope:** PostgreSQL, GitHub and Slack through HTTPS adapters, and the
+> `gh` CLI through a PATH shim. SSH, direct sockets, other protocols, and other
+> unshimmed CLIs are outside today's interception coverage.
+
 `unring` wraps an AI coding agent and intercepts the side effects it has on the real
 world — database writes and outbound API calls. When the run is over you see exactly
 what it did and what it is about to do, then you decide: **commit** or **discard**.
@@ -32,30 +36,54 @@ that build-time error.
 
 ## First run
 
-Point `DATABASE_URL` at the real database, then wrap an agent or any command:
+Wrap one bounded agent task: a run that does one job and exits so you can review one
+coherent set of effects.
+
+```sh
+unring run -- claude -p 'Implement the requested validation change, run its tests, then stop'
+# Or use any other agent's bounded/non-interactive command:
+unring run -- your-one-shot-agent-command
+```
+
+If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
+database first:
 
 ```sh
 export DATABASE_URL='postgresql://user:password@real-host/database'
-unring claude
-# Or:
-unring run -- psql
+unring run -- your-one-shot-agent-command
 ```
 
-`DATABASE_URL` is required. unring exits with a concrete hint when it is absent,
-when the URL cannot be parsed, when the database cannot be reached, or when the
-server is too old. Run `unring --help` for the command forms and safe
-non-interactive defaults.
+Keep database-backed runs bounded. The shared PostgreSQL transaction remains open for
+the wrapped command's entire lifetime. An open-ended `unring claude` session can
+therefore hold locks for hours, block DDL, prevent autovacuum cleanup, and make
+concurrent clients fail with SQLSTATE `55P03`. One final commit/discard decision also
+applies to the whole run, with no partial commit, so a fifteen-task interactive session
+is the wrong review granularity.
+
+PostgreSQL is optional. Precisely, unring considers it **not configured** when
+`DATABASE_URL` is absent, empty, or contains only whitespace. In that mode it does not
+start the PostgreSQL proxy or inject PostgreSQL connection settings, but HTTPS
+interception, the `gh` shim, and the audit log still run. The review explicitly says
+that no database traffic was intercepted; that statement is not evidence that the
+child did not access a database through inherited `PG*` variables, command arguments,
+a service file, or another client-specific setting.
+
+Any nonblank `DATABASE_URL` means PostgreSQL **is configured**. The URL must parse and
+the database must be reachable, authenticated, and supported or unring exits before
+starting the child. A configured-but-unreachable database is never silently downgraded
+to no-database mode. Run `unring --help` for the command forms and safe non-interactive
+defaults.
 
 PostgreSQL 14 is the minimum supported version. Older servers are rejected at startup
 with an explicit version error before any client traffic is accepted; CI exercises
 the integration suite against PostgreSQL 14 and 17 explicitly.
 
-`unring` opens one real transaction on the configured database and binds both the
+When PostgreSQL is configured, `unring` opens one real transaction and binds both the
 Postgres and HTTPS proxies to ephemeral loopback ports. It injects the connection
 variables into the child process only. Every Postgres client connection opened by that
 child uses the same backend transaction; individual protocol exchanges are serialized
-because PostgreSQL has only one backend connection. Closing one client connection
-does not close the transaction.
+because PostgreSQL has only one backend connection. Closing one client connection does
+not close the transaction.
 
 For network clients, the child receives upper- and lower-case HTTP/HTTPS proxy
 variables, plus `ALL_PROXY` and `FTP_PROXY`. Existing
@@ -106,8 +134,10 @@ approval with the exact ambiguity rather than being guessed. The directory
 and socket are removed when the session ends; no shell profile or persistent `PATH`
 is changed.
 
-After the child exits, `unring` prints the PostgreSQL statements and asks whether to
-commit or discard. Automation must choose explicitly:
+After the child exits, `unring` reviews intercepted effects and, when a decision is
+needed, asks whether to commit or discard. Without a configured database, the review
+instead says plainly that PostgreSQL was not intercepted. Automation must choose
+explicitly when it has reviewable effects:
 
 ```sh
 unring run --commit -- your-command
@@ -135,9 +165,10 @@ Every run creates a structured JSON audit record before the child starts and upd
 it atomically as the session progresses. It includes start and end times, the requested
 decision and confirmed outcome, per-table row changes, schema changes, irreversible
 actions approved or declined, intercepted HTTPS requests, and anything unring saw but
-could not intercept. Signal termination, a recoverable unring panic, and backend loss
-all retain a record; an unknown database outcome is recorded as `unknown`, never as a
-successful discard.
+could not intercept. It also records whether PostgreSQL interception was active or not
+configured and the fixed structural blind-spot disclosure. Signal termination, a
+recoverable unring panic, and backend loss all retain a record; an unknown database
+outcome is recorded as `unknown`, never as a successful discard.
 
 Audit records intentionally contain the child's complete argument vector, full
 PostgreSQL statement text, argument vectors for mutating or ambiguous `gh` calls,
@@ -209,6 +240,12 @@ would create states that are difficult to reason about—for example, committing
 
 ## Honest limits
 
+- Every review includes a short fixed warning for channels that never reach an unring
+  interception point and therefore leave no session record: SSH traffic (including
+  `git push` over SSH), direct-to-IP connections, raw sockets, and clients that ignore
+  proxy or PATH settings. On macOS that includes unshimmed Go CLIs such as `aws`,
+  `docker`, `terraform`, and `kubectl`. The warning is structural, not evidence that
+  any of those channels were used in a particular run.
 - Compensating undo is a documented-limits fallback, not the main guarantee. The
   strongest outcome is a staged call that was discarded and therefore never reached
   its service. For a call that really ran, review says before the decision whether
@@ -252,6 +289,11 @@ would create states that are difficult to reason about—for example, committing
   Unring routes common HTTP/HTTPS/FTP/ALL proxy variables to loopback and clears
   inherited `NO_PROXY` to close accidental exclusions, but it is not a hostile-process
   network sandbox.
+- A configured database keeps one real transaction open for the entire wrapped
+  command. Long-lived interactive sessions can retain locks, block DDL, delay
+  autovacuum cleanup, and cause concurrent unring clients to fail with SQLSTATE
+  `55P03`. Prefer one bounded agent task per unring run; one decision applies to the
+  whole run and partial commit is intentionally unavailable.
 - PostgreSQL `nextval` calls do not roll back, including values consumed by
   identity/serial inserts, so discarded runs can leave ID gaps. The sequence reset
   performed by `TRUNCATE ... RESTART IDENTITY` is a PostgreSQL exception: that reset
