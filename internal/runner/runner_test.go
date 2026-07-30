@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -30,6 +31,41 @@ func TestRunPropagatesExitCode(t *testing.T) {
 	}
 	if result.ExitCode != 37 {
 		t.Fatalf("Run() exit code = %d, want 37", result.ExitCode)
+	}
+}
+
+func TestRunResolvesDirectCommandThroughChildEnvironment(t *testing.T) {
+	parentDirectory := t.TempDir()
+	childDirectory := t.TempDir()
+	commandName := "unring-runner-path-test"
+	parentCommand := filepath.Join(parentDirectory, commandName)
+	childCommand := filepath.Join(childDirectory, commandName)
+	if err := os.WriteFile(parentCommand, []byte("#!/bin/sh\nprintf parent\n"), 0o755); err != nil {
+		t.Fatalf("write parent-PATH command: %v", err)
+	}
+	if err := os.WriteFile(childCommand, []byte("#!/bin/sh\nprintf child\n"), 0o755); err != nil {
+		t.Fatalf("write child-PATH command: %v", err)
+	}
+	t.Setenv("PATH", parentDirectory)
+	environment := append([]string(nil), os.Environ()...)
+	for index, entry := range environment {
+		if strings.HasPrefix(entry, "PATH=") {
+			environment[index] = "PATH=" + childDirectory
+		}
+	}
+
+	var stdout strings.Builder
+	result := Run(Options{
+		Command: []string{commandName},
+		Env:     environment,
+		Stdout:  &stdout,
+		Stderr:  io.Discard,
+	})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run() = %#v", result)
+	}
+	if got := stdout.String(); got != "child" {
+		t.Fatalf("direct command output = %q, want child-PATH executable", got)
 	}
 }
 

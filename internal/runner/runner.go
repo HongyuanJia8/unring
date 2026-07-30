@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -50,7 +52,15 @@ func Run(options Options) Result {
 		return Result{ExitCode: 127, Err: errors.New("run child: empty command")}
 	}
 
-	command := exec.Command(options.Command[0], options.Command[1:]...)
+	commandPath, err := lookPathInEnvironment(options.Command[0], options.Env)
+	if err != nil {
+		return Result{
+			ExitCode: 127,
+			Err:      fmt.Errorf("start child %q: %w", options.Command[0], err),
+		}
+	}
+	command := exec.Command(commandPath, options.Command[1:]...)
+	command.Args[0] = options.Command[0]
 	command.Env = options.Env
 	command.Stdin = options.Stdin
 	command.Stdout = options.Stdout
@@ -210,6 +220,44 @@ func Run(options Options) Result {
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)
 		}
 	}
+}
+
+// lookPathInEnvironment resolves the directly wrapped command through the
+// child's PATH, including per-session shims. exec.Command cannot do this for
+// us because it searches the parent process's PATH before Cmd.Env is assigned.
+func lookPathInEnvironment(command string, environment []string) (string, error) {
+	if strings.ContainsRune(command, os.PathSeparator) {
+		return command, nil
+	}
+	path := ""
+	for _, entry := range environment {
+		key, value, found := strings.Cut(entry, "=")
+		if found && key == "PATH" {
+			path = value
+		}
+	}
+	if environment == nil {
+		path = os.Getenv("PATH")
+	}
+	for _, directory := range filepath.SplitList(path) {
+		if directory == "" {
+			directory = "."
+		}
+		candidate := filepath.Join(directory, command)
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		if filepath.IsAbs(candidate) {
+			return candidate, nil
+		}
+		absolute, err := filepath.Abs(candidate)
+		if err != nil {
+			return "", &exec.Error{Name: command, Err: err}
+		}
+		return absolute, nil
+	}
+	return "", &exec.Error{Name: command, Err: exec.ErrNotFound}
 }
 
 func processWasSignaled(state *os.ProcessState) bool {

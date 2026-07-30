@@ -228,10 +228,6 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
-	if !databaseConfigured {
-		proxy = newUnconfiguredPostgresSession()
-	}
-
 	adapterSet, err := loadAdapters(os.Getenv("UNRING_ADAPTERS"))
 	if err != nil {
 		auditError = err.Error()
@@ -422,6 +418,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signalChannel)
 
+	if !databaseConfigured {
+		// Assign the no-op database session only when every startup step has
+		// succeeded and the child is about to run. Earlier failures must retain
+		// the audit record's not_started outcome.
+		proxy = newUnconfiguredPostgresSession()
+	}
 	result := runner.Run(runner.Options{
 		Command:   command,
 		Env:       childEnvironment,
@@ -484,7 +486,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
-		if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+		if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured ||
+			silentSessionNeedsCoverage(command) {
 			printCoverageOnlyReview(stdout, summary)
 		}
 		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1200,25 +1203,25 @@ func printSummaryWithExternal(
 			"  PostgreSQL statements were not intercepted and cannot appear in this review.")
 	} else {
 		fmt.Fprintf(output, "  Connections: %d (one shared backend transaction)\n", summary.Connections)
-	}
-	fmt.Fprintf(output, "  Query batches: %d", len(summary.Queries))
-	if failed > 0 {
-		fmt.Fprintf(output, " (%d failed)", failed)
-	}
-	fmt.Fprintln(output)
-
-	for _, query := range summary.Queries {
-		status := "ok"
-		if query.Failed {
-			status = "error"
-		}
-		fmt.Fprintf(output, "  - [%s] %s", status, compactSQL(query.SQL))
-		if len(query.CommandTags) > 0 {
-			fmt.Fprintf(output, " -> %s", strings.Join(query.CommandTags, ", "))
+		fmt.Fprintf(output, "  Query batches: %d", len(summary.Queries))
+		if failed > 0 {
+			fmt.Fprintf(output, " (%d failed)", failed)
 		}
 		fmt.Fprintln(output)
-		if query.Error != "" {
-			fmt.Fprintf(output, "    Error: %s\n", query.Error)
+
+		for _, query := range summary.Queries {
+			status := "ok"
+			if query.Failed {
+				status = "error"
+			}
+			fmt.Fprintf(output, "  - [%s] %s", status, compactSQL(query.SQL))
+			if len(query.CommandTags) > 0 {
+				fmt.Fprintf(output, " -> %s", strings.Join(query.CommandTags, ", "))
+			}
+			fmt.Fprintln(output)
+			if query.Error != "" {
+				fmt.Fprintf(output, "    Error: %s\n", query.Error)
+			}
 		}
 	}
 	if len(summary.NonTransactional) > 0 {
@@ -1445,15 +1448,35 @@ func writeChangeSummary(output io.Writer, summary pgproxy.Summary) {
 
 func printCoverageOnlyReview(output io.Writer, summary pgproxy.Summary) {
 	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
-	writeChangeSummary(output, summary)
+	if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+		writeChangeSummary(output, summary)
+	}
 	printStructuralBlindSpots(output)
 }
 
 func printStructuralBlindSpots(output io.Writer) {
 	fmt.Fprintln(output, "\nSTRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE")
-	for _, blindSpot := range audit.StructuralBlindSpots() {
-		fmt.Fprintf(output, "  - %s.\n", blindSpot)
+	fmt.Fprintln(output,
+		"  - SSH traffic, including git push over SSH; direct-to-IP and raw-socket connections.")
+	fmt.Fprintln(output, "  - Clients that ignore proxy or PATH settings leave no record.")
+	fmt.Fprintln(output,
+		"  - Unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS.")
+}
+
+func silentSessionNeedsCoverage(command []string) bool {
+	// Preserve the historical quiet path only for invocations whose command
+	// form itself is inert. Unknown commands, agents, shells, and git all get
+	// the structural disclosure even when intercepted summaries are empty.
+	if len(command) == 1 {
+		cleaned := filepath.Clean(command[0])
+		if cleaned == "/bin/true" || cleaned == "/usr/bin/true" {
+			return false
+		}
 	}
+	if len(command) == 2 && filepath.Base(command[0]) == "gh" && command[1] == "--version" {
+		return false
+	}
+	return true
 }
 
 func affectedRows(tags []string) string {

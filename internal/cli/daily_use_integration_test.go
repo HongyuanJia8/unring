@@ -61,29 +61,119 @@ func TestRunWithoutDatabaseRunsChildPropagatesExitAndRecordsCoverage(t *testing.
 	}
 }
 
-func TestRunWithoutDatabaseStillUsesGHShim(t *testing.T) {
+func TestRunWithoutDatabaseDirectGHMutationIsGatedByShim(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
-	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	runLog := filepath.Join(t.TempDir(), "real-gh-ran")
 	fakeDirectory := t.TempDir()
 	fakeGH := filepath.Join(fakeDirectory, "gh")
 	if err := os.WriteFile(fakeGH, []byte(
-		"#!/bin/sh\nprintf 'database-free-gh-shim:%s\\n' \"$*\"\n",
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \""+runLog+"\"\nprintf 'REAL GH RAN\\n'\n",
 	), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
 	}
 	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--", "gh", "--version")
+	command := exec.Command(
+		binary,
+		"gh",
+		"issue",
+		"create",
+		"--title",
+		"database-free shim regression",
+		"--body",
+		"must be gated",
+	)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
+		t.Fatalf("declined direct gh mutation exit = %v, want nonzero\n%s", err, output)
+	}
+	text := string(output)
+	for _, want := range []string{
+		"gh action needs approval",
+		"No interactive terminal; declining the action",
+		"GH INVOCATIONS — MUTATIONS AND AMBIGUOUS COMMANDS",
+		"[not-run] gh issue create",
+		"NOT INTERCEPTED — no database traffic was intercepted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("database-free direct gh review missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "REAL GH RAN") {
+		t.Fatalf("declined direct gh mutation ran the parent-PATH executable:\n%s", text)
+	}
+	if _, err := os.Stat(runLog); !os.IsNotExist(err) {
+		t.Fatalf("declined direct gh mutation invoked real gh: %v", err)
+	}
+	if strings.Contains(text, "Query batches: 0") {
+		t.Fatalf("database-free review implied zero observed PostgreSQL traffic:\n%s", text)
+	}
+
+	logCommand := exec.Command(binary, "log", "--json")
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("unring log --json failed: %v\n%s", err, logOutput)
+	}
+	logText := string(logOutput)
+	for _, want := range []string{
+		`"arguments": [`,
+		`"issue"`,
+		`"create"`,
+		`"state": "not-run"`,
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("direct gh JSON audit missing %q:\n%s", want, logText)
+		}
+	}
+}
+
+func TestRunWithoutDatabaseStillInterceptsHTTPS(t *testing.T) {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skipf("curl unavailable: %v", err)
+	}
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+
+	binary := buildTestBinary(t)
+	command := exec.Command(
+		binary,
+		"run",
+		"--discard",
+		"--",
+		curl,
+		"--silent",
+		"--show-error",
+		"--max-time",
+		"5",
+		"--request",
+		"POST",
+		"--data",
+		"must-not-be-sent",
+		"https://127.0.0.1:1/unring-no-database",
+	)
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("database-free gh run failed: %v\n%s", err, output)
+		t.Fatalf("database-free HTTPS interception failed: %v\n%s", err, output)
 	}
 	text := string(output)
-	if !strings.Contains(text, "database-free-gh-shim:--version") ||
-		!strings.Contains(text, "NOT INTERCEPTED — no database traffic was intercepted") {
-		t.Fatalf("database-free run did not retain gh interception and coverage review:\n%s", text)
+	for _, want := range []string{
+		"HTTPS action needs approval",
+		"No interactive terminal; declining the action",
+		"HTTPS APPROVALS — NOT SENT",
+		"POST https://127.0.0.1:1/unring-no-database",
+		"NOT INTERCEPTED — no database traffic was intercepted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("database-free HTTPS review missing %q:\n%s", want, text)
+		}
 	}
 }
 
@@ -108,7 +198,7 @@ func TestGitPushOnlyRunGetsStructuralBlindSpotDisclosure(t *testing.T) {
 	for _, want := range []string{
 		"STRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE",
 		"git push over SSH",
-		"direct-to-IP or raw-socket connections",
+		"direct-to-IP and raw-socket connections",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("git push-only run missing %q:\n%s", want, text)
@@ -117,12 +207,18 @@ func TestGitPushOnlyRunGetsStructuralBlindSpotDisclosure(t *testing.T) {
 }
 
 func TestConfiguredSessionReviewAlwaysDisclosesStructuralBlindSpots(t *testing.T) {
-	connectionString, backendDone := startReviewTestBackend(t, true)
+	connectionString, backendDone := startReviewTestBackend(t, false)
 	t.Setenv("DATABASE_URL", connectionString)
 	t.Setenv("UNRING_STATE_DIR", t.TempDir())
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--discard", "--", "true")
+	fakeDirectory := t.TempDir()
+	fakeGit := filepath.Join(fakeDirectory, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	command := exec.Command(binary, "run", "--discard", "--", "git", "push")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -132,7 +228,7 @@ func TestConfiguredSessionReviewAlwaysDisclosesStructuralBlindSpots(t *testing.T
 	for _, want := range []string{
 		"STRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE",
 		"git push over SSH",
-		"unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS",
+		"Unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("configured review missing %q:\n%s", want, text)
@@ -140,6 +236,37 @@ func TestConfiguredSessionReviewAlwaysDisclosesStructuralBlindSpots(t *testing.T
 	}
 	if err := <-backendDone; err != nil {
 		t.Fatalf("fake Postgres backend: %v", err)
+	}
+}
+
+func TestDatabaseFreeStartupFailureRemainsNotStartedInAudit(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	t.Setenv("UNRING_ADAPTERS", filepath.Join(t.TempDir(), "does-not-exist.yaml"))
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--", "/bin/echo", "must-not-run")
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != internalErrorExitCode {
+		t.Fatalf("startup failure exit = %v, want %d\n%s", err, internalErrorExitCode, output)
+	}
+	if strings.Contains(string(output), "must-not-run\n") {
+		t.Fatalf("startup failure launched child:\n%s", output)
+	}
+
+	logCommand := exec.Command(binary, "log", "--json")
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("unring log --json failed: %v\n%s", err, logOutput)
+	}
+	logText := string(logOutput)
+	if !strings.Contains(logText, `"outcome": "not_started"`) ||
+		strings.Contains(logText, `"outcome": "discarded"`) {
+		t.Fatalf("pre-child database-free failure has false audit outcome:\n%s", logText)
 	}
 }
 

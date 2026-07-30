@@ -261,7 +261,14 @@ func (model *reviewModel) adjustOffset() {
 }
 
 func (model reviewModel) pageSize() int {
-	size := model.height - 14
+	overhead := 20
+	if model.hasIrreversibilityWarning() {
+		overhead += 5
+	}
+	if model.uninterceptedCount() > 0 {
+		overhead += 5
+	}
+	size := model.height - overhead
 	if size < 4 {
 		return 4
 	}
@@ -276,14 +283,13 @@ func (model reviewModel) View() string {
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
 	printStructuralBlindSpots(&output)
-	if !model.summary.FullyReversible || model.https.HasForwardedEffects() ||
-		ghMayHaveExternalEffect(model.gh) {
+	if model.hasIrreversibilityWarning() {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
 		output.WriteString("Unring cannot guarantee every recorded effect can be undone by discarding.\n")
 		output.WriteString("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 	}
-	uninterceptedCount := len(model.summary.Unintercepted) + len(model.https.Unintercepted)
+	uninterceptedCount := model.uninterceptedCount()
 	if uninterceptedCount > 0 {
 		output.WriteString("\n================================================================\n")
 		fmt.Fprintf(&output, "!!! INTERCEPTION/COVERAGE WARNING: %d UNCLASSIFIED ITEM(S) !!!\n",
@@ -353,12 +359,55 @@ func (model reviewModel) View() string {
 	if end < len(model.items) {
 		fmt.Fprintf(&output, "... %d review items below ...\n", len(model.items)-end)
 	}
+	decisionLine := "\nUp/down: select  Enter/space: expand  c: commit  d: discard\n"
 	if model.decided {
-		fmt.Fprintf(&output, "\nDecision: %s\n", model.decision)
-		return output.String()
+		decisionLine = fmt.Sprintf("\nDecision: %s\n", model.decision)
 	}
-	output.WriteString("\nUp/down: select  Enter/space: expand  c: commit  d: discard\n")
-	return output.String()
+	view := output.String() + decisionLine
+	if renderedLineCount(view) > model.height {
+		return model.compactOverflowView(output.String(), decisionLine)
+	}
+	return view
+}
+
+func (model reviewModel) compactOverflowView(body, decisionLine string) string {
+	var header strings.Builder
+	header.WriteString("UNRING SESSION REVIEW — one decision; partial commit is unavailable.\n")
+	if model.hasIrreversibilityWarning() {
+		header.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
+	}
+	if count := model.uninterceptedCount(); count > 0 {
+		fmt.Fprintf(&header,
+			"!!! INTERCEPTION/COVERAGE WARNING: %d UNCLASSIFIED ITEM(S) !!!\n", count)
+	}
+	header.WriteString("STRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE: " +
+		"SSH/git push over SSH; direct-to-IP and raw sockets.\n")
+	header.WriteString("Proxy/PATH-bypassing clients leave no record; " +
+		"unshimmed macOS Go CLIs: aws, docker, terraform, and kubectl.\n")
+
+	decisionLine = strings.TrimSpace(decisionLine) + "\n"
+	bodyLines := strings.Split(strings.TrimSpace(body), "\n")
+	for len(bodyLines) > 0 {
+		candidate := header.String() + "\n" + strings.Join(bodyLines, "\n") + decisionLine
+		if renderedLineCount(candidate) <= model.height {
+			return candidate
+		}
+		bodyLines = bodyLines[1:]
+	}
+	return header.String() + decisionLine
+}
+
+func (model reviewModel) hasIrreversibilityWarning() bool {
+	return !model.summary.FullyReversible || model.https.HasForwardedEffects() ||
+		ghMayHaveExternalEffect(model.gh)
+}
+
+func (model reviewModel) uninterceptedCount() int {
+	return len(model.summary.Unintercepted) + len(model.https.Unintercepted)
+}
+
+func renderedLineCount(view string) int {
+	return len(strings.Split(view, "\n"))
 }
 
 func reviewDecisionWithSignal(
