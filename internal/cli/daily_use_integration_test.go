@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -206,7 +207,7 @@ func TestGitPushOnlyRunGetsStructuralBlindSpotDisclosure(t *testing.T) {
 	}
 }
 
-func TestConfiguredSessionReviewAlwaysDisclosesStructuralBlindSpots(t *testing.T) {
+func TestConfiguredQuietSessionPrintsOnlyDisclosure(t *testing.T) {
 	connectionString, backendDone := startReviewTestBackend(t, false)
 	t.Setenv("DATABASE_URL", connectionString)
 	t.Setenv("UNRING_STATE_DIR", t.TempDir())
@@ -220,18 +221,23 @@ func TestConfiguredSessionReviewAlwaysDisclosesStructuralBlindSpots(t *testing.T
 	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 	command := exec.Command(binary, "run", "--discard", "--", "git", "push")
 	command.Env = os.Environ()
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("configured review run failed: %v\n%s", err, output)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("configured quiet run failed: %v\nstdout: %s\nstderr: %s",
+			err, stdout.String(), stderr.String())
 	}
-	text := string(output)
-	for _, want := range []string{
-		"STRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE",
-		"git push over SSH",
-		"Unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("configured review missing %q:\n%s", want, text)
+	if got := stdout.String(); got != "" {
+		t.Fatalf("configured quiet run wrote stdout: %q", got)
+	}
+	if got, want := stderr.String(), quietSessionDisclosure+"\n"; got != want {
+		t.Fatalf("configured quiet stderr = %q, want %q", got, want)
+	}
+	for _, unwanted := range []string{"UNRING SESSION REVIEW", "Commit or discard?", "Up/down:"} {
+		if strings.Contains(stderr.String(), unwanted) {
+			t.Fatalf("configured quiet disclosure included %q: %q", unwanted, stderr.String())
 		}
 	}
 	if err := <-backendDone; err != nil {

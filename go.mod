@@ -4,6 +4,7 @@ go 1.26
 
 require (
 	github.com/charmbracelet/bubbletea v0.26.6
+	github.com/charmbracelet/x/ansi v0.10.1
 	github.com/creack/pty v1.1.24
 	github.com/google/cel-go v0.26.1
 	github.com/jackc/pgx/v5 v5.7.6
@@ -17,7 +18,6 @@ require (
 require (
 	cel.dev/expr v0.24.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
-	github.com/charmbracelet/x/ansi v0.10.1 // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

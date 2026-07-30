@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Options controls one child process.
@@ -230,13 +232,15 @@ func lookPathInEnvironment(command string, environment []string) (string, error)
 		return command, nil
 	}
 	path := ""
+	pathSet := false
 	for _, entry := range environment {
 		key, value, found := strings.Cut(entry, "=")
 		if found && key == "PATH" {
 			path = value
+			pathSet = true
 		}
 	}
-	if environment == nil {
+	if !pathSet {
 		path = os.Getenv("PATH")
 	}
 	for _, directory := range filepath.SplitList(path) {
@@ -244,8 +248,7 @@ func lookPathInEnvironment(command string, environment []string) (string, error)
 			directory = "."
 		}
 		candidate := filepath.Join(directory, command)
-		info, err := os.Stat(candidate)
-		if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		if !executableByCurrentUser(candidate) {
 			continue
 		}
 		if filepath.IsAbs(candidate) {
@@ -258,6 +261,21 @@ func lookPathInEnvironment(command string, environment []string) (string, error)
 		return absolute, nil
 	}
 	return "", &exec.Error{Name: command, Err: exec.ErrNotFound}
+}
+
+func executableByCurrentUser(candidate string) bool {
+	info, err := os.Stat(candidate)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	err = unix.Faccessat(unix.AT_FDCWD, candidate, unix.X_OK, unix.AT_EACCESS)
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, syscall.ENOSYS) && !errors.Is(err, syscall.EPERM) {
+		return false
+	}
+	return info.Mode().Perm()&0o111 != 0
 }
 
 func processWasSignaled(state *os.ProcessState) bool {

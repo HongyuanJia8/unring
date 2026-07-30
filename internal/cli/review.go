@@ -34,6 +34,7 @@ type reviewModel struct {
 	expanded map[int]bool
 	cursor   int
 	offset   int
+	width    int
 	height   int
 	decision pgproxy.Decision
 	decided  bool
@@ -54,7 +55,7 @@ func newReviewModelWithExternal(
 ) reviewModel {
 	model := reviewModel{
 		summary: summary, https: httpsSummary, gh: ghSummary,
-		expanded: make(map[int]bool), height: 24,
+		expanded: make(map[int]bool), width: defaultReviewWidth, height: 24,
 		decision: pgproxy.DecisionRollback,
 	}
 	for _, item := range summary.Unintercepted {
@@ -213,6 +214,7 @@ func (model reviewModel) Init() tea.Cmd { return nil }
 
 func (model reviewModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	if size, ok := message.(tea.WindowSizeMsg); ok {
+		model.width = size.Width
 		model.height = size.Height
 		model.adjustOffset()
 		return model, nil
@@ -282,7 +284,7 @@ func (model reviewModel) View() string {
 	var output strings.Builder
 	output.WriteString("UNRING SESSION REVIEW\n")
 	output.WriteString("One decision applies to the whole session; partial commit is not available.\n")
-	printStructuralBlindSpots(&output)
+	printStructuralBlindSpots(&output, model.width)
 	if model.hasIrreversibilityWarning() {
 		output.WriteString("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 		output.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
@@ -372,7 +374,9 @@ func (model reviewModel) View() string {
 
 func (model reviewModel) compactOverflowView(body, decisionLine string) string {
 	var header strings.Builder
-	header.WriteString("UNRING SESSION REVIEW — one decision; partial commit is unavailable.\n")
+	writeWrappedLine(&header,
+		"UNRING SESSION REVIEW — one decision; partial commit is unavailable.",
+		"", "", model.width)
 	if model.hasIrreversibilityWarning() {
 		header.WriteString("WARNING: THIS SESSION IS NOT FULLY REVERSIBLE\n")
 	}
@@ -380,21 +384,19 @@ func (model reviewModel) compactOverflowView(body, decisionLine string) string {
 		fmt.Fprintf(&header,
 			"!!! INTERCEPTION/COVERAGE WARNING: %d UNCLASSIFIED ITEM(S) !!!\n", count)
 	}
-	header.WriteString("STRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE: " +
-		"SSH/git push over SSH; direct-to-IP and raw sockets.\n")
-	header.WriteString("Proxy/PATH-bypassing clients leave no record; " +
-		"unshimmed macOS Go CLIs: aws, docker, terraform, and kubectl.\n")
+	printStructuralBlindSpots(&header, model.width)
 
-	decisionLine = strings.TrimSpace(decisionLine) + "\n"
+	decisionLine = strings.TrimSpace(decisionLine)
 	bodyLines := strings.Split(strings.TrimSpace(body), "\n")
 	for len(bodyLines) > 0 {
-		candidate := header.String() + "\n" + strings.Join(bodyLines, "\n") + decisionLine
+		candidate := header.String() + "\n" + strings.Join(bodyLines, "\n") +
+			"\n" + decisionLine + "\n"
 		if renderedLineCount(candidate) <= model.height {
 			return candidate
 		}
 		bodyLines = bodyLines[1:]
 	}
-	return header.String() + decisionLine
+	return header.String() + decisionLine + "\n"
 }
 
 func (model reviewModel) hasIrreversibilityWarning() bool {

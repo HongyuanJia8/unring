@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hyj28/unring/internal/adapter"
 	"github.com/hyj28/unring/internal/audit"
 	"github.com/hyj28/unring/internal/childenv"
@@ -35,6 +36,9 @@ import (
 const (
 	internalErrorExitCode = 1
 	usageExitCode         = 2
+	defaultReviewWidth    = 80
+
+	quietSessionDisclosure = "unring: nothing intercepted. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
 )
 
 type postgresSession interface {
@@ -486,9 +490,10 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
-		if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured ||
-			silentSessionNeedsCoverage(command) {
+		if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
 			printCoverageOnlyReview(stdout, summary)
+		} else {
+			fmt.Fprintln(stderr, quietSessionDisclosure)
 		}
 		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		ghFinalizeErr := ghSession.Finalize(finalizeContext, false)
@@ -1195,7 +1200,7 @@ func printSummaryWithExternal(
 		fmt.Fprintln(output, "Unring cannot guarantee every recorded effect can be undone by discarding.")
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 	}
-	printStructuralBlindSpots(output)
+	printStructuralBlindSpots(output, defaultReviewWidth)
 	writeChangeSummary(output, summary)
 	fmt.Fprintln(output, "\nSTATEMENTS")
 	if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
@@ -1451,32 +1456,47 @@ func printCoverageOnlyReview(output io.Writer, summary pgproxy.Summary) {
 	if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
 		writeChangeSummary(output, summary)
 	}
-	printStructuralBlindSpots(output)
+	printStructuralBlindSpots(output, defaultReviewWidth)
 }
 
-func printStructuralBlindSpots(output io.Writer) {
-	fmt.Fprintln(output, "\nSTRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE")
-	fmt.Fprintln(output,
-		"  - SSH traffic, including git push over SSH; direct-to-IP and raw-socket connections.")
-	fmt.Fprintln(output, "  - Clients that ignore proxy or PATH settings leave no record.")
-	fmt.Fprintln(output,
-		"  - Unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS.")
+func printStructuralBlindSpots(output io.Writer, width int) {
+	fmt.Fprintln(output)
+	writeWrappedLine(output, "STRUCTURAL BLIND SPOTS — NO RECORD IS POSSIBLE", "", "", width)
+	writeWrappedLine(output, "SSH traffic, including git push over SSH.", "  - ", "    ", width)
+	writeWrappedLine(output, "direct-to-IP and raw-socket connections.", "  - ", "    ", width)
+	writeWrappedLine(output,
+		"Clients that ignore proxy or PATH settings leave no record.", "  - ", "    ", width)
+	writeWrappedLine(output,
+		"Unshimmed Go CLIs such as aws, docker, terraform, and kubectl on macOS.",
+		"  - ", "    ", width)
 }
 
-func silentSessionNeedsCoverage(command []string) bool {
-	// Preserve the historical quiet path only for invocations whose command
-	// form itself is inert. Unknown commands, agents, shells, and git all get
-	// the structural disclosure even when intercepted summaries are empty.
-	if len(command) == 1 {
-		cleaned := filepath.Clean(command[0])
-		if cleaned == "/bin/true" || cleaned == "/usr/bin/true" {
-			return false
+func writeWrappedLine(
+	output io.Writer,
+	text string,
+	firstPrefix string,
+	continuationPrefix string,
+	width int,
+) {
+	if width <= 0 {
+		width = defaultReviewWidth
+	}
+	line := firstPrefix
+	for _, word := range strings.Fields(text) {
+		separator := ""
+		if line != firstPrefix {
+			separator = " "
 		}
+		candidate := line + separator + word
+		if line != firstPrefix && ansi.StringWidth(candidate) > width {
+			fmt.Fprintln(output, line)
+			line = continuationPrefix + word
+			firstPrefix = continuationPrefix
+			continue
+		}
+		line = candidate
 	}
-	if len(command) == 2 && filepath.Base(command[0]) == "gh" && command[1] == "--version" {
-		return false
-	}
-	return true
+	fmt.Fprintln(output, line)
 }
 
 func affectedRows(tags []string) string {

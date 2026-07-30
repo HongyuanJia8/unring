@@ -69,6 +69,63 @@ func TestRunResolvesDirectCommandThroughChildEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunSkipsPathCandidateCurrentUserCannotExecute(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can execute a file when any execute bit is set")
+	}
+	firstDirectory := t.TempDir()
+	secondDirectory := t.TempDir()
+	commandName := "unring-runner-access-test"
+	firstCommand := filepath.Join(firstDirectory, commandName)
+	secondCommand := filepath.Join(secondDirectory, commandName)
+	if err := os.WriteFile(firstCommand, []byte("#!/bin/sh\nprintf first\n"), 0o010); err != nil {
+		t.Fatalf("write inaccessible PATH command: %v", err)
+	}
+	if err := os.WriteFile(secondCommand, []byte("#!/bin/sh\nprintf second\n"), 0o755); err != nil {
+		t.Fatalf("write executable PATH command: %v", err)
+	}
+
+	var stdout strings.Builder
+	result := Run(Options{
+		Command: []string{commandName},
+		Env: []string{
+			"PATH=" + firstDirectory + string(os.PathListSeparator) + secondDirectory,
+		},
+		Stdout: &stdout,
+		Stderr: io.Discard,
+	})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run() = %#v", result)
+	}
+	if got := stdout.String(); got != "second" {
+		t.Fatalf("direct command output = %q, want accessible PATH executable", got)
+	}
+}
+
+func TestRunUsesParentPathWhenChildEnvironmentOmitsPath(t *testing.T) {
+	parentDirectory := t.TempDir()
+	commandName := "unring-runner-parent-path-fallback-test"
+	parentCommand := filepath.Join(parentDirectory, commandName)
+	if err := os.WriteFile(parentCommand, []byte("#!/bin/sh\nprintf parent\n"), 0o755); err != nil {
+		t.Fatalf("write parent-PATH command: %v", err)
+	}
+	t.Setenv("PATH", parentDirectory)
+
+	var stdout strings.Builder
+	result := Run(Options{
+		Command: []string{commandName},
+		Env:     []string{"UNRING_RUNNER_TEST=1"},
+		Stdout:  &stdout,
+		Stderr:  io.Discard,
+	})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run() = %#v", result)
+	}
+	if got := stdout.String(); got != "parent" {
+		t.Fatalf("direct command output = %q, want parent-PATH executable", got)
+	}
+}
+
 func TestRunForwardsSignalToChildProcessGroup(t *testing.T) {
 	t.Parallel()
 
