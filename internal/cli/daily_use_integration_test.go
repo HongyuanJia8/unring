@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -307,6 +308,34 @@ func TestControlPlaneOnlyCLIReviewIsVisible(t *testing.T) {
 				if !strings.Contains(string(logOutput), want) {
 					t.Fatalf("control-plane JSON audit missing %q:\n%s", want, logOutput)
 				}
+			}
+
+			var records []struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(logOutput, &records); err != nil {
+				t.Fatalf("decode unring log --json: %v\n%s", err, logOutput)
+			}
+			if len(records) != 1 || records[0].ID == "" {
+				t.Fatalf("control-plane audit records = %#v, want one identified record", records)
+			}
+			auditCommand := exec.Command(binary, "log", records[0].ID)
+			auditCommand.Env = os.Environ()
+			auditOutput, err := auditCommand.CombinedOutput()
+			if err != nil {
+				t.Fatalf("unring log %s: %v\n%s", records[0].ID, err, auditOutput)
+			}
+			auditText := string(auditOutput)
+			for _, want := range []string{
+				"No commit/discard decision was needed; only observed HTTPS traffic is shown.",
+				"AGENT CONTROL PLANE — FORWARDED WITHOUT GATING",
+			} {
+				if !strings.Contains(auditText, want) {
+					t.Fatalf("control-plane audit replay missing %q:\n%s", want, auditText)
+				}
+			}
+			if strings.Contains(auditText, "One decision applies") {
+				t.Fatalf("control-plane audit replay manufactured a decision:\n%s", auditText)
 			}
 		})
 	}

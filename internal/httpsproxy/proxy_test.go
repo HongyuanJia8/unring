@@ -239,6 +239,28 @@ func TestForwardingErrorNamesTypedCauseWithoutInspectingURLText(t *testing.T) {
 			wantPrefix: "TLS failure during upstream request:",
 		},
 		{
+			name: "peer TLS alert wrapped by network and URL errors",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "https://api.vendor.example/v1/status",
+				Err: &net.OpError{
+					Op:  "remote error",
+					Net: "tcp",
+					Err: errors.New("tls: handshake failure"),
+				},
+			},
+			wantPrefix: "TLS failure during upstream request:",
+		},
+		{
+			name: "TLS protocol negotiation failure",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "https://api.vendor.example/v1/status",
+				Err: errors.New("tls: server selected unsupported protocol version"),
+			},
+			wantPrefix: "TLS failure during upstream request:",
+		},
+		{
 			name: "DNS failure whose URL contains mtls",
 			err: &url.Error{
 				Op:  "Get",

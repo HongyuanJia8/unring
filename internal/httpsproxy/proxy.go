@@ -1103,7 +1103,32 @@ func isTLSFailure(err error) bool {
 		errors.As(err, &invalidCertificate) ||
 		errors.As(err, &systemRoots) ||
 		errors.As(err, &insecureAlgorithm) ||
-		errors.As(err, &constraintViolation)
+		errors.As(err, &constraintViolation) ||
+		hasTLSLeafError(err)
+}
+
+// hasTLSLeafError recognizes crypto/tls errors whose concrete types are not
+// exported, including peer alerts, plus negotiation errors returned as plain
+// errors. It deliberately inspects only leaves: wrapper messages such as
+// url.Error include the request URL and must not influence classification.
+func hasTLSLeafError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if hasTLSLeafError(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if child := wrapped.Unwrap(); child != nil {
+			return hasTLSLeafError(child)
+		}
+	}
+	return strings.HasPrefix(err.Error(), "tls: ")
 }
 
 func writeProxyResponse(

@@ -490,7 +490,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
-		if len(httpsSummary.Requests) > 0 {
+		if hasOnlyObservedHTTPSActivity(summary, httpsSummary, ghSummary) {
 			// Safe reads and enumerated agent control-plane calls do not need a
 			// commit decision, but they were intercepted and must remain visible.
 			printObservedSummaryWithExternal(stdout, summary, httpsSummary, ghSummary)
@@ -961,7 +961,11 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	if record.Error != "" {
 		fmt.Fprintf(output, "Error: %s\n", record.Error)
 	}
-	printSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
+	if hasOnlyObservedHTTPSActivity(record.Postgres, record.HTTPS, record.GH) {
+		printObservedSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
+	} else {
+		printSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
+	}
 	if len(record.Approvals) > 0 {
 		fmt.Fprintln(output, "\nIRREVERSIBLE ACTION DECISIONS")
 		for _, approval := range record.Approvals {
@@ -1216,6 +1220,17 @@ func printObservedSummaryWithExternal(
 	ghSummary ghshim.Summary,
 ) {
 	printSummaryWithExternalDecision(output, summary, httpsSummary, ghSummary, false)
+}
+
+func hasOnlyObservedHTTPSActivity(
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+) bool {
+	return len(httpsSummary.Requests) > 0 &&
+		!summary.HasReviewableActivity() &&
+		!httpsSummary.HasReviewableActivity() &&
+		!ghSummary.HasReviewableActivity()
 }
 
 func printSummaryWithExternalDecision(
