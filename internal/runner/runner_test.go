@@ -507,6 +507,7 @@ func TestApprovalOwnsTTYAndRestoresRawChild(t *testing.T) {
 		t.Fatalf("approval helper failed: %v\n%s", err, output.String())
 	}
 	if !strings.Contains(output.String(), "raw-child-read:z") ||
+		!strings.Contains(output.String(), "approval-terminal-cooked") ||
 		strings.Contains(output.String(), "raw-child-read:x") ||
 		strings.Contains(output.String(), "raw-child-read:y") {
 		t.Fatalf("approval and child did not receive isolated input:\n%s", output.String())
@@ -546,6 +547,20 @@ func TestRunInteractiveChildHelper(t *testing.T) {
 			reply := make(chan ApprovalResult, 1)
 			approvals <- ApprovalRequest{
 				Decide: func() (bool, error) {
+					stty := exec.Command("stty", "-a")
+					stty.Stdin = os.Stdin
+					terminalState, err := stty.CombinedOutput()
+					if err != nil {
+						return false, fmt.Errorf("inspect approval terminal state: %w: %s", err, terminalState)
+					}
+					fields := strings.Fields(string(terminalState))
+					for _, field := range fields {
+						field = strings.Trim(field, ";")
+						if field == "-icanon" || field == "-echo" {
+							return false, fmt.Errorf("approval terminal remained raw: %s", terminalState)
+						}
+					}
+					fmt.Println("approval-terminal-cooked")
 					fmt.Println("approval-prompt")
 					line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 					approved := strings.TrimSpace(line) == "y"

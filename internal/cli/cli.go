@@ -490,7 +490,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
-		if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+		if len(httpsSummary.Requests) > 0 {
+			// Safe reads and enumerated agent control-plane calls do not need a
+			// commit decision, but they were intercepted and must remain visible.
+			printObservedSummaryWithExternal(stdout, summary, httpsSummary, ghSummary)
+		} else if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
 			printCoverageOnlyReview(stdout, summary)
 		} else {
 			fmt.Fprintln(stderr, quietSessionDisclosure)
@@ -1202,6 +1206,25 @@ func printSummaryWithExternal(
 	httpsSummary httpsproxy.Summary,
 	ghSummary ghshim.Summary,
 ) {
+	printSummaryWithExternalDecision(output, summary, httpsSummary, ghSummary, true)
+}
+
+func printObservedSummaryWithExternal(
+	output io.Writer,
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+) {
+	printSummaryWithExternalDecision(output, summary, httpsSummary, ghSummary, false)
+}
+
+func printSummaryWithExternalDecision(
+	output io.Writer,
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+	decisionRequired bool,
+) {
 	failed := 0
 	for _, query := range summary.Queries {
 		if query.Failed {
@@ -1210,9 +1233,14 @@ func printSummaryWithExternal(
 	}
 
 	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
-	fmt.Fprintln(output, "One decision applies to the whole session; partial commit is not available.")
-	fmt.Fprintln(output,
-		"Keeping database changes while withholding a related external action could commit inconsistent state—for example, notified_at set when its mail was never sent.")
+	if decisionRequired {
+		fmt.Fprintln(output, "One decision applies to the whole session; partial commit is not available.")
+		fmt.Fprintln(output,
+			"Keeping database changes while withholding a related external action could commit inconsistent state—for example, notified_at set when its mail was never sent.")
+	} else {
+		fmt.Fprintln(output,
+			"No commit/discard decision was needed; only observed HTTPS traffic is shown.")
+	}
 	if !summary.FullyReversible || httpsSummary.HasForwardedEffects() || ghMayHaveExternalEffect(ghSummary) {
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		fmt.Fprintln(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE")
@@ -1389,7 +1417,10 @@ func printForwardedHTTPSRequests(
 		if request.Error != "" {
 			fmt.Fprintf(output, "    Error: %s\n", request.Error)
 		}
-		printUndoDisclosure(output, request.Undo)
+		if request.Disposition != httpsproxy.RequestDispositionSafeRead &&
+			request.Disposition != httpsproxy.RequestDispositionControlPlane {
+			printUndoDisclosure(output, request.Undo)
+		}
 	}
 }
 

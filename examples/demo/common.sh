@@ -21,7 +21,7 @@ DATABASE_URL="postgresql:///unring_demo?host=$DEMO_RUNTIME&port=$DEMO_DB_PORT&us
 UNRING_STATE_DIR="$DEMO_RUNTIME/unring-state"
 UNRING_ADAPTERS="$DEMO_DIR/adapter.yaml"
 SSL_CERT_FILE="$DEMO_RUNTIME/fake-ca.pem"
-GOCACHE="$REPO_DIR/.cache/go-build"
+GOCACHE="$DEMO_RUNTIME/go-build-cache"
 LC_ALL=C
 LANG=C
 

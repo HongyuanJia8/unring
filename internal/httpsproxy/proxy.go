@@ -133,7 +133,8 @@ func (summary Summary) HasReviewableActivity() bool {
 
 // HasForwardedEffects reports whether a forwarded HTTPS request may have
 // changed external state. Safe reads and enumerated agent control-plane calls
-// remain in the audit without manufacturing a review or reversibility warning.
+// do not manufacture a final decision or reversibility warning; callers still
+// display them as observed traffic.
 func (summary Summary) HasForwardedEffects() bool {
 	for _, request := range summary.Requests {
 		if request.Disposition != RequestDispositionSafeRead &&
@@ -795,12 +796,14 @@ func (proxy *Proxy) forward(
 	request.ContentLength = int64(len(body))
 
 	classification := adapter.Classification{}
+	disposition := ""
 	matched := false
 	if proxy.controlPlane != nil && proxy.controlPlane(request) {
 		classification = adapter.Classification{
 			Tier: adapter.TierAlreadyIrreversible,
 			Rule: RequestDispositionControlPlane,
 		}
+		disposition = RequestDispositionControlPlane
 		matched = true
 	}
 	if !matched {
@@ -818,6 +821,7 @@ func (proxy *Proxy) forward(
 		classification = adapter.Classification{
 			Tier: adapter.TierAlreadyIrreversible, Rule: "safe-http-method",
 		}
+		disposition = RequestDispositionSafeRead
 		matched = true
 	}
 	if !matched {
@@ -832,7 +836,9 @@ func (proxy *Proxy) forward(
 			client, clientReader, request, body, hostport, classification,
 		)
 	case adapter.TierAlreadyIrreversible:
-		return proxy.forwardActual(client, clientReader, request, body, classification)
+		return proxy.forwardActual(
+			client, clientReader, request, body, classification, disposition,
+		)
 	default:
 		err := fmt.Errorf("classification returned unsupported tier %q", classification.Tier)
 		proxy.recordUnintercepted(hostport, err.Error()+"; request was blocked")
@@ -982,7 +988,9 @@ func (proxy *Proxy) requestApproval(
 		}, `{"error":"unring approval declined","sent":false}`)
 		return request.Close, err
 	}
-	return proxy.forwardActual(client, clientReader, request, body, classification)
+	return proxy.forwardActual(
+		client, clientReader, request, body, classification, RequestDispositionApproved,
+	)
 }
 
 func (proxy *Proxy) forwardActual(
@@ -991,12 +999,13 @@ func (proxy *Proxy) forwardActual(
 	request *http.Request,
 	requestBody []byte,
 	classification adapter.Classification,
+	disposition string,
 ) (bool, error) {
 	started := time.Now().UTC()
 	record := RequestRecord{
 		Method: request.Method, URL: request.URL.String(),
 		Tier: classification.Tier, Adapter: classification.Adapter,
-		Rule: classification.Rule, Disposition: forwardedDisposition(classification),
+		Rule: classification.Rule, Disposition: disposition,
 		StartedAt: started,
 	}
 	undoInput := adapter.Request{
@@ -1040,23 +1049,6 @@ func (proxy *Proxy) forwardActual(
 		request.Close = true
 	}
 	record.StatusCode = response.StatusCode
-	if record.Disposition == RequestDispositionSafeRead &&
-		(response.ContentLength < 0 || response.ContentLength <= maximumClassifiedBody) &&
-		!strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
-		buffered, bufferErr := bufferBoundedResponse(response)
-		if bufferErr != nil {
-			record.Error = forwardingError("upstream response body", bufferErr)
-			record.EndedAt = time.Now().UTC()
-			proxy.recordRequest(record)
-			_, _ = io.WriteString(client,
-				"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-			return true, bufferErr
-		}
-		if buffered {
-			response.Header.Del("Content-Length")
-			response.TransferEncoding = nil
-		}
-	}
 	removeHopByHopHeaders(response.Header)
 	closeClient := prepareClientResponse(response, request)
 	var capture boundedCapture
@@ -1080,60 +1072,38 @@ func (proxy *Proxy) forwardActual(
 	return closeClient, nil
 }
 
-// bufferBoundedResponse gives small safe reads an exact HTTP/1.1 Content-Length.
-// That keeps startup/configuration responses off the streaming framing path,
-// including decoded upstream responses with no usable length. Larger responses
-// keep streaming.
-func bufferBoundedResponse(response *http.Response) (bool, error) {
-	limited := &io.LimitedReader{R: response.Body, N: maximumClassifiedBody + 1}
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		return false, err
-	}
-	if int64(len(body)) > maximumClassifiedBody {
-		response.Body = &continuingReadCloser{
-			Reader: io.MultiReader(bytes.NewReader(body), response.Body),
-			Closer: response.Body,
-		}
-		return false, nil
-	}
-	if err := response.Body.Close(); err != nil {
-		return false, err
-	}
-	response.Body = io.NopCloser(bytes.NewReader(body))
-	response.ContentLength = int64(len(body))
-	return true, nil
-}
-
-type continuingReadCloser struct {
-	io.Reader
-	io.Closer
-}
-
 func forwardingError(phase string, err error) string {
 	var networkError net.Error
+	var dnsError *net.DNSError
 	switch {
 	case errors.As(err, &networkError) && networkError.Timeout():
 		return "timeout during " + phase + ": " + err.Error()
-	case strings.Contains(strings.ToLower(err.Error()), "tls") ||
-		strings.Contains(strings.ToLower(err.Error()), "x509"):
+	case errors.As(err, &dnsError):
+		return "DNS failure during " + phase + ": " + err.Error()
+	case isTLSFailure(err):
 		return "TLS failure during " + phase + ": " + err.Error()
 	default:
 		return phase + " failed: " + err.Error()
 	}
 }
 
-func forwardedDisposition(classification adapter.Classification) string {
-	switch classification.Rule {
-	case "safe-http-method":
-		return RequestDispositionSafeRead
-	case RequestDispositionControlPlane:
-		return RequestDispositionControlPlane
-	}
-	if classification.Tier == adapter.TierNeedsApproval {
-		return RequestDispositionApproved
-	}
-	return ""
+func isTLSFailure(err error) bool {
+	var recordHeader tls.RecordHeaderError
+	var verification *tls.CertificateVerificationError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalidCertificate x509.CertificateInvalidError
+	var systemRoots x509.SystemRootsError
+	var insecureAlgorithm x509.InsecureAlgorithmError
+	var constraintViolation x509.ConstraintViolationError
+	return errors.As(err, &recordHeader) ||
+		errors.As(err, &verification) ||
+		errors.As(err, &unknownAuthority) ||
+		errors.As(err, &hostname) ||
+		errors.As(err, &invalidCertificate) ||
+		errors.As(err, &systemRoots) ||
+		errors.As(err, &insecureAlgorithm) ||
+		errors.As(err, &constraintViolation)
 }
 
 func writeProxyResponse(
