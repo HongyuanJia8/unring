@@ -29,6 +29,8 @@ func TestCurlReceivesCompleteResponsesIntegration(t *testing.T) {
 
 	chunkedBody := repeatedBody("chunked-response-", 512*1024)
 	unframedBody := repeatedBody("http2-unframed-response-", 384*1024)
+	accountSettingsBody := repeatedBody("account-settings-", 32*1024)
+	bootstrapBody := repeatedBody("bootstrap-", 48*1024)
 	keepAliveBodyOne := repeatedBody("keep-alive-one-", 96*1024)
 	keepAliveBodyTwo := repeatedBody("keep-alive-two-", 128*1024)
 	closeBody := repeatedBody("connection-close-", 192*1024)
@@ -37,6 +39,10 @@ func TestCurlReceivesCompleteResponsesIntegration(t *testing.T) {
 
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
+		case "/api/oauth/account/settings":
+			_, _ = response.Write(accountSettingsBody)
+		case "/api/claude_cli/bootstrap":
+			_, _ = response.Write(bootstrapBody)
 		case "/unframed":
 			_, _ = response.Write(unframedBody)
 		case "/chunked":
@@ -93,6 +99,14 @@ func TestCurlReceivesCompleteResponsesIntegration(t *testing.T) {
 	assertBytesEqual(t, "HTTP/2-style unframed response", got, unframedBody)
 
 	got = runCurl(t, curl, environment, nil,
+		"--http1.1", "https://"+targetAddress+"/api/oauth/account/settings")
+	assertBytesEqual(t, "account settings startup response", got, accountSettingsBody)
+
+	got = runCurl(t, curl, environment, nil,
+		"--http1.1", "https://"+targetAddress+"/api/claude_cli/bootstrap?entrypoint=sd")
+	assertBytesEqual(t, "CLI bootstrap startup response", got, bootstrapBody)
+
+	got = runCurl(t, curl, environment, nil,
 		"--http1.1", "https://"+targetAddress+"/chunked")
 	assertBytesEqual(t, "chunked response", got, chunkedBody)
 
@@ -125,8 +139,8 @@ func TestCurlReceivesCompleteResponsesIntegration(t *testing.T) {
 		t.Fatalf("Seal() error: %v", err)
 	}
 	summary := proxy.Summary()
-	if len(summary.Requests) != 6 {
-		t.Fatalf("recorded requests = %d, want 6: %#v", len(summary.Requests), summary)
+	if len(summary.Requests) != 8 {
+		t.Fatalf("recorded requests = %d, want 8: %#v", len(summary.Requests), summary)
 	}
 	for _, request := range summary.Requests {
 		if request.StatusCode != http.StatusOK || request.Error != "" {

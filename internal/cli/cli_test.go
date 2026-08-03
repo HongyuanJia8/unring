@@ -49,12 +49,21 @@ func TestAgentControlPlaneRulesAreNarrowAndEnumerated(t *testing.T) {
 		want    bool
 	}{
 		{command: "claude", method: "POST", target: "https://api.anthropic.com/v1/messages", want: true},
+		{command: "claude", method: "POST", target: "https://api.anthropic.com/api/event_logging/v2/batch", want: true},
+		{command: "claude", method: "POST", target: "https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe", want: true},
+		{command: "claude", method: "POST", target: "https://api.anthropic.com/api/eval/sdk/id", want: false},
+		{command: "claude", method: "POST", target: "https://http-intake.logs.us5.datadoghq.com/api/v2/logs", want: true},
+		{command: "claude", method: "POST", target: "https://browser-intake-us5-datadoghq.com/api/v2/logs?ddsource=browser", want: true},
 		{command: "claude", method: "POST", target: "https://api.anthropic.com/v1/files", want: false},
+		{command: "claude", method: "POST", target: "https://api.anthropic.com/api/event_logging/v2/other", want: false},
 		{command: "claude", method: "POST", target: "https://api.openai.com/v1/responses", want: false},
 		{command: "codex", method: "POST", target: "https://api.openai.com/v1/responses", want: true},
 		{command: "codex", method: "GET", target: "https://chatgpt.com/backend-api/codex/responses", want: true},
+		{command: "codex", method: "POST", target: "https://ab.chatgpt.com/otlp/v1/metrics", want: true},
+		{command: "codex", method: "POST", target: "https://ab.chatgpt.com/otlp/v1/traces", want: false},
 		{command: "codex", method: "POST", target: "https://chatgpt.com/backend-api/other", want: false},
 		{command: "opencode", method: "POST", target: "https://opencode.ai/zen/v1/responses", want: true},
+		{command: "opencode", method: "POST", target: "https://opencode.ai/zen/v1/files", want: false},
 		{command: "curl", method: "POST", target: "https://api.anthropic.com/v1/messages", want: false},
 	}
 	for _, test := range tests {
@@ -277,6 +286,58 @@ func TestPlainReviewSeparatesSafeAndControlPlaneTrafficWithoutWarning(t *testing
 	if strings.Contains(text, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") ||
 		strings.Contains(text, "discard cannot undo this") {
 		t.Fatalf("safe/control-plane traffic manufactured an irreversible warning:\n%s", text)
+	}
+}
+
+func TestPlainReviewNamesForwardingFailureCause(t *testing.T) {
+	t.Parallel()
+	postgresSummary := pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}
+	httpsSummary := httpsproxy.Summary{
+		Sealed: true,
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "GET", URL: "https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=sd",
+			Disposition: httpsproxy.RequestDispositionSafeRead,
+			Error:       "response body relay failed: unexpected EOF",
+		}},
+	}
+	var output bytes.Buffer
+	printSummaryWithHTTPS(&output, postgresSummary, httpsSummary)
+	want := "[forwarding failed: response body relay failed: unexpected EOF] GET https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=sd"
+	if !strings.Contains(output.String(), want) {
+		t.Fatalf("plain review hid forwarding cause %q:\n%s", want, output.String())
+	}
+}
+
+func TestTelemetryOnlyReviewDoesNotWarnButApprovedMutationDoes(t *testing.T) {
+	t.Parallel()
+	postgresSummary := pgproxy.Summary{
+		Sealed: true, FullyReversible: true,
+		Changes: pgproxy.ChangeSummary{Complete: true},
+	}
+	telemetry := httpsproxy.Summary{
+		Sealed: true,
+		Requests: []httpsproxy.RequestRecord{{
+			Method: "POST", URL: "https://api.anthropic.com/api/event_logging/v2/batch",
+			StatusCode: http.StatusOK, Disposition: httpsproxy.RequestDispositionControlPlane,
+		}},
+	}
+	var output bytes.Buffer
+	printSummaryWithHTTPS(&output, postgresSummary, telemetry)
+	if strings.Contains(output.String(), "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") {
+		t.Fatalf("telemetry-only session received irreversible warning:\n%s", output.String())
+	}
+
+	telemetry.Requests = append(telemetry.Requests, httpsproxy.RequestRecord{
+		Method: "POST", URL: "https://service.example/mutate",
+		StatusCode: http.StatusCreated, Disposition: httpsproxy.RequestDispositionApproved,
+	})
+	output.Reset()
+	printSummaryWithHTTPS(&output, postgresSummary, telemetry)
+	if !strings.Contains(output.String(), "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") {
+		t.Fatalf("approved irreversible mutation was not warned:\n%s", output.String())
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -215,11 +217,17 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 	}
 	transport := options.Transport
 	if transport == nil {
+		rootCAs, err := configuredRootCAs(os.Getenv("SSL_CERT_FILE"))
+		if err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("load HTTPS upstream roots: %w", err)
+		}
 		transport = &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			ForceAttemptHTTP2:     false,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
+			TLSClientConfig:       &tls.Config{RootCAs: rootCAs, MinVersion: tls.VersionTLS12},
 		}
 	}
 	proxy := &Proxy{
@@ -241,6 +249,24 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 		}
 	}()
 	return proxy, nil
+}
+
+func configuredRootCAs(additionalBundle string) (*x509.CertPool, error) {
+	if strings.TrimSpace(additionalBundle) == "" {
+		return nil, nil
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("load system certificate roots: %w", err)
+	}
+	pemBytes, err := os.ReadFile(additionalBundle)
+	if err != nil {
+		return nil, fmt.Errorf("read SSL_CERT_FILE %s: %w", additionalBundle, err)
+	}
+	if !roots.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("SSL_CERT_FILE %s contains no certificates", additionalBundle)
+	}
+	return roots, nil
 }
 
 // Address returns the loopback address of the proxy.
@@ -989,7 +1015,7 @@ func (proxy *Proxy) forwardActual(
 	}
 	response, err := proxy.transport.RoundTrip(request)
 	if err != nil {
-		record.Error = err.Error()
+		record.Error = forwardingError("upstream request", err)
 		record.EndedAt = time.Now().UTC()
 		proxy.recordRequest(record)
 		_, _ = io.WriteString(client,
@@ -1014,12 +1040,29 @@ func (proxy *Proxy) forwardActual(
 		request.Close = true
 	}
 	record.StatusCode = response.StatusCode
+	if record.Disposition == RequestDispositionSafeRead &&
+		(response.ContentLength < 0 || response.ContentLength <= maximumClassifiedBody) &&
+		!strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		buffered, bufferErr := bufferBoundedResponse(response)
+		if bufferErr != nil {
+			record.Error = forwardingError("upstream response body", bufferErr)
+			record.EndedAt = time.Now().UTC()
+			proxy.recordRequest(record)
+			_, _ = io.WriteString(client,
+				"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return true, bufferErr
+		}
+		if buffered {
+			response.Header.Del("Content-Length")
+			response.TransferEncoding = nil
+		}
+	}
 	removeHopByHopHeaders(response.Header)
 	closeClient := prepareClientResponse(response, request)
 	var capture boundedCapture
 	response.Body = io.NopCloser(io.TeeReader(response.Body, &capture))
 	if err := response.Write(client); err != nil {
-		record.Error = err.Error()
+		record.Error = forwardingError("response body relay", err)
 		record.EndedAt = time.Now().UTC()
 		if record.StatusCode >= 200 && record.StatusCode <= 299 {
 			proxy.recordRequestWithUndo(record, classification.Undo, undoInput, capture.Bytes())
@@ -1035,6 +1078,49 @@ func (proxy *Proxy) forwardActual(
 		proxy.recordRequest(record)
 	}
 	return closeClient, nil
+}
+
+// bufferBoundedResponse gives small safe reads an exact HTTP/1.1 Content-Length.
+// That keeps startup/configuration responses off the streaming framing path,
+// including decoded upstream responses with no usable length. Larger responses
+// keep streaming.
+func bufferBoundedResponse(response *http.Response) (bool, error) {
+	limited := &io.LimitedReader{R: response.Body, N: maximumClassifiedBody + 1}
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return false, err
+	}
+	if int64(len(body)) > maximumClassifiedBody {
+		response.Body = &continuingReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), response.Body),
+			Closer: response.Body,
+		}
+		return false, nil
+	}
+	if err := response.Body.Close(); err != nil {
+		return false, err
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	response.ContentLength = int64(len(body))
+	return true, nil
+}
+
+type continuingReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func forwardingError(phase string, err error) string {
+	var networkError net.Error
+	switch {
+	case errors.As(err, &networkError) && networkError.Timeout():
+		return "timeout during " + phase + ": " + err.Error()
+	case strings.Contains(strings.ToLower(err.Error()), "tls") ||
+		strings.Contains(strings.ToLower(err.Error()), "x509"):
+		return "TLS failure during " + phase + ": " + err.Error()
+	default:
+		return phase + " failed: " + err.Error()
+	}
 }
 
 func forwardedDisposition(classification adapter.Classification) string {

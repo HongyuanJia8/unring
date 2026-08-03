@@ -756,9 +756,10 @@ func configuredPassthroughHosts(value string) func(string) bool {
 }
 
 type agentControlPlaneRule struct {
-	method string
-	host   string
-	path   string
+	method            string
+	host              string
+	path              string
+	singlePathSegment bool
 }
 
 func configuredAgentControlPlane(command []string) func(*http.Request) bool {
@@ -770,12 +771,26 @@ func configuredAgentControlPlane(command []string) func(*http.Request) bool {
 	case "claude":
 		rules = []agentControlPlaneRule{
 			{method: http.MethodPost, host: "api.anthropic.com", path: "/v1/messages"},
+			{method: http.MethodPost, host: "api.anthropic.com", path: "/api/event_logging/v2/batch"},
+			{
+				method: http.MethodPost, host: "api.anthropic.com", path: "/api/eval/",
+				singlePathSegment: true,
+			},
+			{
+				method: http.MethodPost, host: "http-intake.logs.us5.datadoghq.com",
+				path: "/api/v2/logs",
+			},
+			{
+				method: http.MethodPost, host: "browser-intake-us5-datadoghq.com",
+				path: "/api/v2/logs",
+			},
 		}
 	case "codex":
 		rules = []agentControlPlaneRule{
 			{method: http.MethodPost, host: "api.openai.com", path: "/v1/responses"},
 			{method: http.MethodPost, host: "chatgpt.com", path: "/backend-api/codex/responses"},
 			{method: http.MethodGet, host: "chatgpt.com", path: "/backend-api/codex/responses"},
+			{method: http.MethodPost, host: "ab.chatgpt.com", path: "/otlp/v1/metrics"},
 		}
 	case "opencode":
 		rules = []agentControlPlaneRule{
@@ -794,8 +809,12 @@ func configuredAgentControlPlane(command []string) func(*http.Request) bool {
 		}
 		host := strings.ToLower(request.URL.Hostname())
 		for _, rule := range rules {
-			if request.Method == rule.method && host == rule.host &&
-				request.URL.Path == rule.path {
+			pathMatches := request.URL.Path == rule.path
+			if rule.singlePathSegment && strings.HasPrefix(request.URL.Path, rule.path) {
+				suffix := strings.TrimPrefix(request.URL.Path, rule.path)
+				pathMatches = suffix != "" && !strings.Contains(suffix, "/")
+			}
+			if request.Method == rule.method && host == rule.host && pathMatches {
 				return true
 			}
 		}
@@ -1302,7 +1321,7 @@ func printSummaryWithExternal(
 	printForwardedHTTPSRequests(output, httpsSummary.Requests,
 		httpsproxy.RequestDispositionControlPlane,
 		"AGENT CONTROL PLANE — FORWARDED WITHOUT GATING",
-		"  These enumerated model requests were deliberately not gated so the wrapped agent could function; they remain visible here and in the audit.")
+		"  These enumerated agent operational requests were deliberately not gated so the wrapped agent could function; they remain visible here and in the audit.")
 	printForwardedHTTPSRequests(output, httpsSummary.Requests,
 		httpsproxy.RequestDispositionSafeRead,
 		"HTTPS SAFE READS — OBSERVED AND FORWARDED",
@@ -1362,6 +1381,9 @@ func printForwardedHTTPSRequests(
 		status := "forwarded"
 		if request.StatusCode != 0 {
 			status = fmt.Sprintf("HTTP %d", request.StatusCode)
+		}
+		if request.Error != "" {
+			status = "forwarding failed: " + request.Error
 		}
 		fmt.Fprintf(output, "  - [%s] %s %s\n", status, request.Method, request.URL)
 		if request.Error != "" {

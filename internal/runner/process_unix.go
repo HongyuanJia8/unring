@@ -47,15 +47,36 @@ func (control processGroupControl) handleApproval(
 		_ = signalProcessGroup(childPID, syscall.SIGCONT)
 		return ApprovalResult{Err: fmt.Errorf("reclaim terminal for approval: %w", err)}
 	}
+	childTerminal, err := term.GetState(int(control.terminal.Fd()))
+	if err != nil {
+		_ = control.setForeground(int32(childPID))
+		_ = signalProcessGroup(childPID, syscall.SIGCONT)
+		return ApprovalResult{Err: fmt.Errorf("snapshot child terminal state: %w", err)}
+	}
+	if err := term.Restore(int(control.terminal.Fd()), control.parentTerminal); err != nil {
+		_ = control.setForeground(int32(childPID))
+		_ = signalProcessGroup(childPID, syscall.SIGCONT)
+		return ApprovalResult{Err: fmt.Errorf("set terminal state for approval: %w", err)}
+	}
+	flushErr := flushTerminalInput(int(control.terminal.Fd()))
+	_, screenStartErr := control.terminal.Write([]byte("\x1b7\x1b[0m\x1b[?25h\r\n"))
 	approved, decisionErr := decide()
+	_, screenEndErr := control.terminal.Write([]byte("\x1b[0m\x1b8"))
+	restoreStateErr := term.Restore(int(control.terminal.Fd()), childTerminal)
 	foregroundErr := control.setForeground(int32(childPID))
 	continueErr := signalProcessGroup(childPID, syscall.SIGCONT)
+	redrawErr := signalProcessGroup(childPID, syscall.SIGWINCH)
 	return ApprovalResult{
 		Approved: approved,
 		Err: errors.Join(
 			decisionErr,
+			wrapApprovalError("flush pending child input", flushErr),
+			wrapApprovalError("prepare terminal screen for approval", screenStartErr),
+			wrapApprovalError("restore terminal screen after approval", screenEndErr),
+			wrapApprovalError("restore child terminal state", restoreStateErr),
 			wrapApprovalError("return terminal to child", foregroundErr),
 			wrapApprovalError("resume child after approval", continueErr),
+			wrapApprovalError("request child terminal redraw", redrawErr),
 		),
 	}
 }
@@ -82,6 +103,7 @@ func wrapApprovalError(operation string, err error) error {
 type processGroupControl struct {
 	terminal           *os.File
 	parentProcessGroup int
+	parentTerminal     *term.State
 }
 
 func configureProcessGroup(command *exec.Cmd, stdin io.Reader) processGroupControl {
@@ -92,11 +114,16 @@ func configureProcessGroup(command *exec.Cmd, stdin io.Reader) processGroupContr
 		return processGroupControl{}
 	}
 
+	parentTerminal, err := term.GetState(int(terminal.Fd()))
+	if err != nil {
+		return processGroupControl{}
+	}
 	command.SysProcAttr.Foreground = true
 	command.SysProcAttr.Ctty = int(terminal.Fd())
 	return processGroupControl{
 		terminal:           terminal,
 		parentProcessGroup: syscall.Getpgrp(),
+		parentTerminal:     parentTerminal,
 	}
 }
 

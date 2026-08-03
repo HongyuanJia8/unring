@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +131,17 @@ func TestPrepareClientResponseAddsHTTP11Framing(t *testing.T) {
 	response.TransferEncoding = nil
 	if closeClient := prepareClientResponse(response, request); !closeClient || !response.Close {
 		t.Fatalf("connection-close response was not marked for closure: %#v", response)
+	}
+}
+
+func TestConfiguredRootCAsRejectsBundleWithoutCertificates(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "not-a-ca.pem")
+	if err := os.WriteFile(filename, []byte("not a certificate\n"), 0o600); err != nil {
+		t.Fatalf("write invalid CA bundle: %v", err)
+	}
+	if _, err := configuredRootCAs(filename); err == nil ||
+		!strings.Contains(err.Error(), "contains no certificates") {
+		t.Fatalf("configuredRootCAs() error = %v", err)
 	}
 }
 
