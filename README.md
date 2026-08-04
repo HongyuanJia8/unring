@@ -26,10 +26,18 @@ Xcode Command Line Tools or Clang on macOS, or GCC/Clang (typically the
 
 ```sh
 go install github.com/hyj28/unring/cmd/unring@latest
+```
+
+With the default Go configuration, that installs the binary at
+`$(go env GOPATH)/bin/unring` (or at `$GOBIN/unring` when `GOBIN` is set). macOS
+does not put the default Go bin directory on `PATH` automatically. Add it for the
+current shell, then put the same export in your shell startup file:
+
+```sh
+export PATH="$(go env GOPATH)/bin:$PATH"
 unring --version
 ```
 
-If the second command is not found, add `$(go env GOPATH)/bin` to your `PATH`.
 A missing compiler fails during `go install`, before an `unring` binary exists;
 check `go env CGO_ENABLED` (it must be `1`) and `cc --version` when diagnosing
 that build-time error.
@@ -99,23 +107,29 @@ explicitly marked synthetic response, and the review shows the call under
 **PENDING HTTPS — WILL BE SENT IF YOU COMMIT**. Needs-approval calls stop while unring
 asks; a decline guarantees the request is not sent. Safe-method requests and approved
 calls that really ran are shown separately from traffic unring could not intercept.
+Approvals must be answered interactively: input queued before the prompt is deliberately
+discarded so a keystroke intended for the child cannot approve an action, and without a
+terminal unring safely declines rather than accepting pre-supplied input.
 Proxy-aware plain HTTP remains blocked and reported rather than escaping invisibly.
 The complete community adapter format is documented in
 [docs/ADAPTERS.md](docs/ADAPTERS.md).
 
-An agent must be able to reach its own model API before it can do any work. For the
-three named agent commands, unring therefore forwards only these exact control-plane
-requests without approval:
+An agent must be able to reach its own model API and send its own operational
+telemetry without turning approval into noise. For the three named agent commands,
+unring therefore forwards only these enumerated control-plane requests without
+approval:
 
-| Wrapped command | Deliberately ungated model requests |
+| Wrapped command | Deliberately ungated operational requests |
 |---|---|
-| `claude` | `POST https://api.anthropic.com/v1/messages` |
-| `codex` | `POST https://api.openai.com/v1/responses`; `POST` or WebSocket `GET` to `https://chatgpt.com/backend-api/codex/responses` |
+| `claude` | `POST https://api.anthropic.com/v1/messages`, `/api/event_logging/v2/batch`, or one `/api/eval/<event-id>` endpoint; `POST /api/v2/logs` on `http-intake.logs.us5.datadoghq.com` or `browser-intake-us5-datadoghq.com` |
+| `codex` | `POST https://api.openai.com/v1/responses`; `POST` or WebSocket `GET` to `https://chatgpt.com/backend-api/codex/responses`; `POST https://ab.chatgpt.com/otlp/v1/metrics` |
 | `opencode` | `POST` to `/zen/v1/responses` or `/zen/v1/chat/completions` on `opencode.ai`, `/v1/messages` on `api.anthropic.com`, and `/v1/responses` or `/v1/chat/completions` on `api.openai.com` |
 
 The match is enabled only when the wrapped executable's basename is the listed agent,
-and it is exact on method, hostname, and path. Custom providers, gateways, other
-paths on those hosts, and genuinely unknown services still use the normal fail-closed
+and it is exact on method, hostname, and endpoint shape. The Claude evaluation rule
+accepts exactly one non-empty path segment in place of `<event-id>`; it is not a path
+prefix. Custom providers, gateways, other paths on those hosts, and genuinely
+unknown services still use the normal fail-closed
 classification. Because the proxy cannot distinguish an agent's own request from a
 descendant process using the same endpoint, the exemption applies to the whole wrapped
 process tree for those exact requests. Every match is labeled **AGENT CONTROL PLANE —

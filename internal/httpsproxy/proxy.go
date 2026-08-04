@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -131,7 +133,8 @@ func (summary Summary) HasReviewableActivity() bool {
 
 // HasForwardedEffects reports whether a forwarded HTTPS request may have
 // changed external state. Safe reads and enumerated agent control-plane calls
-// remain in the audit without manufacturing a review or reversibility warning.
+// do not manufacture a final decision or reversibility warning; callers still
+// display them as observed traffic.
 func (summary Summary) HasForwardedEffects() bool {
 	for _, request := range summary.Requests {
 		if request.Disposition != RequestDispositionSafeRead &&
@@ -215,11 +218,17 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 	}
 	transport := options.Transport
 	if transport == nil {
+		rootCAs, err := configuredRootCAs(os.Getenv("SSL_CERT_FILE"))
+		if err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("load HTTPS upstream roots: %w", err)
+		}
 		transport = &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			ForceAttemptHTTP2:     false,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
+			TLSClientConfig:       &tls.Config{RootCAs: rootCAs, MinVersion: tls.VersionTLS12},
 		}
 	}
 	proxy := &Proxy{
@@ -241,6 +250,24 @@ func Start(authority *Authority, options Options) (*Proxy, error) {
 		}
 	}()
 	return proxy, nil
+}
+
+func configuredRootCAs(additionalBundle string) (*x509.CertPool, error) {
+	if strings.TrimSpace(additionalBundle) == "" {
+		return nil, nil
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("load system certificate roots: %w", err)
+	}
+	pemBytes, err := os.ReadFile(additionalBundle)
+	if err != nil {
+		return nil, fmt.Errorf("read SSL_CERT_FILE %s: %w", additionalBundle, err)
+	}
+	if !roots.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("SSL_CERT_FILE %s contains no certificates", additionalBundle)
+	}
+	return roots, nil
 }
 
 // Address returns the loopback address of the proxy.
@@ -769,12 +796,14 @@ func (proxy *Proxy) forward(
 	request.ContentLength = int64(len(body))
 
 	classification := adapter.Classification{}
+	disposition := ""
 	matched := false
 	if proxy.controlPlane != nil && proxy.controlPlane(request) {
 		classification = adapter.Classification{
 			Tier: adapter.TierAlreadyIrreversible,
 			Rule: RequestDispositionControlPlane,
 		}
+		disposition = RequestDispositionControlPlane
 		matched = true
 	}
 	if !matched {
@@ -792,6 +821,7 @@ func (proxy *Proxy) forward(
 		classification = adapter.Classification{
 			Tier: adapter.TierAlreadyIrreversible, Rule: "safe-http-method",
 		}
+		disposition = RequestDispositionSafeRead
 		matched = true
 	}
 	if !matched {
@@ -806,7 +836,9 @@ func (proxy *Proxy) forward(
 			client, clientReader, request, body, hostport, classification,
 		)
 	case adapter.TierAlreadyIrreversible:
-		return proxy.forwardActual(client, clientReader, request, body, classification)
+		return proxy.forwardActual(
+			client, clientReader, request, body, classification, disposition,
+		)
 	default:
 		err := fmt.Errorf("classification returned unsupported tier %q", classification.Tier)
 		proxy.recordUnintercepted(hostport, err.Error()+"; request was blocked")
@@ -956,7 +988,9 @@ func (proxy *Proxy) requestApproval(
 		}, `{"error":"unring approval declined","sent":false}`)
 		return request.Close, err
 	}
-	return proxy.forwardActual(client, clientReader, request, body, classification)
+	return proxy.forwardActual(
+		client, clientReader, request, body, classification, RequestDispositionApproved,
+	)
 }
 
 func (proxy *Proxy) forwardActual(
@@ -965,12 +999,13 @@ func (proxy *Proxy) forwardActual(
 	request *http.Request,
 	requestBody []byte,
 	classification adapter.Classification,
+	disposition string,
 ) (bool, error) {
 	started := time.Now().UTC()
 	record := RequestRecord{
 		Method: request.Method, URL: request.URL.String(),
 		Tier: classification.Tier, Adapter: classification.Adapter,
-		Rule: classification.Rule, Disposition: forwardedDisposition(classification),
+		Rule: classification.Rule, Disposition: disposition,
 		StartedAt: started,
 	}
 	undoInput := adapter.Request{
@@ -989,7 +1024,7 @@ func (proxy *Proxy) forwardActual(
 	}
 	response, err := proxy.transport.RoundTrip(request)
 	if err != nil {
-		record.Error = err.Error()
+		record.Error = forwardingError("upstream request", err)
 		record.EndedAt = time.Now().UTC()
 		proxy.recordRequest(record)
 		_, _ = io.WriteString(client,
@@ -1019,7 +1054,7 @@ func (proxy *Proxy) forwardActual(
 	var capture boundedCapture
 	response.Body = io.NopCloser(io.TeeReader(response.Body, &capture))
 	if err := response.Write(client); err != nil {
-		record.Error = err.Error()
+		record.Error = forwardingError("response body relay", err)
 		record.EndedAt = time.Now().UTC()
 		if record.StatusCode >= 200 && record.StatusCode <= 299 {
 			proxy.recordRequestWithUndo(record, classification.Undo, undoInput, capture.Bytes())
@@ -1037,17 +1072,63 @@ func (proxy *Proxy) forwardActual(
 	return closeClient, nil
 }
 
-func forwardedDisposition(classification adapter.Classification) string {
-	switch classification.Rule {
-	case "safe-http-method":
-		return RequestDispositionSafeRead
-	case RequestDispositionControlPlane:
-		return RequestDispositionControlPlane
+func forwardingError(phase string, err error) string {
+	var networkError net.Error
+	var dnsError *net.DNSError
+	switch {
+	case errors.As(err, &networkError) && networkError.Timeout():
+		return "timeout during " + phase + ": " + err.Error()
+	case errors.As(err, &dnsError):
+		return "DNS failure during " + phase + ": " + err.Error()
+	case isTLSFailure(err):
+		return "TLS failure during " + phase + ": " + err.Error()
+	default:
+		return phase + " failed: " + err.Error()
 	}
-	if classification.Tier == adapter.TierNeedsApproval {
-		return RequestDispositionApproved
+}
+
+func isTLSFailure(err error) bool {
+	var recordHeader tls.RecordHeaderError
+	var verification *tls.CertificateVerificationError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalidCertificate x509.CertificateInvalidError
+	var systemRoots x509.SystemRootsError
+	var insecureAlgorithm x509.InsecureAlgorithmError
+	var constraintViolation x509.ConstraintViolationError
+	return errors.As(err, &recordHeader) ||
+		errors.As(err, &verification) ||
+		errors.As(err, &unknownAuthority) ||
+		errors.As(err, &hostname) ||
+		errors.As(err, &invalidCertificate) ||
+		errors.As(err, &systemRoots) ||
+		errors.As(err, &insecureAlgorithm) ||
+		errors.As(err, &constraintViolation) ||
+		hasTLSLeafError(err)
+}
+
+// hasTLSLeafError recognizes crypto/tls errors whose concrete types are not
+// exported, including peer alerts, plus negotiation errors returned as plain
+// errors. It deliberately inspects only leaves: wrapper messages such as
+// url.Error include the request URL and must not influence classification.
+func hasTLSLeafError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return ""
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if hasTLSLeafError(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if child := wrapped.Unwrap(); child != nil {
+			return hasTLSLeafError(child)
+		}
+	}
+	return strings.HasPrefix(err.Error(), "tls: ")
 }
 
 func writeProxyResponse(

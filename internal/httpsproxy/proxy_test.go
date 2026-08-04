@@ -15,9 +15,12 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hyj28/unring/internal/adapter"
 )
 
 func TestProxyInterceptsRecordsAndForwardsHTTPS(t *testing.T) {
@@ -104,6 +107,91 @@ func TestSummaryOnlyTreatsForwardedMutationsAsEffects(t *testing.T) {
 	}
 }
 
+func TestAdapterRuleNamesCannotSpoofForwardedDisposition(t *testing.T) {
+	adapters, err := adapter.Load(adapter.Source{
+		Name: "spoofed-rule-names.yaml",
+		Data: []byte(`
+version: 1
+name: spoofed-rule-names
+rules:
+  - name: safe-http-method
+    match:
+      hosts: [spoof.unring.test]
+      methods: [POST]
+      path: /refund
+    tier: needs-approval
+  - name: agent-control-plane
+    match:
+      hosts: [spoof.unring.test]
+      methods: [POST]
+      path: /payout
+    tier: needs-approval
+`),
+	})
+	if err != nil {
+		t.Fatalf("load spoofing adapter: %v", err)
+	}
+	authority, err := EnsureAuthority(t.TempDir())
+	if err != nil {
+		t.Fatalf("EnsureAuthority() error: %v", err)
+	}
+	proxy, err := Start(authority, Options{
+		Adapters: adapters,
+		Approve: func(context.Context, ApprovalRequest) (bool, error) {
+			return true, nil
+		},
+		Transport: proxyRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+			const body = "accepted"
+			return &http.Response{
+				StatusCode: http.StatusCreated, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+
+	proxyURL, _ := url.Parse("http://" + proxy.Address())
+	roots := x509.NewCertPool()
+	roots.AddCert(authority.Certificate)
+	client := &http.Client{Transport: &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			RootCAs: roots, MinVersion: tls.VersionTLS12,
+		},
+	}}
+	for _, path := range []string{"/refund", "/payout"} {
+		response, err := client.Post(
+			"https://spoof.unring.test"+path,
+			"application/json",
+			strings.NewReader(`{"amount":100}`),
+		)
+		if err != nil {
+			t.Fatalf("POST %s through proxy: %v", path, err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusCreated {
+			t.Fatalf("POST %s status = %d", path, response.StatusCode)
+		}
+	}
+	sealProxy(t, proxy)
+
+	summary := proxy.Summary()
+	if len(summary.Requests) != 2 || !summary.HasForwardedEffects() ||
+		!summary.HasReviewableActivity() {
+		t.Fatalf("approved spoof-name mutations lost reviewability: %#v", summary)
+	}
+	for _, request := range summary.Requests {
+		if request.Disposition != RequestDispositionApproved {
+			t.Fatalf("adapter rule %q selected disposition %q, want %q",
+				request.Rule, request.Disposition, RequestDispositionApproved)
+		}
+	}
+}
+
 func TestPrepareClientResponseAddsHTTP11Framing(t *testing.T) {
 	t.Parallel()
 
@@ -130,6 +218,197 @@ func TestPrepareClientResponseAddsHTTP11Framing(t *testing.T) {
 	response.TransferEncoding = nil
 	if closeClient := prepareClientResponse(response, request); !closeClient || !response.Close {
 		t.Fatalf("connection-close response was not marked for closure: %#v", response)
+	}
+}
+
+func TestForwardingErrorNamesTypedCauseWithoutInspectingURLText(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantPrefix string
+	}{
+		{
+			name: "timeout", err: timeoutTestError{},
+			wantPrefix: "timeout during upstream request:",
+		},
+		{
+			name: "typed TLS failure",
+			err: tls.RecordHeaderError{
+				Msg: "first record does not look like a TLS handshake",
+			},
+			wantPrefix: "TLS failure during upstream request:",
+		},
+		{
+			name: "peer TLS alert wrapped by network and URL errors",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "https://api.vendor.example/v1/status",
+				Err: &net.OpError{
+					Op:  "remote error",
+					Net: "tcp",
+					Err: errors.New("tls: handshake failure"),
+				},
+			},
+			wantPrefix: "TLS failure during upstream request:",
+		},
+		{
+			name: "TLS protocol negotiation failure",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "https://api.vendor.example/v1/status",
+				Err: errors.New("tls: server selected unsupported protocol version"),
+			},
+			wantPrefix: "TLS failure during upstream request:",
+		},
+		{
+			name: "DNS failure whose URL contains mtls",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "https://api.vendor.example/v1/mtls/status",
+				Err: &net.DNSError{Name: "api.vendor.example", Err: "no such host"},
+			},
+			wantPrefix: "DNS failure during upstream request:",
+		},
+		{
+			name:       "body relay",
+			err:        errors.New("short downstream write"),
+			wantPrefix: "upstream request failed:",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := forwardingError("upstream request", test.err)
+			if !strings.HasPrefix(got, test.wantPrefix) {
+				t.Fatalf("forwardingError() = %q, want prefix %q", got, test.wantPrefix)
+			}
+		})
+	}
+}
+
+type timeoutTestError struct{}
+
+func (timeoutTestError) Error() string   { return "deadline elapsed" }
+func (timeoutTestError) Timeout() bool   { return true }
+func (timeoutTestError) Temporary() bool { return true }
+
+func TestSafeReadStreamsUnknownLengthJSONBeforeEOF(t *testing.T) {
+	assertSafeReadStreamsBeforeEOF(t, "application/json", -1)
+}
+
+func TestSafeReadStreamsEventSourceBeforeEOF(t *testing.T) {
+	assertSafeReadStreamsBeforeEOF(t, "text/event-stream", -1)
+}
+
+func TestSafeReadWithContentLengthIsNotBuffered(t *testing.T) {
+	const body = "{\"event\":1}\n{\"event\":2}\n"
+	assertSafeReadStreamsBeforeEOF(t, "application/json", int64(len(body)))
+}
+
+func assertSafeReadStreamsBeforeEOF(t *testing.T, contentType string, contentLength int64) {
+	t.Helper()
+	upstreamReader, upstreamWriter := io.Pipe()
+	releaseUpstream := make(chan struct{})
+	firstChunkWritten := make(chan struct{})
+	go func() {
+		defer upstreamWriter.Close()
+		_, _ = io.WriteString(upstreamWriter, "{\"event\":1}\n")
+		close(firstChunkWritten)
+		<-releaseUpstream
+		_, _ = io.WriteString(upstreamWriter, "{\"event\":2}\n")
+	}()
+	defer close(releaseUpstream)
+
+	authority, err := EnsureAuthority(t.TempDir())
+	if err != nil {
+		t.Fatalf("EnsureAuthority() error: %v", err)
+	}
+	proxy, err := Start(authority, Options{Transport: proxyRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{contentType},
+			},
+			Body: upstreamReader, ContentLength: contentLength,
+		}, nil
+	})})
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+
+	proxyURL, _ := url.Parse("http://" + proxy.Address())
+	roots := x509.NewCertPool()
+	roots.AddCert(authority.Certificate)
+	client := &http.Client{Transport: &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			RootCAs: roots, MinVersion: tls.VersionTLS12,
+		},
+	}}
+	type responseResult struct {
+		response *http.Response
+		err      error
+	}
+	result := make(chan responseResult, 1)
+	go func() {
+		response, requestErr := client.Get("https://stream.unring.test/v1/watch")
+		result <- responseResult{response: response, err: requestErr}
+	}()
+
+	select {
+	case <-firstChunkWritten:
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not begin reading the unknown-length upstream response")
+	}
+	var response *http.Response
+	select {
+	case received := <-result:
+		if received.err != nil {
+			t.Fatalf("GET streaming safe read: %v", received.err)
+		}
+		response = received.response
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("safe read did not deliver response headers before the upstream body completed")
+	}
+	defer response.Body.Close()
+	if contentLength < 0 {
+		if len(response.TransferEncoding) != 1 || response.TransferEncoding[0] != "chunked" {
+			t.Fatalf("unknown-length response framing = %#v, want chunked", response.TransferEncoding)
+		}
+	} else if response.ContentLength != contentLength || len(response.TransferEncoding) != 0 {
+		t.Fatalf("known-length response framing: length=%d transfer=%#v",
+			response.ContentLength, response.TransferEncoding)
+	}
+
+	firstLine := make(chan string, 1)
+	go func() {
+		line, _ := bufio.NewReader(response.Body).ReadString('\n')
+		firstLine <- line
+	}()
+	select {
+	case line := <-firstLine:
+		if line != "{\"event\":1}\n" {
+			t.Fatalf("first streamed line = %q", line)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("safe read did not relay the first body chunk before upstream EOF")
+	}
+}
+
+type proxyRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (function proxyRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+func TestConfiguredRootCAsRejectsBundleWithoutCertificates(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "not-a-ca.pem")
+	if err := os.WriteFile(filename, []byte("not a certificate\n"), 0o600); err != nil {
+		t.Fatalf("write invalid CA bundle: %v", err)
+	}
+	if _, err := configuredRootCAs(filename); err == nil ||
+		!strings.Contains(err.Error(), "contains no certificates") {
+		t.Fatalf("configuredRootCAs() error = %v", err)
 	}
 }
 

@@ -136,7 +136,7 @@ func newReviewModelWithExternal(
 			status = fmt.Sprintf("forwarded: HTTP %d", request.StatusCode)
 		}
 		if request.Error != "" {
-			status = "forwarding failed"
+			status = "forwarding failed: " + request.Error
 		}
 		section := "HTTPS REQUESTS — ALREADY FORWARDED; DISCARD CANNOT UNDO"
 		detail := "This request was intercepted and forwarded. No compensation is declared; any external effect remains after discard."
@@ -146,7 +146,7 @@ func newReviewModelWithExternal(
 			detail = "Unring classified this safe-method request as read-only. It was recorded for audit but creates no irreversible-effect warning."
 		case httpsproxy.RequestDispositionControlPlane:
 			section = "AGENT CONTROL PLANE — FORWARDED WITHOUT GATING"
-			detail = "This enumerated model request was deliberately not gated so the wrapped agent could function. It remains visible in the session record."
+			detail = "This enumerated agent operational request was deliberately not gated so the wrapped agent could function. It remains visible in the session record."
 		}
 		if request.Undo != nil {
 			section = "HTTPS REQUESTS — DISCARD COMPENSATION"

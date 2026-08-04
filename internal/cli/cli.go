@@ -490,7 +490,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
-		if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+		if hasOnlyObservedHTTPSActivity(summary, httpsSummary, ghSummary) {
+			// Safe reads and enumerated agent control-plane calls do not need a
+			// commit decision, but they were intercepted and must remain visible.
+			printObservedSummaryWithExternal(stdout, summary, httpsSummary, ghSummary)
+		} else if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
 			printCoverageOnlyReview(stdout, summary)
 		} else {
 			fmt.Fprintln(stderr, quietSessionDisclosure)
@@ -756,9 +760,10 @@ func configuredPassthroughHosts(value string) func(string) bool {
 }
 
 type agentControlPlaneRule struct {
-	method string
-	host   string
-	path   string
+	method            string
+	host              string
+	path              string
+	singlePathSegment bool
 }
 
 func configuredAgentControlPlane(command []string) func(*http.Request) bool {
@@ -770,12 +775,26 @@ func configuredAgentControlPlane(command []string) func(*http.Request) bool {
 	case "claude":
 		rules = []agentControlPlaneRule{
 			{method: http.MethodPost, host: "api.anthropic.com", path: "/v1/messages"},
+			{method: http.MethodPost, host: "api.anthropic.com", path: "/api/event_logging/v2/batch"},
+			{
+				method: http.MethodPost, host: "api.anthropic.com", path: "/api/eval/",
+				singlePathSegment: true,
+			},
+			{
+				method: http.MethodPost, host: "http-intake.logs.us5.datadoghq.com",
+				path: "/api/v2/logs",
+			},
+			{
+				method: http.MethodPost, host: "browser-intake-us5-datadoghq.com",
+				path: "/api/v2/logs",
+			},
 		}
 	case "codex":
 		rules = []agentControlPlaneRule{
 			{method: http.MethodPost, host: "api.openai.com", path: "/v1/responses"},
 			{method: http.MethodPost, host: "chatgpt.com", path: "/backend-api/codex/responses"},
 			{method: http.MethodGet, host: "chatgpt.com", path: "/backend-api/codex/responses"},
+			{method: http.MethodPost, host: "ab.chatgpt.com", path: "/otlp/v1/metrics"},
 		}
 	case "opencode":
 		rules = []agentControlPlaneRule{
@@ -794,8 +813,12 @@ func configuredAgentControlPlane(command []string) func(*http.Request) bool {
 		}
 		host := strings.ToLower(request.URL.Hostname())
 		for _, rule := range rules {
-			if request.Method == rule.method && host == rule.host &&
-				request.URL.Path == rule.path {
+			pathMatches := request.URL.Path == rule.path
+			if rule.singlePathSegment && strings.HasPrefix(request.URL.Path, rule.path) {
+				suffix := strings.TrimPrefix(request.URL.Path, rule.path)
+				pathMatches = suffix != "" && !strings.Contains(suffix, "/")
+			}
+			if request.Method == rule.method && host == rule.host && pathMatches {
 				return true
 			}
 		}
@@ -938,7 +961,11 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	if record.Error != "" {
 		fmt.Fprintf(output, "Error: %s\n", record.Error)
 	}
-	printSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
+	if hasOnlyObservedHTTPSActivity(record.Postgres, record.HTTPS, record.GH) {
+		printObservedSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
+	} else {
+		printSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
+	}
 	if len(record.Approvals) > 0 {
 		fmt.Fprintln(output, "\nIRREVERSIBLE ACTION DECISIONS")
 		for _, approval := range record.Approvals {
@@ -1183,6 +1210,36 @@ func printSummaryWithExternal(
 	httpsSummary httpsproxy.Summary,
 	ghSummary ghshim.Summary,
 ) {
+	printSummaryWithExternalDecision(output, summary, httpsSummary, ghSummary, true)
+}
+
+func printObservedSummaryWithExternal(
+	output io.Writer,
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+) {
+	printSummaryWithExternalDecision(output, summary, httpsSummary, ghSummary, false)
+}
+
+func hasOnlyObservedHTTPSActivity(
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+) bool {
+	return len(httpsSummary.Requests) > 0 &&
+		!summary.HasReviewableActivity() &&
+		!httpsSummary.HasReviewableActivity() &&
+		!ghSummary.HasReviewableActivity()
+}
+
+func printSummaryWithExternalDecision(
+	output io.Writer,
+	summary pgproxy.Summary,
+	httpsSummary httpsproxy.Summary,
+	ghSummary ghshim.Summary,
+	decisionRequired bool,
+) {
 	failed := 0
 	for _, query := range summary.Queries {
 		if query.Failed {
@@ -1191,9 +1248,14 @@ func printSummaryWithExternal(
 	}
 
 	fmt.Fprintln(output, "\nUNRING SESSION REVIEW")
-	fmt.Fprintln(output, "One decision applies to the whole session; partial commit is not available.")
-	fmt.Fprintln(output,
-		"Keeping database changes while withholding a related external action could commit inconsistent state—for example, notified_at set when its mail was never sent.")
+	if decisionRequired {
+		fmt.Fprintln(output, "One decision applies to the whole session; partial commit is not available.")
+		fmt.Fprintln(output,
+			"Keeping database changes while withholding a related external action could commit inconsistent state—for example, notified_at set when its mail was never sent.")
+	} else {
+		fmt.Fprintln(output,
+			"No commit/discard decision was needed; only observed HTTPS traffic is shown.")
+	}
 	if !summary.FullyReversible || httpsSummary.HasForwardedEffects() || ghMayHaveExternalEffect(ghSummary) {
 		fmt.Fprintln(output, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		fmt.Fprintln(output, "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE")
@@ -1302,7 +1364,7 @@ func printSummaryWithExternal(
 	printForwardedHTTPSRequests(output, httpsSummary.Requests,
 		httpsproxy.RequestDispositionControlPlane,
 		"AGENT CONTROL PLANE — FORWARDED WITHOUT GATING",
-		"  These enumerated model requests were deliberately not gated so the wrapped agent could function; they remain visible here and in the audit.")
+		"  These enumerated agent operational requests were deliberately not gated so the wrapped agent could function; they remain visible here and in the audit.")
 	printForwardedHTTPSRequests(output, httpsSummary.Requests,
 		httpsproxy.RequestDispositionSafeRead,
 		"HTTPS SAFE READS — OBSERVED AND FORWARDED",
@@ -1363,11 +1425,17 @@ func printForwardedHTTPSRequests(
 		if request.StatusCode != 0 {
 			status = fmt.Sprintf("HTTP %d", request.StatusCode)
 		}
+		if request.Error != "" {
+			status = "forwarding failed: " + request.Error
+		}
 		fmt.Fprintf(output, "  - [%s] %s %s\n", status, request.Method, request.URL)
 		if request.Error != "" {
 			fmt.Fprintf(output, "    Error: %s\n", request.Error)
 		}
-		printUndoDisclosure(output, request.Undo)
+		if request.Disposition != httpsproxy.RequestDispositionSafeRead &&
+			request.Disposition != httpsproxy.RequestDispositionControlPlane {
+			printUndoDisclosure(output, request.Undo)
+		}
 	}
 }
 

@@ -1,0 +1,28 @@
+version: 1
+name: unring-local-demo
+rules:
+  - name: staged-notification
+    match:
+      hosts:
+        - localhost
+      methods:
+        - POST
+      path: /stage
+    tier: stageable
+    idempotency_key: '"demo-stage:" + request.body_sha256'
+    response:
+      status: 202
+      headers:
+        Content-Type: application/json
+        X-Unring-Staged: "true"
+      body: '{"accepted":true,"unring":{"staged":true,"real_response":false}}'
+
+  - name: approved-action
+    match:
+      hosts:
+        - localhost
+      methods:
+        - POST
+      path: /approval
+    tier: needs-approval
+    idempotency_key: '"demo-approval:" + request.body_sha256'

@@ -2,12 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hyj28/unring/internal/httpsproxy"
 )
 
 func TestRunWithoutDatabaseRunsChildPropagatesExitAndRecordsCoverage(t *testing.T) {
@@ -176,6 +181,170 @@ func TestRunWithoutDatabaseStillInterceptsHTTPS(t *testing.T) {
 			t.Fatalf("database-free HTTPS review missing %q:\n%s", want, text)
 		}
 	}
+}
+
+func TestControlPlaneOnlyCLIReviewIsVisible(t *testing.T) {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skipf("curl unavailable: %v", err)
+	}
+	upstreamAuthority, err := httpsproxy.EnsureAuthority(t.TempDir())
+	if err != nil {
+		t.Fatalf("create upstream test authority: %v", err)
+	}
+	upstreamProxy, err := httpsproxy.Start(upstreamAuthority, httpsproxy.Options{
+		Transport: cliRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost || request.URL.Hostname() != "api.anthropic.com" ||
+				request.URL.Path != "/v1/messages" {
+				t.Errorf("upstream request = %s %s", request.Method, request.URL)
+			}
+			const body = "model-ok\n"
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        make(http.Header),
+				Body:          io.NopCloser(strings.NewReader(body)),
+				ContentLength: int64(len(body)),
+			}, nil
+		}),
+		AgentControlPlane: func(*http.Request) bool { return true },
+	})
+	if err != nil {
+		t.Fatalf("start upstream test proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = upstreamProxy.Close() })
+
+	for _, key := range []string{
+		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+		"ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+	} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("HTTPS_PROXY", "http://"+upstreamProxy.Address())
+	t.Setenv("https_proxy", "http://"+upstreamProxy.Address())
+	t.Setenv("SSL_CERT_FILE", upstreamAuthority.CertificatePath)
+
+	fakeDirectory := t.TempDir()
+	fakeClaude := filepath.Join(fakeDirectory, "claude")
+	if err := os.WriteFile(fakeClaude, []byte(
+		"#!/bin/sh\nexec \""+curl+"\" -fsS --request POST --data '{}' "+
+			"https://api.anthropic.com/v1/messages\n",
+	), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	binary := buildTestBinary(t)
+
+	for _, test := range []struct {
+		name       string
+		configured bool
+	}{
+		{name: "configured database", configured: true},
+		{name: "no database", configured: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			t.Setenv("UNRING_STATE_DIR", stateDir)
+			var backendDone <-chan error
+			if test.configured {
+				connectionString, done := startReviewTestBackend(t, false)
+				t.Setenv("DATABASE_URL", connectionString)
+				backendDone = done
+			} else {
+				t.Setenv("DATABASE_URL", "")
+			}
+
+			command := exec.Command(binary, "run", "--", fakeClaude)
+			command.Env = os.Environ()
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("control-plane-only CLI run: %v\n%s", err, output)
+			}
+			text := string(output)
+			for _, want := range []string{
+				"model-ok",
+				"AGENT CONTROL PLANE — FORWARDED WITHOUT GATING",
+				"[HTTP 200] POST https://api.anthropic.com:443/v1/messages",
+			} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("control-plane-only CLI output missing %q:\n%s", want, text)
+				}
+			}
+			if strings.Contains(text, quietSessionDisclosure) {
+				t.Fatalf("intercepted control-plane traffic was called un-intercepted:\n%s", text)
+			}
+			for _, unwanted := range []string{
+				"One decision applies", "Commit or discard?", "Up/down:",
+			} {
+				if strings.Contains(text, unwanted) {
+					t.Fatalf("control-plane-only traffic manufactured %q:\n%s", unwanted, text)
+				}
+			}
+			if !strings.Contains(text,
+				"No commit/discard decision was needed; only observed HTTPS traffic is shown.") {
+				t.Fatalf("observational review did not explain the missing decision prompt:\n%s", text)
+			}
+			if test.configured && strings.Contains(text, "NOT INTERCEPTED — no database traffic") {
+				t.Fatalf("configured database was presented as unconfigured:\n%s", text)
+			}
+			if !test.configured && !strings.Contains(text,
+				"NOT INTERCEPTED — no database traffic was intercepted") {
+				t.Fatalf("no-database coverage disclosure missing:\n%s", text)
+			}
+			if backendDone != nil {
+				if err := <-backendDone; err != nil {
+					t.Fatalf("fake Postgres backend: %v", err)
+				}
+			}
+
+			logCommand := exec.Command(binary, "log", "--json")
+			logCommand.Env = os.Environ()
+			logOutput, err := logCommand.CombinedOutput()
+			if err != nil {
+				t.Fatalf("unring log --json: %v\n%s", err, logOutput)
+			}
+			for _, want := range []string{
+				`"url": "https://api.anthropic.com:443/v1/messages"`,
+				`"disposition": "agent-control-plane"`,
+			} {
+				if !strings.Contains(string(logOutput), want) {
+					t.Fatalf("control-plane JSON audit missing %q:\n%s", want, logOutput)
+				}
+			}
+
+			var records []struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(logOutput, &records); err != nil {
+				t.Fatalf("decode unring log --json: %v\n%s", err, logOutput)
+			}
+			if len(records) != 1 || records[0].ID == "" {
+				t.Fatalf("control-plane audit records = %#v, want one identified record", records)
+			}
+			auditCommand := exec.Command(binary, "log", records[0].ID)
+			auditCommand.Env = os.Environ()
+			auditOutput, err := auditCommand.CombinedOutput()
+			if err != nil {
+				t.Fatalf("unring log %s: %v\n%s", records[0].ID, err, auditOutput)
+			}
+			auditText := string(auditOutput)
+			for _, want := range []string{
+				"No commit/discard decision was needed; only observed HTTPS traffic is shown.",
+				"AGENT CONTROL PLANE — FORWARDED WITHOUT GATING",
+			} {
+				if !strings.Contains(auditText, want) {
+					t.Fatalf("control-plane audit replay missing %q:\n%s", want, auditText)
+				}
+			}
+			if strings.Contains(auditText, "One decision applies") {
+				t.Fatalf("control-plane audit replay manufactured a decision:\n%s", auditText)
+			}
+		})
+	}
+}
+
+type cliRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (function cliRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
 }
 
 func TestGitPushOnlyRunGetsStructuralBlindSpotDisclosure(t *testing.T) {

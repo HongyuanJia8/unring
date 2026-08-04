@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/term"
 )
 
 func TestRunPropagatesExitCode(t *testing.T) {
@@ -460,9 +461,62 @@ func TestRunInteractiveChildHandlesTerminalStop(t *testing.T) {
 	}
 }
 
+func TestApprovalOwnsTTYAndRestoresRawChild(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=^TestRunInteractiveChildHelper$")
+	command.Env = append(os.Environ(), "UNRING_RUNNER_PTY_HELPER=approval")
+	terminal, err := pty.Start(command)
+	if err != nil {
+		t.Fatalf("start approval helper under PTY: %v", err)
+	}
+	defer terminal.Close()
+	session := bufio.NewReader(terminal)
+	var output strings.Builder
+	waitFor := func(marker string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !strings.Contains(output.String(), marker) && time.Now().Before(deadline) {
+			line, readErr := session.ReadString('\n')
+			output.WriteString(line)
+			if readErr != nil {
+				t.Fatalf("wait for %q: %v\n%s", marker, readErr, output.String())
+			}
+		}
+		if !strings.Contains(output.String(), marker) {
+			t.Fatalf("timed out waiting for %q:\n%s", marker, output.String())
+		}
+	}
+	waitFor("raw-child-ready")
+	if _, err := terminal.Write([]byte("x")); err != nil {
+		t.Fatalf("queue child input before approval: %v", err)
+	}
+	waitFor("approval-prompt")
+	if _, err := terminal.Write([]byte("y\n")); err != nil {
+		t.Fatalf("answer approval: %v", err)
+	}
+	waitFor("approval-accepted")
+	if _, err := terminal.Write([]byte("z")); err != nil {
+		t.Fatalf("write child input after approval: %v", err)
+	}
+
+	rest, readErr := io.ReadAll(session)
+	output.Write(rest)
+	if readErr != nil && !errors.Is(readErr, syscall.EIO) {
+		t.Fatalf("read approval helper: %v\n%s", readErr, output.String())
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("approval helper failed: %v\n%s", err, output.String())
+	}
+	if !strings.Contains(output.String(), "raw-child-read:z") ||
+		!strings.Contains(output.String(), "approval-terminal-cooked") ||
+		strings.Contains(output.String(), "raw-child-read:x") ||
+		strings.Contains(output.String(), "raw-child-read:y") {
+		t.Fatalf("approval and child did not receive isolated input:\n%s", output.String())
+	}
+}
+
 func TestRunInteractiveChildHelper(t *testing.T) {
 	mode := os.Getenv("UNRING_RUNNER_PTY_HELPER")
-	if mode != "1" && mode != "job-control" {
+	if mode != "1" && mode != "job-control" && mode != "approval" {
 		return
 	}
 
@@ -478,13 +532,58 @@ func TestRunInteractiveChildHelper(t *testing.T) {
 			"-test.run=^TestRunForegroundChildProcess$",
 		}
 		childEnvironment = append(childEnvironment, "UNRING_RUNNER_FOREGROUND_CHILD=1")
+	} else if mode == "approval" {
+		childCommand = []string{
+			os.Args[0],
+			"-test.run=^TestRunRawForegroundChildProcess$",
+		}
+		childEnvironment = append(childEnvironment, "UNRING_RUNNER_RAW_CHILD=1")
+	}
+	var approvals chan ApprovalRequest
+	if mode == "approval" {
+		approvals = make(chan ApprovalRequest)
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			reply := make(chan ApprovalResult, 1)
+			approvals <- ApprovalRequest{
+				Decide: func() (bool, error) {
+					stty := exec.Command("stty", "-a")
+					stty.Stdin = os.Stdin
+					terminalState, err := stty.CombinedOutput()
+					if err != nil {
+						return false, fmt.Errorf("inspect approval terminal state: %w: %s", err, terminalState)
+					}
+					fields := strings.Fields(string(terminalState))
+					for _, field := range fields {
+						field = strings.Trim(field, ";")
+						if field == "-icanon" || field == "-echo" {
+							return false, fmt.Errorf("approval terminal remained raw: %s", terminalState)
+						}
+					}
+					fmt.Println("approval-terminal-cooked")
+					fmt.Println("approval-prompt")
+					line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+					approved := strings.TrimSpace(line) == "y"
+					if approved {
+						fmt.Println("approval-accepted")
+					}
+					return approved, err
+				},
+				Reply: reply,
+			}
+			result := <-reply
+			if !result.Approved || result.Err != nil {
+				fmt.Fprintf(os.Stderr, "approval failed: %#v\n", result)
+			}
+		}()
 	}
 	result := Run(Options{
-		Command: childCommand,
-		Env:     childEnvironment,
-		Stdin:   os.Stdin,
-		Stdout:  os.Stdout,
-		Stderr:  os.Stderr,
+		Command:   childCommand,
+		Env:       childEnvironment,
+		Stdin:     os.Stdin,
+		Stdout:    os.Stdout,
+		Stderr:    os.Stderr,
+		Approvals: approvals,
 	})
 	if result.Err != nil {
 		fmt.Fprintf(os.Stderr, "interactive runner failed: exit=%d err=%v\n",
@@ -506,12 +605,37 @@ func TestRunInteractiveChildHelper(t *testing.T) {
 		fmt.Fprintf(os.Stderr, "interactive child exit=%d, want 0\n", result.ExitCode)
 		os.Exit(1)
 	}
+	if mode == "approval" {
+		fmt.Println("approval-wrapper-done")
+		return
+	}
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parent failed to read restored TTY: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("parent-read:%s", line)
+}
+
+func TestRunRawForegroundChildProcess(t *testing.T) {
+	if os.Getenv("UNRING_RUNNER_RAW_CHILD") != "1" {
+		return
+	}
+	state, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "make child terminal raw: %v\n", err)
+		os.Exit(1)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), state)
+	fmt.Println("raw-child-ready")
+	time.Sleep(time.Second)
+	var input [1]byte
+	if _, err := io.ReadFull(os.Stdin, input[:]); err != nil {
+		fmt.Fprintf(os.Stderr, "raw child read: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("raw-child-read:%c\n", input[0])
+	os.Exit(0)
 }
 
 func TestRunForegroundChildProcess(t *testing.T) {

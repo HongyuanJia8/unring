@@ -1,0 +1,9 @@
+#!/bin/sh
+
+if [ -z "${DEMO_RUNTIME:-}" ]; then
+    echo "DEMO_RUNTIME is not set" >&2
+    exit 2
+fi
+mkdir -p "$DEMO_RUNTIME"
+printf '%s\n' "$*" >> "$DEMO_RUNTIME/gh-received.log"
+printf '%s\n' 'https://example.invalid/acme/unring-demo/issues/1'
